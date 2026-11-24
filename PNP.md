@@ -122,8 +122,15 @@ To make the lower bound concrete:
 - `Formula`: propositional formulas over numbered variables.
 - `Formula.eval` and `Formula.encode`: Boolean semantics and a prefix encoding
   as words.
-- `Formula.trueFormula`, `Formula.falseFormula`, `Formula.ofCircuit`, and
-  `Formula.ofCircuit_eval`: a direct circuit-to-formula translation preserving
+- `Formula.trueFormula`, `Formula.falseFormula`, `Formula.toCircuit`,
+  `toCircuit_eval`, `toCircuit_maxVar_le`, `toCircuit_sat_iff`,
+  `toCircuit_treeSize`, `toCircuit_size_le_formulaSize`, `toCircuit_vars`, and
+  `Formula.tseitin_encode_length_le_poly`: the reverse bridge from formulas back
+  to circuits, preserving evaluation, satisfiability, variable bounds,
+  structural size, and polynomial Tseitin output length.
+- `Circuit.size_le_treeSize`: the sharing-aware circuit size never exceeds the
+  structural tree size.
+- `Formula.ofCircuit` and `Formula.ofCircuit_eval`: a direct circuit-to-formula translation preserving
   evaluation.  It is a tree expansion, not the polynomial-size Tseitin
   translation.
 - `Circuit.maxVar` and `Circuit.eval_eq_of_agree_on_vars`: circuit evaluation
@@ -134,6 +141,10 @@ To make the lower bound concrete:
   satisfiability equivalence with SAT.  This translation is a tree expansion;
   see section 12 for the polynomial-size Tseitin translation.
 - `SAT`: the language of encoded satisfiable formulas.
+- `Formula.mem_SAT_iff_sat`, `Formula.sat_iff_tseitin_toCircuit`, and
+  `Formula.mem_SAT_iff_tseitin_toCircuit`: ordinary SAT witnesses are equivalent
+  to satisfiability of the Tseitin translation of the formula's structural
+  circuit.
 - `Formula.mem_SAT_of_eval_true`, `sat_var_zero`, and `sat_tautology`: basic
   SAT membership checks.
 - `unsat_contradiction`: an explicit unsatisfiable formula is not in SAT, using
@@ -290,9 +301,11 @@ circuit level:
 - `Formula.and_var_sat_iff_of_fresh` and
   `npReductionFixed_mem_SAT_iff_accepts` prove that the padding preserves SAT
   membership and the NP acceptance equivalence.
-- `NPSemanticReductionIsPolyTime` isolates the one remaining step: showing the
-  explicit fixed-length word function `npReductionFixed V p q` is computed by a
-  polynomial-time TM.  The length bound above makes the obligation coherent.
+- `NPSemanticReductionIsPolyTime` isolates the reduction-machine step: showing
+  the explicit fixed-length word function `npReductionFixed V p q` is computed
+  by a polynomial-time TM.  The length bound above makes the obligation
+  coherent.  This is separate from `SATVerifierTMExists`, which supplies
+  `SAT ∈ NP`.
 - `semantic_cook_levin` proves `NPHard SAT` conditional only on that explicit
   machine-realization obligation; it does not assume Cook–Levin.
 - `NP_subset_PPoly_of_reduction_and_SAT_in_PPoly` and
@@ -300,10 +313,16 @@ circuit level:
   transfers P/poly membership from SAT to all of NP, and contrapositively moves
   a lower bound from NP to SAT.  These do not need the SAT verifier obligation.
 
-This closes the semantic gap in the 3b route.  The remaining obligations are
-the concrete polynomial-time machine for `npReduction` (equivalently a concrete
-`SATVerifierTMExists` plus tape parsing), and the concrete lower bound
-`SATNotInPPoly`.  Both are explicit propositions, not axioms.
+This closes the semantic gap in the 3b route.  The remaining obligations are:
+
+1. `NPSemanticReductionIsPolyTime`: a concrete polynomial-time TM computing the
+   fixed-length semantic reduction `npReductionFixed`.
+2. `SATVerifierTMExists`: a concrete polynomial-time TM for the SAT certificate
+   checker on `x ++ cert`, including reliable parsing of the instance prefix.
+3. `SATNotInPPoly`: the concrete circuit lower bound for SAT.
+
+All three are explicit propositions, not axioms.  `not_PEqualsNP_of_obligations`
+packages them into the final implication.
 
 The file also records the P/poly consequence of an NP-complete language being
 in P: `NPComplete_in_P_implies_NP_subset_PPoly` and its specialization

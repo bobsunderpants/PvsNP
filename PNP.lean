@@ -3458,6 +3458,34 @@ lemma ofCircuit_maxVar_le (c : Circuit) : (ofCircuit c).maxVar ≤ c.maxVar := b
       dsimp [ofCircuit, maxVar, Circuit.maxVar]
       exact max_le_max ih1 ih2
 
+/-- The reverse bridge: a formula is also a circuit, with one gate per
+    connective.  Unlike `ofCircuit`, this direction is tree-sized but preserves
+    the structural shape of the formula. -/
+def toCircuit : Formula → Circuit
+  | var i => Circuit.var i
+  | not f => Circuit.not (toCircuit f)
+  | and f g => Circuit.and (toCircuit f) (toCircuit g)
+  | or f g => Circuit.or (toCircuit f) (toCircuit g)
+
+lemma toCircuit_eval (f : Formula) (x : Word) :
+    (toCircuit f).eval x = f.eval (fun i => x.getD i false) := by
+  induction f with
+  | var i => simp [toCircuit, eval]
+  | not f ih => simp [toCircuit, eval, ih]
+  | and f g ihf ihg => simp [toCircuit, eval, ihf, ihg]
+  | or f g ihf ihg => simp [toCircuit, eval, ihf, ihg]
+
+lemma toCircuit_maxVar_le (f : Formula) : (toCircuit f).maxVar ≤ f.maxVar := by
+  induction f with
+  | var i => simp [toCircuit, Circuit.maxVar, maxVar]
+  | not f ih => simpa [toCircuit, Circuit.maxVar, maxVar] using ih
+  | and f g ihf ihg =>
+      dsimp [toCircuit, Circuit.maxVar, maxVar]
+      exact max_le_max ihf ihg
+  | or f g ihf ihg =>
+      dsimp [toCircuit, Circuit.maxVar, maxVar]
+      exact max_le_max ihf ihg
+
 /-- Evaluation only depends on assignment entries up to `maxVar`. -/
 lemma eval_eq_of_agree_on_vars (f : Formula) {a b : Nat → Bool}
     (h : ∀ i, i ≤ f.maxVar → a i = b i) : f.eval a = f.eval b := by
@@ -3486,12 +3514,41 @@ lemma eval_eq_of_agree_on_vars (f : Formula) {a b : Nat → Bool}
         exact h i (Nat.le_trans hi (Nat.le_max_right _ _)))
       simp [eval, hf, hg]
 
+lemma toCircuit_sat_iff (f : Formula) :
+    (∃ a : Nat → Bool, f.eval a = true) ↔
+      ∃ x : Word, (toCircuit f).eval x = true := by
+  constructor
+  · rintro ⟨a, ha⟩
+    let x : Word := List.ofFn (fun i : Fin (f.maxVar + 1) => a i)
+    refine ⟨x, ?_⟩
+    rw [toCircuit_eval]
+    have hget : ∀ i, i ≤ f.maxVar → x.getD i false = a i := by
+      intro i hi
+      have hi' : i < f.maxVar + 1 := by omega
+      rw [List.getD_eq_getElem x false (by simpa [x] using hi')]
+      simpa [x] using (List.getElem_ofFn
+        (f := fun j : Fin (f.maxVar + 1) => a j) (by simpa using hi'))
+    exact (eval_eq_of_agree_on_vars f hget).trans ha
+  · rintro ⟨x, hx⟩
+    refine ⟨fun i => x.getD i false, ?_⟩
+    rw [← toCircuit_eval]
+    exact hx
+
 /-- The finite set of variables occurring in a formula. -/
 def vars : Formula → Finset Nat
   | var i => {i}
   | not f => f.vars
   | and f g => f.vars ∪ g.vars
   | or f g => f.vars ∪ g.vars
+
+lemma toCircuit_vars (f : Formula) : (toCircuit f).vars = f.vars := by
+  induction f with
+  | var i => simp [Formula.toCircuit, Formula.vars, Circuit.vars]
+  | not f ih => simpa [Formula.toCircuit, Formula.vars, Circuit.vars] using ih
+  | and f g ihf ihg =>
+      simp [Formula.toCircuit, Formula.vars, Circuit.vars, ihf, ihg]
+  | or f g ihf ihg =>
+      simp [Formula.toCircuit, Formula.vars, Circuit.vars, ihf, ihg]
 
 @[simp] lemma mem_vars_var (i j : Nat) : i ∈ (var j : Formula).vars ↔ i = j := by
   simp [vars]
@@ -3704,6 +3761,16 @@ lemma Formula.and_var_sat_iff_of_fresh (f : Formula) (k : Nat) (hk : f.maxVar < 
 lemma Formula.mem_SAT_of_eval_true (f : Formula) (a : Nat → Bool)
     (h : f.eval a = true) : f.encode ∈ SAT := by
   refine ⟨f, rfl, a, h⟩
+
+lemma Formula.mem_SAT_iff_sat (f : Formula) :
+    f.encode ∈ SAT ↔ ∃ a : Nat → Bool, f.eval a = true := by
+  constructor
+  · rintro ⟨g, hg, a, ha⟩
+    have hgf : g = f := Formula.encode_injective hg
+    subst g
+    exact ⟨a, ha⟩
+  · rintro ⟨a, ha⟩
+    exact Formula.mem_SAT_of_eval_true f a ha
 
 /-- A satisfying assignment for a circuit gives a SAT instance via the direct
     tree expansion. -/
@@ -4499,6 +4566,15 @@ theorem circuit_tseitin_SAT_iff (c : Circuit) :
     exact tseitinFormula_mem_SAT_of_eval_true c x hx
   · exact eval_true_of_tseitinFormula_mem_SAT
 
+theorem Formula.sat_iff_tseitin_toCircuit (f : Formula) :
+    (∃ a : Nat → Bool, f.eval a = true) ↔
+      (tseitinFormula (Formula.toCircuit f)).encode ∈ SAT := by
+  rw [Formula.toCircuit_sat_iff, circuit_tseitin_SAT_iff]
+
+theorem Formula.mem_SAT_iff_tseitin_toCircuit (f : Formula) :
+    f.encode ∈ SAT ↔ (tseitinFormula (Formula.toCircuit f)).encode ∈ SAT := by
+  rw [Formula.mem_SAT_iff_sat, Formula.sat_iff_tseitin_toCircuit]
+
 /-- A structural size measure for formulas, counted independently of variable
     index magnitude. -/
 def formulaSize : Formula → Nat
@@ -4506,6 +4582,34 @@ def formulaSize : Formula → Nat
   | Formula.not f => 1 + formulaSize f
   | Formula.and f g => 1 + formulaSize f + formulaSize g
   | Formula.or f g => 1 + formulaSize f + formulaSize g
+
+lemma Circuit.size_le_treeSize (c : Circuit) : c.size ≤ c.treeSize := by
+  induction c with
+  | const b => simp [Circuit.size, Circuit.treeSize, Circuit.nodes]
+  | var i => simp [Circuit.size, Circuit.treeSize, Circuit.nodes]
+  | not c ih =>
+      exact le_trans (size_not c) (Nat.add_le_add_left ih 1)
+  | and c₁ c₂ ih1 ih2 =>
+      have h : 1 + c₁.size + c₂.size ≤ 1 + c₁.treeSize + c₂.treeSize := by omega
+      exact le_trans (size_and c₁ c₂) (by simpa [Circuit.treeSize] using h)
+  | or c₁ c₂ ih1 ih2 =>
+      have h : 1 + c₁.size + c₂.size ≤ 1 + c₁.treeSize + c₂.treeSize := by omega
+      exact le_trans (size_or c₁ c₂) (by simpa [Circuit.treeSize] using h)
+
+lemma Formula.toCircuit_treeSize (f : Formula) :
+    (Formula.toCircuit f).treeSize = formulaSize f := by
+  induction f with
+  | var i => simp [Formula.toCircuit, Circuit.treeSize, formulaSize]
+  | not f ih => simp [Formula.toCircuit, Circuit.treeSize, formulaSize, ih]
+  | and f g ihf ihg =>
+      simp [Formula.toCircuit, Circuit.treeSize, formulaSize, ihf, ihg]
+  | or f g ihf ihg =>
+      simp [Formula.toCircuit, Circuit.treeSize, formulaSize, ihf, ihg]
+
+lemma Formula.toCircuit_size_le_formulaSize (f : Formula) :
+    (Formula.toCircuit f).size ≤ formulaSize f := by
+  rw [← Formula.toCircuit_treeSize f]
+  exact Circuit.size_le_treeSize (Formula.toCircuit f)
 
 @[simp] lemma formulaSize_trueFormula : formulaSize Formula.trueFormula = 4 := by
   simp [Formula.trueFormula, formulaSize]
@@ -4734,6 +4838,16 @@ lemma tseitin_encode_length_le_poly (c : Circuit) :
   have hmul := Nat.mul_le_mul h1 h2
   dsimp [tseitinPoly, N]
   simpa using (le_trans h hmul)
+
+lemma Formula.tseitin_encode_length_le_poly (f : Formula) :
+    (tseitinFormula (Formula.toCircuit f)).encode.length ≤
+      tseitinPoly.eval (formulaSize f + f.maxVar) := by
+  have h := PNP.tseitin_encode_length_le_poly (Formula.toCircuit f)
+  have hs := Formula.toCircuit_size_le_formulaSize f
+  have hm := Formula.toCircuit_maxVar_le f
+  have hsum : (Formula.toCircuit f).size + (Formula.toCircuit f).maxVar ≤
+      formulaSize f + f.maxVar := Nat.add_le_add hs hm
+  exact le_trans h (timeBound_eval_monotone tseitinPoly hsum)
 
 lemma tseitinCertificate_length_le_poly (c : Circuit) (x : Word) :
     (tseitinCertificate c x).length ≤ tseitinPoly.eval (c.size + c.maxVar) := by
