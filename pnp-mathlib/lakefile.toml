@@ -1,0 +1,7 @@
+name = "pnp"
+[[lean_lib]]
+name = "PNP"
+[[require]]
+name = "mathlib"
+scope = "leanprover-community"
+rev = "6c9a0a07bbbce9b0205b16c83a17b8458f4bcdf9"
