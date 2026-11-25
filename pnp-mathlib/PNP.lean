@@ -19,6 +19,7 @@ module
 
 import Mathlib.Algebra.Polynomial.Eval.Defs
 import Mathlib.Data.List.GetD
+import Mathlib.Order.Nat
 
 namespace PNP
 
@@ -198,6 +199,1328 @@ lemma timeBound_eval_monotone (p : TimeBound) {a b : Nat} (h : a ≤ b) :
   | monomial n c =>
       simpa [Polynomial.eval_monomial] using
         Nat.mul_le_mul_left c (Nat.pow_le_pow_left h n)
+
+-- -----------------------------------------------------------------------------
+-- 2b. A composable transducer model
+-- -----------------------------------------------------------------------------
+
+/-- One transition of a composable transducer: the next state, an optional
+    output bit, the input-head movement, an optional work-tape write, and the
+    work-head movement.  A movement is `some true` for right, `some false` for
+    left, and `none` for staying put. -/
+structure DAction (σ : Type) where
+  next : σ
+  output : Option Bool
+  inputMove : Option Bool
+  workWrite : Option Bool
+  workMove : Option Bool
+
+/-- A composable transducer: a read-only input word, a write-only output word,
+    and a two-way infinite work tape.  Both heads start on distinguished left
+    boundaries.  The `handoff` instruction resets the input to the current
+    output, clears the output, and blanks the work tape, which is exactly what
+    sequential composition needs. -/
+structure DTM (σ : Type) [Fintype σ] [DecidableEq σ] where
+  step : σ → Option Bool → Bool → DAction σ
+  handoff : σ → Bool := fun _ => false
+  start : σ
+  accept : σ
+  reject : σ
+
+/-- A configuration of a transducer. -/
+structure DConfig (σ : Type) where
+  state : σ
+  input : Word
+  head : Nat
+  output : Word
+  work : Nat → Bool
+  workHead : Nat
+
+/-- Initial configuration: both heads on their boundaries, input immediately to
+    the right of the input boundary, work tape blank. -/
+def Dinit {σ : Type} [Fintype σ] [DecidableEq σ] (M : DTM σ) (x : Word) : DConfig σ :=
+  ⟨M.start, x, 0, [], fun _ => false, 0⟩
+
+/-- A transducer halts in its accepting or rejecting state. -/
+def Dhalted {σ : Type} [Fintype σ] [DecidableEq σ] (M : DTM σ) (c : DConfig σ) : Bool :=
+  decide (c.state = M.accept) || decide (c.state = M.reject)
+
+/-- The symbol currently scanned by the input head.  The left boundary and any
+    position past the end of the input are both represented by `none`. -/
+def Dread {σ : Type} (c : DConfig σ) : Option Bool :=
+  if c.head = 0 then none else c.input[c.head - 1]?
+
+/-- Move a head one cell, reflecting at the distinguished boundary. -/
+def Dmove (dir : Bool) (h : Nat) : Nat :=
+  if dir then h + 1 else if h = 0 then 0 else h - 1
+
+/-- Write an optional bit to the work tape. -/
+def DwriteWork (f : Nat → Bool) (h : Nat) (w : Option Bool) : Nat → Bool :=
+  fun i => match w with
+    | none => f i
+    | some b => if i = h then b else f i
+
+@[simp] lemma DwriteWork_none (f : Nat → Bool) (h : Nat) : DwriteWork f h none = f := by
+  funext i
+  simp [DwriteWork]
+
+/-- One transition.  The output word is append-only and the work tape is
+    persistent unless a handoff occurs. -/
+def Dstep {σ : Type} [Fintype σ] [DecidableEq σ] (M : DTM σ) (c : DConfig σ) : DConfig σ :=
+  let sym := Dread c
+  let tr := M.step c.state sym (c.work c.workHead)
+  let hand := M.handoff c.state
+  let input' := if hand then c.output else c.input
+  let head' := if hand then 0 else match tr.inputMove with
+    | none => c.head
+    | some dir => Dmove dir c.head
+  let output' := if hand then [] else match tr.output with
+    | none => c.output
+    | some b => c.output ++ [b]
+  let work' := if hand then (fun _ => false) else DwriteWork c.work c.workHead tr.workWrite
+  let workHead' := if hand then 0 else match tr.workMove with
+    | none => c.workHead
+    | some dir => Dmove dir c.workHead
+  ⟨tr.next, input', head', output', work', workHead'⟩
+
+/-- Run a transducer for at most `t` steps, freezing on halt. -/
+def Drun {σ : Type} [Fintype σ] [DecidableEq σ] (M : DTM σ) : Nat → DConfig σ → DConfig σ
+  | 0, c => c
+  | t + 1, c => if Dhalted M c then c else Drun M t (Dstep M c)
+
+/-- The bounded output word. -/
+abbrev Dboutput {σ : Type} [Fintype σ] [DecidableEq σ]
+    (M : DTM σ) (t : Nat) (x : Word) : Word :=
+  (Drun M t (Dinit M x)).output
+
+/-- The first `m` output bits, padded with `false` when shorter. -/
+def DboutputUpTo {σ : Type} [Fintype σ] [DecidableEq σ]
+    (M : DTM σ) (t m : Nat) (x : Word) : Word :=
+  List.ofFn (fun i : Fin m => (Drun M t (Dinit M x)).output.getD i.val false)
+
+@[simp] lemma DboutputUpTo_length {σ : Type} [Fintype σ] [DecidableEq σ]
+    (M : DTM σ) (t m : Nat) (x : Word) : (DboutputUpTo M t m x).length = m := by
+  simp [DboutputUpTo]
+
+/-- One transition with halting configurations frozen. -/
+def DnextConfig {σ : Type} [Fintype σ] [DecidableEq σ]
+    (M : DTM σ) (c : DConfig σ) : DConfig σ :=
+  if Dhalted M c then c else Dstep M c
+
+lemma Drun_halted {σ : Type} [Fintype σ] [DecidableEq σ]
+    (M : DTM σ) (c : DConfig σ) (k : Nat) (h : Dhalted M c = true) :
+    Drun M k c = c := by
+  cases k <;> simp [Drun, h]
+
+lemma Drun_succ_eq_run_nextConfig {σ : Type} [Fintype σ] [DecidableEq σ]
+    (M : DTM σ) (c : DConfig σ) (k : Nat) :
+    Drun M (k + 1) c = Drun M k (DnextConfig M c) := by
+  by_cases h : Dhalted M c = true
+  · simp [Drun, h, DnextConfig, Drun_halted M c k h]
+  · simp [Drun, h, DnextConfig]
+
+lemma Drun_add_eq {σ : Type} [Fintype σ] [DecidableEq σ]
+    (M : DTM σ) (c : DConfig σ) (a b : Nat) :
+    Drun M (a + b) c = Drun M b (Drun M a c) := by
+  induction a generalizing c with
+  | zero => simp [Drun]
+  | succ a ih =>
+      rw [Nat.succ_add, Drun_succ_eq_run_nextConfig]
+      rw [Drun_succ_eq_run_nextConfig M c a]
+      exact ih (DnextConfig M c)
+
+lemma Drun_eq_of_halted_within {σ : Type} [Fintype σ] [DecidableEq σ]
+    (M : DTM σ) (c : DConfig σ) {s t : Nat} (hs : s ≤ t)
+    (hh : Dhalted M (Drun M s c) = true) : Drun M t c = Drun M s c := by
+  obtain ⟨k, hk⟩ := Nat.exists_eq_add_of_le hs
+  rw [hk, Drun_add_eq, Drun_halted M (Drun M s c) k hh]
+
+/-- Polynomial-time computability in the composable model.  `p` bounds the
+    running time and `r` bounds the output length. -/
+def DPolyTimeComputable (f : Word → Word) : Prop :=
+  ∃ (σ : Type) (_instσ : Fintype σ) (_decσ : DecidableEq σ)
+    (M : DTM σ) (p r : TimeBound),
+    (∀ x : Word, Dhalted M (Drun M (p.eval x.length) (Dinit M x)) = true) ∧
+    ∀ x : Word,
+      Dboutput M (p.eval x.length) x = f x ∧ (f x).length = r.eval x.length
+
+/-- States of a sequential composition: first subroutine, then second. -/
+inductive DCompState (σ τ : Type) where
+  | first : σ → DCompState σ τ
+  | second : τ → DCompState σ τ
+  deriving DecidableEq
+
+namespace DCompState
+
+def toSum {σ τ : Type} : DCompState σ τ → σ ⊕ τ
+  | first q => Sum.inl q
+  | second q => Sum.inr q
+
+def ofSum {σ τ : Type} : σ ⊕ τ → DCompState σ τ
+  | Sum.inl q => first q
+  | Sum.inr q => second q
+
+lemma ofSum_toSum {σ τ : Type} (s : DCompState σ τ) : ofSum (toSum s) = s := by
+  cases s <;> rfl
+
+lemma toSum_ofSum {σ τ : Type} (s : σ ⊕ τ) : toSum (ofSum s) = s := by
+  cases s <;> rfl
+
+def finEquiv {σ τ : Type} : DCompState σ τ ≃ σ ⊕ τ where
+  toFun := toSum
+  invFun := ofSum
+  left_inv := ofSum_toSum
+  right_inv := toSum_ofSum
+
+instance fintype {σ τ : Type} [Fintype σ] [Fintype τ] : Fintype (DCompState σ τ) :=
+  Fintype.ofEquiv (σ ⊕ τ) finEquiv.symm
+
+end DCompState
+
+/-- Sequential composition.  The first phase mirrors `M`; when `M` halts, the
+    composed machine hands its output to `N` and the second phase mirrors `N`. -/
+def Dcompose {σ τ : Type} [Fintype σ] [DecidableEq σ] [Fintype τ] [DecidableEq τ]
+    (M : DTM σ) (N : DTM τ) : DTM (DCompState σ τ) where
+  step
+    | DCompState.first q, sym, wsym =>
+        if decide (q = M.accept) || decide (q = M.reject) then
+          { next := DCompState.second N.start, output := none, inputMove := none
+            workWrite := none, workMove := none }
+        else
+          let tr := M.step q sym wsym
+          { next := DCompState.first tr.next, output := tr.output
+            inputMove := tr.inputMove, workWrite := tr.workWrite, workMove := tr.workMove }
+    | DCompState.second q, sym, wsym =>
+        if decide (q = N.accept) || decide (q = N.reject) then
+          { next := DCompState.second q, output := none, inputMove := none
+            workWrite := none, workMove := none }
+        else
+          let tr := N.step q sym wsym
+          { next := DCompState.second tr.next, output := tr.output
+            inputMove := tr.inputMove, workWrite := tr.workWrite, workMove := tr.workMove }
+  handoff
+    | DCompState.first q => M.handoff q || (decide (q = M.accept) || decide (q = M.reject))
+    | DCompState.second q => N.handoff q
+  start := DCompState.first M.start
+  accept := DCompState.second N.accept
+  reject := DCompState.second N.reject
+
+def liftFirst {σ τ : Type} [Fintype σ] [DecidableEq σ] [Fintype τ] [DecidableEq τ]
+    (_M : DTM σ) (_N : DTM τ) (c : DConfig σ) : DConfig (DCompState σ τ) :=
+  ⟨DCompState.first c.state, c.input, c.head, c.output, c.work, c.workHead⟩
+
+def liftSecond {σ τ : Type} [Fintype σ] [DecidableEq σ] [Fintype τ] [DecidableEq τ]
+    (_M : DTM σ) (_N : DTM τ) (c : DConfig τ) : DConfig (DCompState σ τ) :=
+  ⟨DCompState.second c.state, c.input, c.head, c.output, c.work, c.workHead⟩
+
+lemma Dhalted_compose_liftFirst {σ τ : Type} [Fintype σ] [DecidableEq σ]
+    [Fintype τ] [DecidableEq τ] (M : DTM σ) (N : DTM τ) (c : DConfig σ) :
+    Dhalted (Dcompose M N) (liftFirst M N c) = false := by
+  rcases c with ⟨q, inp, hd, out, wk, wh⟩
+  simp [Dhalted, liftFirst, Dcompose]
+
+lemma Dhalted_compose_liftSecond {σ τ : Type} [Fintype σ] [DecidableEq σ]
+    [Fintype τ] [DecidableEq τ] (M : DTM σ) (N : DTM τ) (c : DConfig τ) :
+    Dhalted (Dcompose M N) (liftSecond M N c) = Dhalted N c := by
+  rcases c with ⟨q, inp, hd, out, wk, wh⟩
+  simp [Dhalted, liftSecond, Dcompose]
+
+lemma Dstep_compose_first_of_not_halted {σ τ : Type} [Fintype σ] [DecidableEq σ]
+    [Fintype τ] [DecidableEq τ] (M : DTM σ) (N : DTM τ) (c : DConfig σ)
+    (hnot : Dhalted M c = false) :
+    Dstep (Dcompose M N) (liftFirst M N c) = liftFirst M N (Dstep M c) := by
+  rcases c with ⟨q, inp, hd, out, wk, wh⟩
+  dsimp [liftFirst, Dstep, Dread, Dhalted] at hnot ⊢
+  have hqp : ¬ (q = M.accept ∨ q = M.reject) := by simpa using hnot
+  simp [Dcompose, hqp]
+
+lemma Dstep_compose_first_halted {σ τ : Type} [Fintype σ] [DecidableEq σ]
+    [Fintype τ] [DecidableEq τ] (M : DTM σ) (N : DTM τ) (c : DConfig σ)
+    (hhalt : Dhalted M c = true) :
+    Dstep (Dcompose M N) (liftFirst M N c) = liftSecond M N (Dinit N c.output) := by
+  rcases c with ⟨q, inp, hd, out, wk, wh⟩
+  dsimp [liftFirst, liftSecond, Dinit, Dstep, Dread, Dhalted] at hhalt ⊢
+  have hqp : q = M.accept ∨ q = M.reject := by simpa using hhalt
+  simp [Dcompose, hqp]
+
+lemma Dstep_compose_second_of_not_halted {σ τ : Type} [Fintype σ] [DecidableEq σ]
+    [Fintype τ] [DecidableEq τ] (M : DTM σ) (N : DTM τ) (c : DConfig τ)
+    (hnot : Dhalted N c = false) :
+    Dstep (Dcompose M N) (liftSecond M N c) = liftSecond M N (Dstep N c) := by
+  rcases c with ⟨q, inp, hd, out, wk, wh⟩
+  dsimp [liftSecond, Dstep, Dread, Dhalted] at hnot ⊢
+  have hqp : ¬ (q = N.accept ∨ q = N.reject) := by simpa using hnot
+  simp [Dcompose, hqp]
+
+lemma DnextConfig_compose_second {σ τ : Type} [Fintype σ] [DecidableEq σ]
+    [Fintype τ] [DecidableEq τ] (M : DTM σ) (N : DTM τ) (c : DConfig τ) :
+    DnextConfig (Dcompose M N) (liftSecond M N c) =
+      liftSecond M N (DnextConfig N c) := by
+  by_cases h : Dhalted N c = true
+  · have hc : Dhalted (Dcompose M N) (liftSecond M N c) = true := by
+      rw [Dhalted_compose_liftSecond]
+      exact h
+    simp [DnextConfig, h, hc]
+  · have hf : Dhalted N c = false := by cases h' : Dhalted N c <;> simp_all
+    have hc : Dhalted (Dcompose M N) (liftSecond M N c) = false := by
+      rw [Dhalted_compose_liftSecond]
+      exact hf
+    simp [DnextConfig, hf, hc, Dstep_compose_second_of_not_halted M N c hf]
+
+lemma DnextConfig_compose_first_of_not_halted {σ τ : Type} [Fintype σ] [DecidableEq σ]
+    [Fintype τ] [DecidableEq τ] (M : DTM σ) (N : DTM τ) (c : DConfig σ)
+    (hnot : Dhalted M c = false) :
+    DnextConfig (Dcompose M N) (liftFirst M N c) = liftFirst M N (DnextConfig M c) := by
+  have hcnot : Dhalted (Dcompose M N) (liftFirst M N c) = false :=
+    Dhalted_compose_liftFirst M N c
+  simp [DnextConfig, hnot, hcnot, Dstep_compose_first_of_not_halted M N c hnot]
+
+lemma Drun_compose_second {σ τ : Type} [Fintype σ] [DecidableEq σ]
+    [Fintype τ] [DecidableEq τ] (M : DTM σ) (N : DTM τ)
+    (k : Nat) (c : DConfig τ) :
+    Drun (Dcompose M N) k (liftSecond M N c) = liftSecond M N (Drun N k c) := by
+  induction k generalizing c with
+  | zero => simp [Drun, liftSecond]
+  | succ k ih =>
+      rw [Drun_succ_eq_run_nextConfig]
+      rw [Drun_succ_eq_run_nextConfig]
+      rw [DnextConfig_compose_second M N c]
+      exact ih (DnextConfig N c)
+
+lemma Drun_compose_first {σ τ : Type} [Fintype σ] [DecidableEq σ]
+    [Fintype τ] [DecidableEq τ] (M : DTM σ) (N : DTM τ)
+    (t : Nat) (c : DConfig σ)
+    (hnone : ∀ s : Nat, s < t → Dhalted M (Drun M s c) = false) :
+    Drun (Dcompose M N) t (liftFirst M N c) = liftFirst M N (Drun M t c) := by
+  induction t generalizing c with
+  | zero => simp [Drun, liftFirst]
+  | succ t ih =>
+      rw [Drun_succ_eq_run_nextConfig]
+      rw [Drun_succ_eq_run_nextConfig]
+      have hnot_c : Dhalted M c = false := by
+        simpa [Drun] using hnone 0 (Nat.succ_pos t)
+      rw [DnextConfig_compose_first_of_not_halted M N c hnot_c]
+      apply ih (DnextConfig M c)
+      intro s hs
+      have hs' : s + 1 < t + 1 := Nat.succ_lt_succ hs
+      have h := hnone (s + 1) hs'
+      simpa [Drun_succ_eq_run_nextConfig] using h
+
+/-- Sequential closure is now a theorem: the handoff instruction transfers a
+    variable-length output word to a clean input for the second machine. -/
+theorem DPolyTimeComputableClosedUnderComposition :
+    ∀ f g : Word → Word, DPolyTimeComputable f → DPolyTimeComputable g →
+      DPolyTimeComputable (fun x => g (f x)) := by
+  intro f g hf hg
+  rcases hf with ⟨σ, _instσ, _decσ, M, p, r, hMhalt, hMout⟩
+  rcases hg with ⟨τ, _instτ, _decτ, N, q, s, hNhalt, hNout⟩
+  let K := Dcompose M N
+  let P : TimeBound := p + C 1 + q.comp r
+  let R : TimeBound := s.comp r
+  have hcomp_run : ∀ x : Word,
+      Drun K (P.eval x.length) (Dinit K x) =
+        liftSecond M N (Drun N (q.eval (f x).length) (Dinit N (f x))) := by
+    intro x
+    let pm := p.eval x.length
+    let c0 := Dinit K x
+    let cM0 := Dinit M x
+    let hex : ∃ t : Nat, t ≤ pm ∧ Dhalted M (Drun M t cM0) = true :=
+      ⟨pm, le_rfl, by simpa [pm] using hMhalt x⟩
+    let t0 := Nat.find hex
+    have ht0halt : Dhalted M (Drun M t0 cM0) = true := (Nat.find_spec hex).2
+    have ht0le : t0 ≤ pm := Nat.find_min' hex (by simpa [pm] using hMhalt x)
+    have hnone : ∀ s' : Nat, s' < t0 → Dhalted M (Drun M s' cM0) = false := by
+      intro s' hs
+      have hle : s' ≤ pm := by omega
+      by_contra hh
+      exact (Nat.find_min hex hs) ⟨hle, by simpa using hh⟩
+    have hfirst : Drun K t0 (liftFirst M N cM0) = liftFirst M N (Drun M t0 cM0) := by
+      simpa [K] using Drun_compose_first M N t0 cM0 hnone
+    have hfreeze : Drun M pm cM0 = Drun M t0 cM0 :=
+      Drun_eq_of_halted_within M cM0 ht0le ht0halt
+    have hout_t0 : (Drun M t0 cM0).output = f x := by
+      rw [← hfreeze]
+      exact (hMout x).1
+    have hswitch : Drun K (t0 + 1) c0 = liftSecond M N (Dinit N (f x)) := by
+      dsimp [c0]
+      change Drun K (t0 + 1) (liftFirst M N cM0) = _
+      rw [Drun_add_eq]
+      rw [hfirst]
+      change Drun (Dcompose M N) 1 (liftFirst M N (Drun M t0 cM0)) = _
+      rw [show Drun (Dcompose M N) 1 (liftFirst M N (Drun M t0 cM0)) =
+          DnextConfig (Dcompose M N) (liftFirst M N (Drun M t0 cM0)) by
+        simp [Drun, DnextConfig, Dhalted_compose_liftFirst]]
+      rw [DnextConfig, Dhalted_compose_liftFirst]
+      simp [Dstep_compose_first_halted M N (Drun M t0 cM0) ht0halt, hout_t0]
+    let pn := q.eval (f x).length
+    have hNhaltx : Dhalted N (Drun N pn (Dinit N (f x))) = true := by
+      simpa [pn] using hNhalt (f x)
+    have htotal_time : Drun K ((t0 + 1) + pn) c0 =
+        liftSecond M N (Drun N pn (Dinit N (f x))) := by
+      rw [Drun_add_eq]
+      rw [hswitch]
+      simpa [K] using Drun_compose_second M N pn (Dinit N (f x))
+    have hhalt_total : Dhalted K (Drun K ((t0 + 1) + pn) c0) = true := by
+      rw [htotal_time]
+      rw [Dhalted_compose_liftSecond]
+      simpa [K] using hNhaltx
+    have hpn : pn = (q.comp r).eval x.length := by
+      have hlen := (hMout x).2
+      simp [pn, hlen, Polynomial.eval_comp]
+    have hP : P.eval x.length = pm + 1 + (q.comp r).eval x.length := by
+      simp [P, pm]
+    have hle_total : (t0 + 1) + pn ≤ P.eval x.length := by omega
+    exact (Drun_eq_of_halted_within K c0 hle_total hhalt_total).trans htotal_time
+  refine ⟨DCompState σ τ, inferInstance, inferInstance, K, P, R, ?_, ?_⟩
+  · intro x
+    rw [hcomp_run x]
+    rw [Dhalted_compose_liftSecond]
+    simpa [K] using hNhalt (f x)
+  · intro x
+    constructor
+    · change (Drun K (P.eval x.length) (Dinit K x)).output = g (f x)
+      rw [hcomp_run x]
+      simpa [liftSecond] using (hNout (f x)).1
+    · have hlenf : (f x).length = r.eval x.length := (hMout x).2
+      rw [(hNout (f x)).2, hlenf]
+      simp [R, Polynomial.eval_comp]
+
+-- -----------------------------------------------------------------------------
+-- 2c. A first concrete transducer subroutine
+-- -----------------------------------------------------------------------------
+
+/-- States of the identity transducer, identified with `Fin 4`. -/
+abbrev DIdState := Fin 4
+
+namespace DIdState
+
+def start : DIdState := ⟨0, by decide⟩
+def scan : DIdState := ⟨1, by decide⟩
+def done : DIdState := ⟨2, by decide⟩
+def reject : DIdState := ⟨3, by decide⟩
+
+end DIdState
+
+/-- A transducer that copies its read-only input to its output.  It uses one
+    startup step to leave the input boundary, then emits one bit per input cell. -/
+def DIdTM : DTM DIdState where
+  step := fun q sym _ =>
+    if q = DIdState.start then
+      { next := DIdState.scan, output := none, inputMove := some true
+        workWrite := none, workMove := none }
+    else if q = DIdState.scan then
+      match sym with
+      | some b =>
+          { next := DIdState.scan, output := some b, inputMove := some true
+            workWrite := none, workMove := none }
+      | none =>
+          { next := DIdState.done, output := none, inputMove := none
+            workWrite := none, workMove := none }
+    else
+      { next := q, output := none, inputMove := none
+        workWrite := none, workMove := none }
+  start := DIdState.start
+  accept := DIdState.done
+  reject := DIdState.reject
+
+lemma Drun_DIdTM_start (x : Word) :
+    Drun DIdTM 1 (Dinit DIdTM x) =
+      { state := DIdState.scan, input := x, head := 1, output := [],
+        work := fun _ : Nat => false, workHead := 0 } := by
+  simp [Drun, Dhalted, Dinit, Dstep, Dread, DIdTM, Dmove,
+    DIdState.start, DIdState.scan, DIdState.done, DIdState.reject]
+
+/-- Once the scan state is reached with `prefix` already emitted, the machine
+    emits the remaining suffix and halts.  The work tape is left untouched. -/
+lemma Drun_DIdTM_scan_suffix (pre suffix : Word) (wk : Nat → Bool) (wh : Nat) :
+    Drun DIdTM (suffix.length + 1)
+      { state := DIdState.scan, input := pre ++ suffix, head := pre.length + 1,
+        output := pre, work := wk, workHead := wh } =
+      { state := DIdState.done, input := pre ++ suffix,
+        head := (pre ++ suffix).length + 1, output := pre ++ suffix,
+        work := wk, workHead := wh } := by
+  induction suffix generalizing pre with
+  | nil =>
+      let c : DConfig DIdState :=
+        { state := DIdState.scan, input := pre ++ [], head := pre.length + 1,
+          output := pre, work := wk, workHead := wh }
+      change Drun DIdTM 1 c = _
+      simp [c, Drun, Dhalted, Dstep, Dread, DIdTM,
+        DIdState.scan, DIdState.done, DIdState.start, DIdState.reject]
+  | cons b bs ih =>
+      rw [show (b :: bs).length + 1 = 1 + (bs.length + 1) by
+        simp [Nat.add_comm, Nat.add_left_comm]]
+      rw [Drun_add_eq]
+      let c : DConfig DIdState :=
+        { state := DIdState.scan, input := pre ++ b :: bs, head := pre.length + 1,
+          output := pre, work := wk, workHead := wh }
+      let c' : DConfig DIdState :=
+        { state := DIdState.scan, input := pre ++ b :: bs, head := pre.length + 2,
+          output := pre ++ [b], work := wk, workHead := wh }
+      have hstep : Drun DIdTM 1 c = c' := by
+        simp [c, c', Drun, Dhalted, Dstep, Dread, DIdTM, Dmove,
+          DIdState.scan, DIdState.done, DIdState.start, DIdState.reject]
+      change Drun DIdTM (bs.length + 1) (Drun DIdTM 1 c) = _
+      rw [hstep]
+      simpa [c', List.append_assoc, Nat.add_comm, Nat.add_left_comm] using ih (pre := pre ++ [b])
+
+lemma dPolyTimeComputable_id : DPolyTimeComputable id := by
+  refine ⟨DIdState, inferInstance, inferInstance, DIdTM, X + C 2, X, ?_, ?_⟩
+  · intro x
+    have hstart := Drun_DIdTM_start x
+    have hfinal : Drun DIdTM (x.length + 1)
+        { state := DIdState.scan, input := x, head := 1, output := [],
+          work := fun _ : Nat => false, workHead := 0 } =
+        { state := DIdState.done, input := x, head := x.length + 1,
+          output := x, work := fun _ : Nat => false, workHead := 0 } := by
+      simpa using (Drun_DIdTM_scan_suffix [] x (fun _ : Nat => false) 0)
+    simp only [Polynomial.eval_add, Polynomial.eval_X, Polynomial.eval_C]
+    change Dhalted DIdTM (Drun DIdTM (x.length + 2) (Dinit DIdTM x)) = true
+    rw [show x.length + 2 = 1 + (x.length + 1) by omega, Drun_add_eq, hstart, hfinal]
+    simp [Dhalted, DIdTM]
+  · intro x
+    have hstart := Drun_DIdTM_start x
+    have hfinal : Drun DIdTM (x.length + 1)
+        { state := DIdState.scan, input := x, head := 1, output := [],
+          work := fun _ : Nat => false, workHead := 0 } =
+        { state := DIdState.done, input := x, head := x.length + 1,
+          output := x, work := fun _ : Nat => false, workHead := 0 } := by
+      simpa using (Drun_DIdTM_scan_suffix [] x (fun _ : Nat => false) 0)
+    constructor
+    · change Dboutput DIdTM ((X + C 2 : TimeBound).eval x.length) x = id x
+      simp only [Polynomial.eval_add, Polynomial.eval_X, Polynomial.eval_C]
+      dsimp [Dboutput]
+      rw [show x.length + 2 = 1 + (x.length + 1) by omega, Drun_add_eq, hstart, hfinal]
+    · simp
+
+-- -----------------------------------------------------------------------------
+-- 2d. Appending a fixed suffix
+-- -----------------------------------------------------------------------------
+
+/-- States of the append transducer.  States `0` and `1` copy the input; states
+    `2 ... y.length + 1` emit the bits of the fixed suffix `y`; the last state
+    is halting. -/
+abbrev DAppendState (y : Word) := Fin (y.length + 3)
+
+namespace DAppendState
+
+def start (y : Word) : DAppendState y := ⟨0, by omega⟩
+def scan (y : Word) : DAppendState y := ⟨1, by omega⟩
+def emitStart (y : Word) : DAppendState y := ⟨2, by omega⟩
+def done (y : Word) : DAppendState y := ⟨y.length + 2, by omega⟩
+
+end DAppendState
+
+/-- Copy the input, then append the fixed word `y`. -/
+def DAppendTM (y : Word) : DTM (DAppendState y) where
+  step := fun q sym _ =>
+    if q = DAppendState.start y then
+      { next := DAppendState.scan y, output := none, inputMove := some true
+        workWrite := none, workMove := none }
+    else if q = DAppendState.scan y then
+      match sym with
+      | some b =>
+          { next := DAppendState.scan y, output := some b, inputMove := some true
+            workWrite := none, workMove := none }
+      | none =>
+          { next := DAppendState.emitStart y, output := none, inputMove := none
+            workWrite := none, workMove := none }
+    else if hq : q.val < y.length + 2 then
+      { next := ⟨q.val + 1, by
+          exact Nat.lt_of_le_of_lt (Nat.succ_le_of_lt ‹q.val < y.length + 2›)
+            (Nat.lt_succ_self (y.length + 2))⟩,
+        output := some (y.getD (q.val - 2) false),
+        inputMove := none, workWrite := none, workMove := none }
+    else
+      { next := q, output := none, inputMove := none
+        workWrite := none, workMove := none }
+  start := DAppendState.start y
+  accept := DAppendState.done y
+  reject := DAppendState.done y
+
+lemma Drun_DAppendTM_start (y x : Word) :
+    Drun (DAppendTM y) 1 (Dinit (DAppendTM y) x) =
+      { state := DAppendState.scan y, input := x, head := 1, output := [],
+        work := fun _ : Nat => false, workHead := 0 } := by
+  simp [Drun, Dhalted, Dinit, Dstep, Dread, DAppendTM, Dmove,
+    DAppendState.start, DAppendState.scan, DAppendState.emitStart,
+    DAppendState.done]
+
+/-- The scan phase emits `pre ++ suffix` and enters the fixed-suffix phase. -/
+lemma Drun_DAppendTM_scan_suffix (y pre suffix : Word) (wk : Nat → Bool) (wh : Nat) :
+    Drun (DAppendTM y) (suffix.length + 1)
+      { state := DAppendState.scan y, input := pre ++ suffix, head := pre.length + 1,
+        output := pre, work := wk, workHead := wh } =
+      { state := DAppendState.emitStart y, input := pre ++ suffix,
+        head := (pre ++ suffix).length + 1, output := pre ++ suffix,
+        work := wk, workHead := wh } := by
+  induction suffix generalizing pre with
+  | nil =>
+      let c : DConfig (DAppendState y) :=
+        { state := DAppendState.scan y, input := pre ++ [], head := pre.length + 1,
+          output := pre, work := wk, workHead := wh }
+      change Drun (DAppendTM y) 1 c = _
+      simp [c, Drun, Dhalted, Dstep, Dread, DAppendTM,
+        DAppendState.start, DAppendState.scan, DAppendState.emitStart,
+        DAppendState.done]
+  | cons b bs ih =>
+      rw [show (b :: bs).length + 1 = 1 + (bs.length + 1) by
+        simp [Nat.add_comm, Nat.add_left_comm]]
+      rw [Drun_add_eq]
+      let c : DConfig (DAppendState y) :=
+        { state := DAppendState.scan y, input := pre ++ b :: bs, head := pre.length + 1,
+          output := pre, work := wk, workHead := wh }
+      let c' : DConfig (DAppendState y) :=
+        { state := DAppendState.scan y, input := pre ++ b :: bs, head := pre.length + 2,
+          output := pre ++ [b], work := wk, workHead := wh }
+      have hstep : Drun (DAppendTM y) 1 c = c' := by
+        simp [c, c', Drun, Dhalted, Dstep, Dread, DAppendTM, Dmove,
+          DAppendState.start, DAppendState.scan, DAppendState.emitStart,
+          DAppendState.done]
+      change Drun (DAppendTM y) (bs.length + 1) (Drun (DAppendTM y) 1 c) = _
+      rw [hstep]
+      simpa [c', List.append_assoc, Nat.add_comm, Nat.add_left_comm] using ih (pre := pre ++ [b])
+
+/-- The fixed-suffix phase emits `suffix` without touching the input or work tape. -/
+lemma Drun_DAppendTM_emit_suffix (y : Word) :
+    ∀ (preY suffix : Word) (hy : y = preY ++ suffix),
+    ∀ (inp out : Word) (h : Nat) (wk : Nat → Bool) (wh : Nat),
+      Drun (DAppendTM y) suffix.length
+        { state := ⟨preY.length + 2, by
+            have hlen : y.length = preY.length + suffix.length := by
+              rw [hy]
+              simp
+            omega⟩, input := inp, head := h,
+          output := out, work := wk, workHead := wh } =
+        { state := ⟨(preY ++ suffix).length + 2, by
+            have hlen : y.length = preY.length + suffix.length := by
+              rw [hy]
+              simp
+            have happ : (preY ++ suffix).length = preY.length + suffix.length := by simp
+            omega⟩, input := inp, head := h,
+          output := out ++ suffix, work := wk, workHead := wh } := by
+  intro preY suffix hy
+  induction suffix generalizing preY with
+  | nil =>
+      intro inp out h wk wh
+      subst y
+      simp [Drun]
+  | cons b bs ih =>
+      intro inp out h wk wh
+      change Drun (DAppendTM y) (bs.length + 1)
+        { state := ⟨preY.length + 2, by
+            have hlen : y.length = preY.length + (b :: bs).length := by
+              rw [hy]
+              simp
+            omega⟩, input := inp, head := h,
+          output := out, work := wk, workHead := wh } = _
+      rw [Drun_succ_eq_run_nextConfig]
+      have hy' : y = (preY ++ [b]) ++ bs := by simpa [List.append_assoc] using hy
+      have hlt : preY.length + 2 < y.length + 2 := by
+        rw [hy]
+        simp
+      have hne : preY.length ≠ y.length := by omega
+      have hlt' : (preY ++ [b]).length + 2 < y.length + 3 := by
+        rw [hy']
+        simp
+      have hget : y[preY.length]?.getD false = b := by
+        rw [hy]
+        simp
+      have hnext : DnextConfig (DAppendTM y)
+          { state := ⟨preY.length + 2, by
+              have hlen : y.length = preY.length + (b :: bs).length := by
+                rw [hy]
+                simp
+              omega⟩, input := inp, head := h,
+            output := out, work := wk, workHead := wh } =
+          { state := ⟨(preY ++ [b]).length + 2, hlt'⟩, input := inp, head := h,
+            output := out ++ [b], work := wk, workHead := wh } := by
+        simp [DnextConfig, Dhalted, Dstep, DAppendTM, hlt, hne, hget,
+          DAppendState.start, DAppendState.scan, DAppendState.done]
+      rw [hnext]
+      simpa [List.append_assoc, Nat.add_comm, Nat.add_left_comm] using
+        ih (preY := preY ++ [b]) hy' inp (out ++ [b]) h wk wh
+
+theorem dPolyTimeComputable_append (y : Word) : DPolyTimeComputable (fun x => x ++ y) := by
+  refine ⟨DAppendState y, inferInstance, inferInstance, DAppendTM y,
+    X + C (y.length + 2), X + C y.length, ?_, ?_⟩
+  · intro x
+    have hstart := Drun_DAppendTM_start y x
+    have hscan : Drun (DAppendTM y) (x.length + 1)
+        { state := DAppendState.scan y, input := x, head := 1, output := [],
+          work := fun _ : Nat => false, workHead := 0 } =
+        { state := DAppendState.emitStart y, input := x, head := x.length + 1,
+          output := x, work := fun _ : Nat => false, workHead := 0 } := by
+      simpa using (Drun_DAppendTM_scan_suffix y [] x (fun _ : Nat => false) 0)
+    have hemit : Drun (DAppendTM y) y.length
+        { state := DAppendState.emitStart y, input := x, head := x.length + 1,
+          output := x, work := fun _ : Nat => false, workHead := 0 } =
+        { state := DAppendState.done y, input := x, head := x.length + 1,
+          output := x ++ y, work := fun _ : Nat => false, workHead := 0 } := by
+      simpa [DAppendState.emitStart, DAppendState.done] using
+        (Drun_DAppendTM_emit_suffix y [] y rfl x x (x.length + 1)
+          (fun _ : Nat => false) 0)
+    simp only [Polynomial.eval_add, Polynomial.eval_X, Polynomial.eval_C]
+    change Dhalted (DAppendTM y)
+      (Drun (DAppendTM y) (x.length + (y.length + 2))
+        (Dinit (DAppendTM y) x)) = true
+    rw [show x.length + (y.length + 2) = 1 + ((x.length + 1) + y.length) by omega]
+    rw [Drun_add_eq, hstart]
+    rw [Drun_add_eq, hscan, hemit]
+    simp [Dhalted, DAppendTM, DAppendState.done]
+  · intro x
+    have hstart := Drun_DAppendTM_start y x
+    have hscan : Drun (DAppendTM y) (x.length + 1)
+        { state := DAppendState.scan y, input := x, head := 1, output := [],
+          work := fun _ : Nat => false, workHead := 0 } =
+        { state := DAppendState.emitStart y, input := x, head := x.length + 1,
+          output := x, work := fun _ : Nat => false, workHead := 0 } := by
+      simpa using (Drun_DAppendTM_scan_suffix y [] x (fun _ : Nat => false) 0)
+    have hemit : Drun (DAppendTM y) y.length
+        { state := DAppendState.emitStart y, input := x, head := x.length + 1,
+          output := x, work := fun _ : Nat => false, workHead := 0 } =
+        { state := DAppendState.done y, input := x, head := x.length + 1,
+          output := x ++ y, work := fun _ : Nat => false, workHead := 0 } := by
+      simpa [DAppendState.emitStart, DAppendState.done] using
+        (Drun_DAppendTM_emit_suffix y [] y rfl x x (x.length + 1)
+          (fun _ : Nat => false) 0)
+    constructor
+    · change Dboutput (DAppendTM y) ((X + C (y.length + 2) : TimeBound).eval x.length) x = x ++ y
+      simp only [Polynomial.eval_add, Polynomial.eval_X, Polynomial.eval_C]
+      dsimp [Dboutput]
+      rw [show x.length + (y.length + 2) = 1 + ((x.length + 1) + y.length) by omega]
+      rw [Drun_add_eq, hstart]
+      rw [Drun_add_eq, hscan, hemit]
+    · simp
+
+-- -----------------------------------------------------------------------------
+-- 2e. Prefixing a fixed word
+-- -----------------------------------------------------------------------------
+
+/-- States of the prefix transducer.  States below `y.length` emit the fixed
+    prefix, then one startup step enters the input-copy loop. -/
+abbrev DPrependState (y : Word) := Fin (y.length + 3)
+
+namespace DPrependState
+
+def emitStart (y : Word) : DPrependState y := ⟨0, by omega⟩
+def copyStart (y : Word) : DPrependState y := ⟨y.length, by omega⟩
+def copy (y : Word) : DPrependState y := ⟨y.length + 1, by omega⟩
+def done (y : Word) : DPrependState y := ⟨y.length + 2, by omega⟩
+
+end DPrependState
+
+/-- Emit the fixed word `y`, then copy the input after it. -/
+def DPrependTM (y : Word) : DTM (DPrependState y) where
+  step := fun q sym _ =>
+    if hq : q.val < y.length then
+      { next := ⟨q.val + 1, by
+          exact Nat.lt_of_le_of_lt (Nat.succ_le_of_lt hq)
+            (by omega : y.length < y.length + 3)⟩,
+        output := some (y[q.val]?.getD false), inputMove := none,
+        workWrite := none, workMove := none }
+    else if q = DPrependState.copyStart y then
+      { next := DPrependState.copy y, output := none, inputMove := some true
+        workWrite := none, workMove := none }
+    else if q = DPrependState.copy y then
+      match sym with
+      | some b =>
+          { next := DPrependState.copy y, output := some b, inputMove := some true
+            workWrite := none, workMove := none }
+      | none =>
+          { next := DPrependState.done y, output := none, inputMove := none
+            workWrite := none, workMove := none }
+    else
+      { next := q, output := none, inputMove := none
+        workWrite := none, workMove := none }
+  start := DPrependState.emitStart y
+  accept := DPrependState.done y
+  reject := DPrependState.done y
+
+/-- The fixed-prefix phase emits `suffix` and enters the copy-start state. -/
+lemma Drun_DPrependTM_emit_prefix (y : Word) :
+    ∀ (pre suffix : Word) (hy : y = pre ++ suffix),
+    ∀ (inp out : Word) (h : Nat) (wk : Nat → Bool) (wh : Nat),
+      Drun (DPrependTM y) suffix.length
+        { state := ⟨pre.length, by
+            have hlen : y.length = pre.length + suffix.length := by
+              rw [hy]
+              simp
+            omega⟩, input := inp, head := h,
+          output := out, work := wk, workHead := wh } =
+        { state := ⟨(pre ++ suffix).length, by
+            have hlen : y.length = pre.length + suffix.length := by
+              rw [hy]
+              simp
+            have happ : (pre ++ suffix).length = pre.length + suffix.length := by simp
+            omega⟩, input := inp, head := h,
+          output := out ++ suffix, work := wk, workHead := wh } := by
+  intro pre suffix hy
+  induction suffix generalizing pre with
+  | nil =>
+      intro inp out h wk wh
+      subst y
+      simp [Drun]
+  | cons b bs ih =>
+      intro inp out h wk wh
+      change Drun (DPrependTM y) (bs.length + 1)
+        { state := ⟨pre.length, by
+            have hlen : y.length = pre.length + (b :: bs).length := by
+              rw [hy]
+              simp
+            omega⟩, input := inp, head := h,
+          output := out, work := wk, workHead := wh } = _
+      rw [Drun_succ_eq_run_nextConfig]
+      have hy' : y = (pre ++ [b]) ++ bs := by simpa [List.append_assoc] using hy
+      have hlt : pre.length < y.length := by
+        rw [hy]
+        simp
+      have hlt' : (pre ++ [b]).length < y.length + 3 := by
+        rw [hy']
+        simp
+        omega
+      have hne : pre.length ≠ y.length + 2 := by omega
+      have hgetD : y[pre.length]?.getD false = b := by
+        rw [hy]
+        simp
+      have hget : y[pre.length] = b := by
+        rw [← List.getD_eq_getElem y false hlt]
+        exact hgetD
+      have hnext : DnextConfig (DPrependTM y)
+          { state := ⟨pre.length, by
+              have hlen : y.length = pre.length + (b :: bs).length := by
+                rw [hy]
+                simp
+              omega⟩, input := inp, head := h,
+            output := out, work := wk, workHead := wh } =
+          { state := ⟨(pre ++ [b]).length, hlt'⟩, input := inp, head := h,
+            output := out ++ [b], work := wk, workHead := wh } := by
+        simp [DnextConfig, Dhalted, Dstep, DPrependTM, hlt, hne, hget,
+          DPrependState.emitStart, DPrependState.copyStart,
+          DPrependState.copy, DPrependState.done]
+      rw [hnext]
+      simpa [List.append_assoc, Nat.add_comm, Nat.add_left_comm] using
+        ih (pre := pre ++ [b]) hy' inp (out ++ [b]) h wk wh
+
+lemma Drun_DPrependTM_copy_start (y x : Word) (wk : Nat → Bool) (wh : Nat) :
+    Drun (DPrependTM y) 1
+      { state := DPrependState.copyStart y, input := x, head := 0, output := y,
+        work := wk, workHead := wh } =
+      { state := DPrependState.copy y, input := x, head := 1, output := y,
+        work := wk, workHead := wh } := by
+  simp [Drun, Dhalted, Dstep, Dread, DPrependTM, Dmove,
+    DPrependState.emitStart, DPrependState.copyStart,
+    DPrependState.copy, DPrependState.done]
+
+/-- The copy phase emits `pre ++ suffix` after the prefix. -/
+lemma Drun_DPrependTM_copy_suffix (y pre suffix : Word)
+    (out : Word) (wk : Nat → Bool) (wh : Nat) :
+    Drun (DPrependTM y) (suffix.length + 1)
+      { state := DPrependState.copy y, input := pre ++ suffix,
+        head := pre.length + 1, output := out, work := wk, workHead := wh } =
+      { state := DPrependState.done y, input := pre ++ suffix,
+        head := (pre ++ suffix).length + 1, output := out ++ suffix,
+        work := wk, workHead := wh } := by
+  induction suffix generalizing pre out with
+  | nil =>
+      let c : DConfig (DPrependState y) :=
+        { state := DPrependState.copy y, input := pre ++ [], head := pre.length + 1,
+          output := out, work := wk, workHead := wh }
+      change Drun (DPrependTM y) 1 c = _
+      simp [c, Drun, Dhalted, Dstep, Dread, DPrependTM,
+        DPrependState.emitStart, DPrependState.copyStart,
+        DPrependState.copy, DPrependState.done]
+  | cons b bs ih =>
+      rw [show (b :: bs).length + 1 = 1 + (bs.length + 1) by
+        simp [Nat.add_comm, Nat.add_left_comm]]
+      rw [Drun_add_eq]
+      let c : DConfig (DPrependState y) :=
+        { state := DPrependState.copy y, input := pre ++ b :: bs,
+          head := pre.length + 1, output := out, work := wk, workHead := wh }
+      let c' : DConfig (DPrependState y) :=
+        { state := DPrependState.copy y, input := pre ++ b :: bs,
+          head := pre.length + 2, output := out ++ [b], work := wk, workHead := wh }
+      have hstep : Drun (DPrependTM y) 1 c = c' := by
+        simp [c, c', Drun, Dhalted, Dstep, Dread, DPrependTM, Dmove,
+          DPrependState.emitStart, DPrependState.copyStart,
+          DPrependState.copy, DPrependState.done]
+      change Drun (DPrependTM y) (bs.length + 1) (Drun (DPrependTM y) 1 c) = _
+      rw [hstep]
+      simpa [c', List.append_assoc, Nat.add_comm, Nat.add_left_comm] using
+        ih (pre := pre ++ [b]) (out := out ++ [b])
+
+theorem dPolyTimeComputable_prepend (y : Word) :
+    DPolyTimeComputable (fun x => y ++ x) := by
+  refine ⟨DPrependState y, inferInstance, inferInstance, DPrependTM y,
+    X + C (y.length + 2), X + C y.length, ?_, ?_⟩
+  · intro x
+    have hprefix : Drun (DPrependTM y) y.length
+        { state := DPrependState.emitStart y, input := x, head := 0, output := [],
+          work := fun _ : Nat => false, workHead := 0 } =
+        { state := DPrependState.copyStart y, input := x, head := 0, output := y,
+          work := fun _ : Nat => false, workHead := 0 } := by
+      simpa [DPrependState.emitStart, DPrependState.copyStart] using
+        (Drun_DPrependTM_emit_prefix y [] y rfl x [] 0 (fun _ : Nat => false) 0)
+    have hcopyStart := Drun_DPrependTM_copy_start y x (fun _ : Nat => false) 0
+    have hcopy : Drun (DPrependTM y) (x.length + 1)
+        { state := DPrependState.copy y, input := x, head := 1, output := y,
+          work := fun _ : Nat => false, workHead := 0 } =
+        { state := DPrependState.done y, input := x, head := x.length + 1,
+          output := y ++ x, work := fun _ : Nat => false, workHead := 0 } := by
+      simpa using (Drun_DPrependTM_copy_suffix y [] x y (fun _ : Nat => false) 0)
+    simp only [Polynomial.eval_add, Polynomial.eval_X, Polynomial.eval_C]
+    change Dhalted (DPrependTM y)
+      (Drun (DPrependTM y) (x.length + (y.length + 2))
+        (Dinit (DPrependTM y) x)) = true
+    dsimp [Dinit]
+    change Dhalted (DPrependTM y)
+      (Drun (DPrependTM y) (x.length + (y.length + 2))
+        { state := DPrependState.emitStart y, input := x, head := 0, output := [],
+          work := fun _ : Nat => false, workHead := 0 }) = true
+    rw [show x.length + (y.length + 2) = y.length + (1 + (x.length + 1)) by omega]
+    rw [Drun_add_eq, hprefix]
+    rw [Drun_add_eq, hcopyStart]
+    rw [hcopy]
+    simp [Dhalted, DPrependTM, DPrependState.done]
+  · intro x
+    have hprefix : Drun (DPrependTM y) y.length
+        { state := DPrependState.emitStart y, input := x, head := 0, output := [],
+          work := fun _ : Nat => false, workHead := 0 } =
+        { state := DPrependState.copyStart y, input := x, head := 0, output := y,
+          work := fun _ : Nat => false, workHead := 0 } := by
+      simpa [DPrependState.emitStart, DPrependState.copyStart] using
+        (Drun_DPrependTM_emit_prefix y [] y rfl x [] 0 (fun _ : Nat => false) 0)
+    have hcopyStart := Drun_DPrependTM_copy_start y x (fun _ : Nat => false) 0
+    have hcopy : Drun (DPrependTM y) (x.length + 1)
+        { state := DPrependState.copy y, input := x, head := 1, output := y,
+          work := fun _ : Nat => false, workHead := 0 } =
+        { state := DPrependState.done y, input := x, head := x.length + 1,
+          output := y ++ x, work := fun _ : Nat => false, workHead := 0 } := by
+      simpa using (Drun_DPrependTM_copy_suffix y [] x y (fun _ : Nat => false) 0)
+    constructor
+    · change Dboutput (DPrependTM y) ((X + C (y.length + 2) : TimeBound).eval x.length) x =
+        y ++ x
+      simp only [Polynomial.eval_add, Polynomial.eval_X, Polynomial.eval_C]
+      dsimp [Dboutput, Dinit]
+      change (Drun (DPrependTM y) (x.length + (y.length + 2))
+        { state := DPrependState.emitStart y, input := x, head := 0, output := [],
+          work := fun _ : Nat => false, workHead := 0 }).output = y ++ x
+      rw [show x.length + (y.length + 2) = y.length + (1 + (x.length + 1)) by omega]
+      rw [Drun_add_eq, hprefix]
+      rw [Drun_add_eq, hcopyStart]
+      rw [hcopy]
+    · simp [Nat.add_comm]
+
+-- -----------------------------------------------------------------------------
+-- 2f. Emitting a fixed word
+-- -----------------------------------------------------------------------------
+
+/-- States of the constant transducer.  State `i < y.length` emits `y[i]`; the
+    last state is halting. -/
+abbrev DConstState (y : Word) := Fin (y.length + 1)
+
+namespace DConstState
+
+def start (y : Word) : DConstState y := ⟨0, by omega⟩
+def done (y : Word) : DConstState y := ⟨y.length, by omega⟩
+
+end DConstState
+
+/-- Ignore the input and emit the fixed word `y`. -/
+def DConstTM (y : Word) : DTM (DConstState y) where
+  step := fun q _ _ =>
+    if hq : q.val < y.length then
+      { next := ⟨q.val + 1, by
+          exact Nat.lt_of_le_of_lt (Nat.succ_le_of_lt hq)
+            (Nat.lt_succ_self y.length)⟩,
+        output := some (y[q.val]?.getD false), inputMove := none,
+        workWrite := none, workMove := none }
+    else
+      { next := q, output := none, inputMove := none
+        workWrite := none, workMove := none }
+  start := DConstState.start y
+  accept := DConstState.done y
+  reject := DConstState.done y
+
+/-- The fixed-word phase emits `suffix` without touching the input or work tape. -/
+lemma Drun_DConstTM_emit_prefix (y : Word) :
+    ∀ (pre suffix : Word) (hy : y = pre ++ suffix),
+    ∀ (inp out : Word) (h : Nat) (wk : Nat → Bool) (wh : Nat),
+      Drun (DConstTM y) suffix.length
+        { state := ⟨pre.length + 0, by
+            have hlen : y.length = pre.length + suffix.length := by
+              rw [hy]
+              simp
+            omega⟩, input := inp, head := h,
+          output := out, work := wk, workHead := wh } =
+        { state := ⟨(pre ++ suffix).length + 0, by
+            have hlen : y.length = pre.length + suffix.length := by
+              rw [hy]
+              simp
+            have happ : (pre ++ suffix).length = pre.length + suffix.length := by simp
+            omega⟩, input := inp, head := h,
+          output := out ++ suffix, work := wk, workHead := wh } := by
+  intro pre suffix hy
+  induction suffix generalizing pre with
+  | nil =>
+      intro inp out h wk wh
+      subst y
+      simp [Drun]
+  | cons b bs ih =>
+      intro inp out h wk wh
+      change Drun (DConstTM y) (bs.length + 1)
+        { state := ⟨pre.length + 0, by
+            have hlen : y.length = pre.length + (b :: bs).length := by
+              rw [hy]
+              simp
+            omega⟩, input := inp, head := h,
+          output := out, work := wk, workHead := wh } = _
+      rw [Drun_succ_eq_run_nextConfig]
+      have hy' : y = (pre ++ [b]) ++ bs := by simpa [List.append_assoc] using hy
+      have hlt : pre.length < y.length := by
+        rw [hy]
+        simp
+      have hne : pre.length ≠ y.length := by omega
+      have hlt' : (pre ++ [b]).length < y.length + 1 := by
+        rw [hy']
+        simp
+      have hgetD : y[pre.length]?.getD false = b := by
+        rw [hy]
+        simp
+      have hget : y[pre.length] = b := by
+        rw [← List.getD_eq_getElem y false hlt]
+        exact hgetD
+      have hnext : DnextConfig (DConstTM y)
+          { state := ⟨pre.length + 0, by
+              have hlen : y.length = pre.length + (b :: bs).length := by
+                rw [hy]
+                simp
+              omega⟩, input := inp, head := h,
+            output := out, work := wk, workHead := wh } =
+          { state := ⟨(pre ++ [b]).length + 0, hlt'⟩, input := inp, head := h,
+            output := out ++ [b], work := wk, workHead := wh } := by
+        simp [DnextConfig, Dhalted, Dstep, DConstTM, hlt, hne, hget,
+          DConstState.start, DConstState.done]
+      rw [hnext]
+      simpa [List.append_assoc, Nat.add_comm, Nat.add_left_comm] using
+        ih (pre := pre ++ [b]) hy' inp (out ++ [b]) h wk wh
+
+theorem dPolyTimeComputable_const (y : Word) : DPolyTimeComputable (fun _ => y) := by
+  refine ⟨DConstState y, inferInstance, inferInstance, DConstTM y,
+    C y.length, C y.length, ?_, ?_⟩
+  · intro x
+    have hem : Drun (DConstTM y) y.length
+        { state := DConstState.start y, input := x, head := 0, output := [],
+          work := fun _ : Nat => false, workHead := 0 } =
+        { state := DConstState.done y, input := x, head := 0, output := y,
+          work := fun _ : Nat => false, workHead := 0 } := by
+      simpa [DConstState.start, DConstState.done] using
+        (Drun_DConstTM_emit_prefix y [] y rfl x [] 0 (fun _ : Nat => false) 0)
+    simp only [Polynomial.eval_C]
+    change Dhalted (DConstTM y)
+      (Drun (DConstTM y) y.length (Dinit (DConstTM y) x)) = true
+    dsimp [Dinit]
+    change Dhalted (DConstTM y)
+      (Drun (DConstTM y) y.length
+        { state := DConstState.start y, input := x, head := 0, output := [],
+          work := fun _ : Nat => false, workHead := 0 }) = true
+    rw [hem]
+    simp [Dhalted, DConstTM, DConstState.done]
+  · intro x
+    have hem : Drun (DConstTM y) y.length
+        { state := DConstState.start y, input := x, head := 0, output := [],
+          work := fun _ : Nat => false, workHead := 0 } =
+        { state := DConstState.done y, input := x, head := 0, output := y,
+          work := fun _ : Nat => false, workHead := 0 } := by
+      simpa [DConstState.start, DConstState.done] using
+        (Drun_DConstTM_emit_prefix y [] y rfl x [] 0 (fun _ : Nat => false) 0)
+    constructor
+    · change Dboutput (DConstTM y) ((C y.length : TimeBound).eval x.length) x = y
+      simp only [Polynomial.eval_C]
+      dsimp [Dboutput, Dinit]
+      change (Drun (DConstTM y) y.length
+        { state := DConstState.start y, input := x, head := 0, output := [],
+          work := fun _ : Nat => false, workHead := 0 }).output = y
+      rw [hem]
+    · simp
+
+-- -----------------------------------------------------------------------------
+-- 2g. A length-dependent unary encoding
+-- -----------------------------------------------------------------------------
+
+/-- States of the unary-length transducer. -/
+abbrev DUnaryLengthState := Fin 6
+
+namespace DUnaryLengthState
+
+def start : DUnaryLengthState := ⟨0, by decide⟩
+def copy : DUnaryLengthState := ⟨1, by decide⟩
+def handoff : DUnaryLengthState := ⟨2, by decide⟩
+def countStart : DUnaryLengthState := ⟨3, by decide⟩
+def count : DUnaryLengthState := ⟨4, by decide⟩
+def done : DUnaryLengthState := ⟨5, by decide⟩
+
+end DUnaryLengthState
+
+/-- Compute `encodeNat x.length = replicate x.length true ++ [false]`.  The
+    first pass copies the input to the output; the handoff turns that output
+    into the new input; the second pass emits one `true` per input bit. -/
+def DUnaryLengthTM : DTM DUnaryLengthState where
+  step := fun q sym _ =>
+    if q = DUnaryLengthState.start then
+      { next := DUnaryLengthState.copy, output := none, inputMove := some true
+        workWrite := none, workMove := none }
+    else if q = DUnaryLengthState.copy then
+      match sym with
+      | some b =>
+          { next := DUnaryLengthState.copy, output := some b, inputMove := some true
+            workWrite := none, workMove := none }
+      | none =>
+          { next := DUnaryLengthState.handoff, output := none, inputMove := none
+            workWrite := none, workMove := none }
+    else if q = DUnaryLengthState.handoff then
+      { next := DUnaryLengthState.countStart, output := none, inputMove := none
+        workWrite := none, workMove := none }
+    else if q = DUnaryLengthState.countStart then
+      { next := DUnaryLengthState.count, output := none, inputMove := some true
+        workWrite := none, workMove := none }
+    else if q = DUnaryLengthState.count then
+      match sym with
+      | some _ =>
+          { next := DUnaryLengthState.count, output := some true, inputMove := some true
+            workWrite := none, workMove := none }
+      | none =>
+          { next := DUnaryLengthState.done, output := some false, inputMove := none
+            workWrite := none, workMove := none }
+    else
+      { next := q, output := none, inputMove := none
+        workWrite := none, workMove := none }
+  handoff := fun q => q = DUnaryLengthState.handoff
+  start := DUnaryLengthState.start
+  accept := DUnaryLengthState.done
+  reject := DUnaryLengthState.done
+
+lemma Drun_DUnaryLengthTM_start (x : Word) :
+    Drun DUnaryLengthTM 1 (Dinit DUnaryLengthTM x) =
+      { state := DUnaryLengthState.copy, input := x, head := 1, output := [],
+        work := fun _ : Nat => false, workHead := 0 } := by
+  simp [Drun, Dhalted, Dinit, Dstep, Dread, DUnaryLengthTM, Dmove,
+    DUnaryLengthState.start, DUnaryLengthState.copy, DUnaryLengthState.handoff,
+    DUnaryLengthState.count, DUnaryLengthState.done]
+
+/-- The copy phase emits `pre ++ suffix` and enters the handoff state. -/
+lemma Drun_DUnaryLengthTM_copy_suffix (pre suffix : Word)
+    (wk : Nat → Bool) (wh : Nat) :
+    Drun DUnaryLengthTM (suffix.length + 1)
+      { state := DUnaryLengthState.copy, input := pre ++ suffix,
+        head := pre.length + 1, output := pre, work := wk, workHead := wh } =
+      { state := DUnaryLengthState.handoff, input := pre ++ suffix,
+        head := (pre ++ suffix).length + 1, output := pre ++ suffix,
+        work := wk, workHead := wh } := by
+  induction suffix generalizing pre with
+  | nil =>
+      let c : DConfig DUnaryLengthState :=
+        { state := DUnaryLengthState.copy, input := pre ++ [], head := pre.length + 1,
+          output := pre, work := wk, workHead := wh }
+      change Drun DUnaryLengthTM 1 c = _
+      simp [c, Drun, Dhalted, Dstep, Dread, DUnaryLengthTM,
+        DUnaryLengthState.start, DUnaryLengthState.copy,
+        DUnaryLengthState.handoff, DUnaryLengthState.countStart,
+    DUnaryLengthState.count,
+        DUnaryLengthState.done]
+  | cons b bs ih =>
+      rw [show (b :: bs).length + 1 = 1 + (bs.length + 1) by
+        simp [Nat.add_comm, Nat.add_left_comm]]
+      rw [Drun_add_eq]
+      let c : DConfig DUnaryLengthState :=
+        { state := DUnaryLengthState.copy, input := pre ++ b :: bs,
+          head := pre.length + 1, output := pre, work := wk, workHead := wh }
+      let c' : DConfig DUnaryLengthState :=
+        { state := DUnaryLengthState.copy, input := pre ++ b :: bs,
+          head := pre.length + 2, output := pre ++ [b], work := wk, workHead := wh }
+      have hstep : Drun DUnaryLengthTM 1 c = c' := by
+        simp [c, c', Drun, Dhalted, Dstep, Dread, DUnaryLengthTM, Dmove,
+          DUnaryLengthState.start, DUnaryLengthState.copy,
+          DUnaryLengthState.handoff, DUnaryLengthState.countStart,
+    DUnaryLengthState.count,
+          DUnaryLengthState.done]
+      change Drun DUnaryLengthTM (bs.length + 1) (Drun DUnaryLengthTM 1 c) = _
+      rw [hstep]
+      simpa [c', List.append_assoc, Nat.add_comm, Nat.add_left_comm] using ih (pre := pre ++ [b])
+
+/-- A handoff resets the heads, replaces the input by the output, clears the
+    output, and blanks the work tape. -/
+lemma Drun_DUnaryLengthTM_handoff (x : Word) (_h : Nat)
+    (wk : Nat → Bool) (wh : Nat) :
+    Drun DUnaryLengthTM 1
+      { state := DUnaryLengthState.handoff, input := x, head := _h, output := x,
+        work := wk, workHead := wh } =
+      { state := DUnaryLengthState.countStart, input := x, head := 0, output := [],
+        work := fun _ : Nat => false, workHead := 0 } := by
+  rw [Drun_succ_eq_run_nextConfig]
+  simp [Drun, DnextConfig, Dhalted, Dstep, Dread, DUnaryLengthTM,
+    DUnaryLengthState.start, DUnaryLengthState.copy,
+    DUnaryLengthState.handoff, DUnaryLengthState.countStart,
+    DUnaryLengthState.count,
+    DUnaryLengthState.done]
+
+/-- Leave the left boundary before counting the input bits. -/
+lemma Drun_DUnaryLengthTM_count_start (x : Word) :
+    Drun DUnaryLengthTM 1
+      { state := DUnaryLengthState.countStart, input := x, head := 0,
+        output := [], work := fun _ : Nat => false, workHead := 0 } =
+      { state := DUnaryLengthState.count, input := x, head := 1,
+        output := [], work := fun _ : Nat => false, workHead := 0 } := by
+  simp [Drun, Dhalted, Dstep, Dread, DUnaryLengthTM, Dmove,
+    DUnaryLengthState.start, DUnaryLengthState.copy,
+    DUnaryLengthState.handoff, DUnaryLengthState.countStart,
+    DUnaryLengthState.count,
+    DUnaryLengthState.done]
+
+/-- The count phase emits one `true` per input bit and then a final `false`. -/
+lemma Drun_DUnaryLengthTM_count_suffix (pre suffix out : Word)
+    (wk : Nat → Bool) (wh : Nat) :
+    Drun DUnaryLengthTM (suffix.length + 1)
+      { state := DUnaryLengthState.count, input := pre ++ suffix,
+        head := pre.length + 1, output := out, work := wk, workHead := wh } =
+      { state := DUnaryLengthState.done, input := pre ++ suffix,
+        head := (pre ++ suffix).length + 1,
+        output := out ++ List.replicate suffix.length true ++ [false],
+        work := wk, workHead := wh } := by
+  induction suffix generalizing pre out with
+  | nil =>
+      let c : DConfig DUnaryLengthState :=
+        { state := DUnaryLengthState.count, input := pre ++ [], head := pre.length + 1,
+          output := out, work := wk, workHead := wh }
+      change Drun DUnaryLengthTM 1 c = _
+      simp [c, Drun, Dhalted, Dstep, Dread, DUnaryLengthTM,
+        DUnaryLengthState.start, DUnaryLengthState.copy,
+        DUnaryLengthState.handoff, DUnaryLengthState.countStart,
+    DUnaryLengthState.count,
+        DUnaryLengthState.done]
+  | cons b bs ih =>
+      rw [show (b :: bs).length + 1 = 1 + (bs.length + 1) by
+        simp [Nat.add_comm, Nat.add_left_comm]]
+      rw [Drun_add_eq]
+      let c : DConfig DUnaryLengthState :=
+        { state := DUnaryLengthState.count, input := pre ++ b :: bs,
+          head := pre.length + 1, output := out, work := wk, workHead := wh }
+      let c' : DConfig DUnaryLengthState :=
+        { state := DUnaryLengthState.count, input := pre ++ b :: bs,
+          head := pre.length + 2, output := out ++ [true],
+          work := wk, workHead := wh }
+      have hstep : Drun DUnaryLengthTM 1 c = c' := by
+        simp [c, c', Drun, Dhalted, Dstep, Dread, DUnaryLengthTM, Dmove,
+          DUnaryLengthState.start, DUnaryLengthState.copy,
+          DUnaryLengthState.handoff, DUnaryLengthState.countStart,
+    DUnaryLengthState.count,
+          DUnaryLengthState.done]
+      change Drun DUnaryLengthTM (bs.length + 1) (Drun DUnaryLengthTM 1 c) = _
+      rw [hstep]
+      simpa [c', List.replicate_succ, List.append_assoc, Nat.add_comm,
+        Nat.add_left_comm] using ih (pre := pre ++ [b]) (out := out ++ [true])
+
+theorem dPolyTimeComputable_unary_length :
+    DPolyTimeComputable (fun x => List.replicate x.length true ++ [false]) := by
+  refine ⟨DUnaryLengthState, inferInstance, inferInstance, DUnaryLengthTM,
+    C 2 * X + C 5, X + C 1, ?_, ?_⟩
+  · intro x
+    have hstart := Drun_DUnaryLengthTM_start x
+    have hcopy : Drun DUnaryLengthTM (x.length + 1)
+        { state := DUnaryLengthState.copy, input := x, head := 1, output := [],
+          work := fun _ : Nat => false, workHead := 0 } =
+        { state := DUnaryLengthState.handoff, input := x, head := x.length + 1,
+          output := x, work := fun _ : Nat => false, workHead := 0 } := by
+      simpa using (Drun_DUnaryLengthTM_copy_suffix [] x (fun _ : Nat => false) 0)
+    have hhand : Drun DUnaryLengthTM 1
+        { state := DUnaryLengthState.handoff, input := x, head := x.length + 1,
+          output := x, work := fun _ : Nat => false, workHead := 0 } =
+        { state := DUnaryLengthState.countStart, input := x, head := 0, output := [],
+          work := fun _ : Nat => false, workHead := 0 } := by
+      simpa using (Drun_DUnaryLengthTM_handoff x (x.length + 1)
+        (fun _ : Nat => false) 0)
+    have hcountStart : Drun DUnaryLengthTM 1
+        { state := DUnaryLengthState.countStart, input := x, head := 0,
+          output := [], work := fun _ : Nat => false, workHead := 0 } =
+        { state := DUnaryLengthState.count, input := x, head := 1,
+          output := [], work := fun _ : Nat => false, workHead := 0 } := by
+      simpa using (Drun_DUnaryLengthTM_count_start x)
+    have hcount : Drun DUnaryLengthTM (x.length + 1)
+        { state := DUnaryLengthState.count, input := x, head := 1, output := [],
+          work := fun _ : Nat => false, workHead := 0 } =
+        { state := DUnaryLengthState.done, input := x, head := x.length + 1,
+          output := List.replicate x.length true ++ [false],
+          work := fun _ : Nat => false, workHead := 0 } := by
+      simpa using
+        (Drun_DUnaryLengthTM_count_suffix [] x [] (fun _ : Nat => false) 0)
+    simp only [Polynomial.eval_mul, Polynomial.eval_add, Polynomial.eval_C,
+      Polynomial.eval_X]
+    change Dhalted DUnaryLengthTM
+      (Drun DUnaryLengthTM (2 * x.length + 5) (Dinit DUnaryLengthTM x)) = true
+    rw [show 2 * x.length + 5 = 1 + ((x.length + 1) + (1 + (1 + (x.length + 1)))) by omega]
+    rw [Drun_add_eq, hstart]
+    rw [Drun_add_eq, hcopy]
+    rw [Drun_add_eq, hhand]
+    rw [Drun_add_eq, hcountStart]
+    rw [hcount]
+    simp [Dhalted, DUnaryLengthTM, DUnaryLengthState.done]
+  · intro x
+    have hstart := Drun_DUnaryLengthTM_start x
+    have hcopy : Drun DUnaryLengthTM (x.length + 1)
+        { state := DUnaryLengthState.copy, input := x, head := 1, output := [],
+          work := fun _ : Nat => false, workHead := 0 } =
+        { state := DUnaryLengthState.handoff, input := x, head := x.length + 1,
+          output := x, work := fun _ : Nat => false, workHead := 0 } := by
+      simpa using (Drun_DUnaryLengthTM_copy_suffix [] x (fun _ : Nat => false) 0)
+    have hhand : Drun DUnaryLengthTM 1
+        { state := DUnaryLengthState.handoff, input := x, head := x.length + 1,
+          output := x, work := fun _ : Nat => false, workHead := 0 } =
+        { state := DUnaryLengthState.countStart, input := x, head := 0, output := [],
+          work := fun _ : Nat => false, workHead := 0 } := by
+      simpa using (Drun_DUnaryLengthTM_handoff x (x.length + 1)
+        (fun _ : Nat => false) 0)
+    have hcountStart : Drun DUnaryLengthTM 1
+        { state := DUnaryLengthState.countStart, input := x, head := 0,
+          output := [], work := fun _ : Nat => false, workHead := 0 } =
+        { state := DUnaryLengthState.count, input := x, head := 1,
+          output := [], work := fun _ : Nat => false, workHead := 0 } := by
+      simpa using (Drun_DUnaryLengthTM_count_start x)
+    have hcount : Drun DUnaryLengthTM (x.length + 1)
+        { state := DUnaryLengthState.count, input := x, head := 1, output := [],
+          work := fun _ : Nat => false, workHead := 0 } =
+        { state := DUnaryLengthState.done, input := x, head := x.length + 1,
+          output := List.replicate x.length true ++ [false],
+          work := fun _ : Nat => false, workHead := 0 } := by
+      simpa using
+        (Drun_DUnaryLengthTM_count_suffix [] x [] (fun _ : Nat => false) 0)
+    constructor
+    · change Dboutput DUnaryLengthTM ((C 2 * X + C 5 : TimeBound).eval x.length) x =
+        List.replicate x.length true ++ [false]
+      simp only [Polynomial.eval_mul, Polynomial.eval_add, Polynomial.eval_C,
+        Polynomial.eval_X]
+      change (Drun DUnaryLengthTM (2 * x.length + 5)
+        (Dinit DUnaryLengthTM x)).output =
+        List.replicate x.length true ++ [false]
+      rw [show 2 * x.length + 5 = 1 + ((x.length + 1) + (1 + (1 + (x.length + 1)))) by omega]
+      rw [Drun_add_eq, hstart]
+      rw [Drun_add_eq, hcopy]
+      rw [Drun_add_eq, hhand]
+      rw [Drun_add_eq, hcountStart]
+      rw [hcount]
+    · simp
+
+/-- Composing the unary-length transducer with a fixed prefix gives the
+    encoding of the variable whose index is the input length:
+    `[false, false] ++ replicate |x| true ++ [false]`. -/
+theorem dPolyTimeComputable_var_encoding_length :
+    DPolyTimeComputable
+      (fun x => ([false, false] : Word) ++ (List.replicate x.length true ++ [false])) := by
+  have hcomp := DPolyTimeComputableClosedUnderComposition
+    (fun x => List.replicate x.length true ++ [false])
+    (fun z => ([false, false] : Word) ++ z)
+    dPolyTimeComputable_unary_length
+    (dPolyTimeComputable_prepend [false, false])
+  simpa [Function.comp_def, List.append_assoc] using hcomp
 
 -- -----------------------------------------------------------------------------
 -- 3. The classes P and NP
@@ -2950,6 +4273,47 @@ def encode : Formula → Word
   | and f g => [true, false] ++ f.encode ++ g.encode
   | or f g => [true, true] ++ f.encode ++ g.encode
 
+/-- Each constructor is a fixed-tag prepend on encoded inputs. -/
+lemma encode_var_eq (i : Nat) : (var i).encode = [false, false] ++ encodeNat i := rfl
+lemma encode_not_eq (f : Formula) : (not f).encode = [false, true] ++ f.encode := rfl
+lemma encode_and_eq (f g : Formula) :
+    (and f g).encode = [true, false] ++ f.encode ++ g.encode := rfl
+lemma encode_or_eq (f g : Formula) :
+    (or f g).encode = [true, true] ++ f.encode ++ g.encode := rfl
+
+/-- A concrete transducer computes the encoding of the variable whose index is
+    the input length. -/
+theorem dPolyTimeComputable_var_encoding :
+    DPolyTimeComputable (fun x => (var x.length).encode) := by
+  simpa [encode_var_eq, encodeNat] using PNP.dPolyTimeComputable_var_encoding_length
+
+/-- The unary connective is a fixed-tag prepend. -/
+theorem dPolyTimeComputable_not_encoding :
+    DPolyTimeComputable (fun z => ([false, true] : Word) ++ z) := by
+  simpa using PNP.dPolyTimeComputable_prepend ([false, true] : Word)
+
+lemma not_encoding_correct (f : Formula) :
+    ([false, true] : Word) ++ f.encode = (not f).encode := by
+  simp [encode_not_eq]
+
+/-- The binary connectives prepend a fixed tag to the concatenation of the two
+    encoded subformulas.  Thus the pair format is simply `f.encode ++ g.encode`. -/
+theorem dPolyTimeComputable_and_encoding :
+    DPolyTimeComputable (fun z => ([true, false] : Word) ++ z) := by
+  simpa using PNP.dPolyTimeComputable_prepend ([true, false] : Word)
+
+lemma and_encoding_correct (f g : Formula) :
+    ([true, false] : Word) ++ (f.encode ++ g.encode) = (and f g).encode := by
+  simp [encode_and_eq]
+
+theorem dPolyTimeComputable_or_encoding :
+    DPolyTimeComputable (fun z => ([true, true] : Word) ++ z) := by
+  simpa using PNP.dPolyTimeComputable_prepend ([true, true] : Word)
+
+lemma or_encoding_correct (f g : Formula) :
+    ([true, true] : Word) ++ (f.encode ++ g.encode) = (or f g).encode := by
+  simp [encode_or_eq]
+
 /-- Unique splitting of formula encodings, by strong induction on the total
     encoded length of the two formulas and two suffixes.  This proves that the
     prefix encoding above is injective and uniquely decodable. -/
@@ -5114,6 +6478,22 @@ lemma npReductionFixed_mem_SAT_iff_accepts (V : TM) (p q : TimeBound) (x : Word)
   rw [npReductionFixed_mem_SAT_iff V p q x hhalt,
     npReduction_mem_SAT_iff V p q x hhalt]
 
+/-- Polynomial-time word functions should be closed under composition.  This is
+    a standard machine-composition fact; keeping it separate makes the reduction
+    construction easier to organize. -/
+def PolyTimeComputableClosedUnderComposition : Prop :=
+  ∀ (f g : Word → Word), PolyTimeComputable f → PolyTimeComputable g →
+    PolyTimeComputable (fun x => g (f x))
+
+/-- The reduction can be assembled from two polynomial-time subroutines: one
+    producing an intermediate encoding, and one turning that encoding into the
+    fixed-length SAT instance. -/
+def NPReductionSubroutineObligation : Prop :=
+  ∀ (V : TM) (p q : TimeBound),
+    ∃ (core aux : Word → Word),
+      PolyTimeComputable core ∧ PolyTimeComputable aux ∧
+      ∀ x : Word, aux (core x) = npReductionFixed V p q x
+
 /-- The only missing step for a genuine Cook--Levin theorem: the explicit
     fixed-length semantic reduction must be computable by a polynomial-time TM.
     The fixed length is essential because `PolyTimeComputable` transducers have
@@ -5123,6 +6503,47 @@ def NPSemanticReductionIsPolyTime : Prop :=
     (∀ x y : Word,
       halted V (run V (p.eval (x ++ y).length) (init V (x ++ y))) = true) →
     PolyTimeComputable (npReductionFixed V p q)
+
+/-- The machine-realization obligation follows from composition closure plus
+    the two subroutines above. -/
+theorem NPSemanticReductionIsPolyTime_of_subroutines
+    (hcomp : PolyTimeComputableClosedUnderComposition)
+    (hsub : NPReductionSubroutineObligation) : NPSemanticReductionIsPolyTime := by
+  intro V p q _hhalt
+  rcases hsub V p q with ⟨core, aux, hcore, haux, hcorrect⟩
+  have hfg : PolyTimeComputable (fun x => aux (core x)) := hcomp core aux hcore haux
+  have heq : (fun x => aux (core x)) = npReductionFixed V p q := funext hcorrect
+  simpa [heq] using hfg
+
+/-- A bridge between the composable transducer model and the concrete TM model
+    used by `Reducible`.  It is stated as an explicit proposition: the two
+    models have different tape disciplines, and constructing the translation is
+    a separate machine-construction obligation. -/
+def DTMPolyTimeBridge : Prop :=
+  ∀ f : Word → Word, DPolyTimeComputable f ↔ PolyTimeComputable f
+
+/-- The fixed-length reduction can be assembled from two subroutines in the
+    composable model.  The proved closure theorem then removes the composition
+    obligation; only the two subroutine constructions and the bridge remain. -/
+def NPReductionDTMSubroutineObligation : Prop :=
+  ∀ (V : TM) (p q : TimeBound),
+    ∃ (core aux : Word → Word),
+      DPolyTimeComputable core ∧ DPolyTimeComputable aux ∧
+      ∀ x : Word, aux (core x) = npReductionFixed V p q x
+
+/-- Using the proved DTM composition theorem, the semantic reduction is
+    polynomial-time in the concrete TM model whenever the DTM subroutines exist
+    and the two models agree. -/
+theorem NPSemanticReductionIsPolyTime_of_DTM
+    (hbridge : DTMPolyTimeBridge) (hsub : NPReductionDTMSubroutineObligation) :
+    NPSemanticReductionIsPolyTime := by
+  intro V p q _hhalt
+  rcases hsub V p q with ⟨core, aux, hcoreD, hauxD, hcorrect⟩
+  have hfgD : DPolyTimeComputable (fun x => aux (core x)) :=
+    DPolyTimeComputableClosedUnderComposition core aux hcoreD hauxD
+  have hfgP : PolyTimeComputable (fun x => aux (core x)) := (hbridge _).1 hfgD
+  have heq : (fun x => aux (core x)) = npReductionFixed V p q := funext hcorrect
+  simpa [heq] using hfgP
 
 /-- Cook--Levin, conditional only on the explicit machine-realization
     obligation above. -/

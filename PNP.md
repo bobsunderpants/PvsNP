@@ -20,6 +20,48 @@ mathlib for:
   the machine stops changing its configuration once it reaches a halting state.
 - `boutputIn`: the bounded transducer output, read from fixed absolute tape
   indices so that every output bit has a direct circuit representation.
+- `DTM`, `DConfig`, `Dinit`, `Dstep`, `Drun`, `Dboutput`, and `DboutputUpTo`: a
+  composable transducer model with a read-only input word, an append-only output
+  word, and a two-way infinite work tape.  `DAction` carries optional head
+  movements (`none` means stay put) and the optional work-tape write, so ordinary
+  subroutine constructions can keep auxiliary data.  Its `handoff` instruction resets the input to the current
+  output, clears the output, and blanks the work tape, which is exactly what
+  sequential composition needs.  The original decider model and all
+  circuit-compilation lemmas remain unchanged.
+- `DPolyTimeComputable`: polynomial-time computability in the composable model,
+  with separate time and length polynomials.
+- `Dcompose`, `liftFirst`, and `liftSecond`: the sequential-composition machine
+  and the two phase-simulation invariants.  A first-phase halting step performs
+  the handoff; subsequent steps mirror the second machine.
+- `theorem DPolyTimeComputableClosedUnderComposition`: proved sequential closure
+  in the composable model.  The first machine's first halt is located with
+  `Nat.find`; freezing lemmas show its output is unchanged up to the full time
+  bound, and the handoff gives the second machine a clean input.
+- `DIdTM` and `dPolyTimeComputable_id`: the first concrete subroutine in the
+  composable model, copying the read-only input to the output in linear time.
+  Its proofs exercise the boundary-aware input reader and the stay-put movement
+  option.
+- `DAppendTM` and `dPolyTimeComputable_append`: a second concrete subroutine,
+  copying the input and then emitting a fixed suffix.  Its fixed-suffix phase
+  uses `Option`-valued head movements to stay put while reading the suffix from
+  the machine's finite control.
+- `DPrependTM` and `dPolyTimeComputable_prepend`: a fixed-prefix emitter followed
+  by an input-copy phase.
+- `DConstTM` and `dPolyTimeComputable_const`: a fixed-word emitter that ignores
+  its input.
+- `DUnaryLengthTM` and `dPolyTimeComputable_unary_length`: a length-dependent
+  subroutine computing `replicate x.length true ++ [false]`.  It copies the
+  input, uses the handoff instruction to make that copy the new input, and then
+  emits one `true` per bit.
+- `dPolyTimeComputable_var_encoding_length`: composition of the prefix and
+  unary-length subroutines, producing the encoding of a variable whose index is
+  the input length.
+- `Formula.dPolyTimeComputable_var_encoding`, `not_encoding`, `and_encoding`,
+  and `or_encoding`: concrete transducers for the formula constructors.  Because
+  the encoding is prefix-based, every constructor is a fixed-tag prepend; for
+  binary connectives the pair format is `f.encode ++ g.encode`.
+- `DTMPolyTimeBridge`: an explicit proposition connecting the composable model
+  to the concrete TM model used by `Reducible`.  It is not assumed.
 - `InP L`: a Turing machine **halts on every input** within a polynomial time
   bound and decides `L`.
 - `InNP L`: a polynomial-time verifier **halts on every input/certificate pair**
@@ -306,6 +348,13 @@ circuit level:
   by a polynomial-time TM.  The length bound above makes the obligation
   coherent.  This is separate from `SATVerifierTMExists`, which supplies
   `SAT ∈ NP`.
+- `PolyTimeComputableClosedUnderComposition` and
+  `NPReductionSubroutineObligation` decompose that machine step in the concrete
+  TM model.  In the composable `DTM` model, closure is a proved theorem, and
+  `NPReductionDTMSubroutineObligation` asks only for the core encoder and
+  assembler.  `DTMPolyTimeBridge` connects the two models, and
+  `NPSemanticReductionIsPolyTime_of_DTM` shows that the bridge plus the DTM
+  subroutines discharge the concrete reduction obligation.
 - `semantic_cook_levin` proves `NPHard SAT` conditional only on that explicit
   machine-realization obligation; it does not assume Cook–Levin.
 - `NP_subset_PPoly_of_reduction_and_SAT_in_PPoly` and
@@ -315,8 +364,9 @@ circuit level:
 
 This closes the semantic gap in the 3b route.  The remaining obligations are:
 
-1. `NPSemanticReductionIsPolyTime`: a concrete polynomial-time TM computing the
-   fixed-length semantic reduction `npReductionFixed`.
+1. `DTMPolyTimeBridge` and `NPReductionDTMSubroutineObligation`: translate the
+   proved composable-model reduction into a concrete polynomial-time TM for
+   `npReductionFixed`.
 2. `SATVerifierTMExists`: a concrete polynomial-time TM for the SAT certificate
    checker on `x ++ cert`, including reliable parsing of the instance prefix.
 3. `SATNotInPPoly`: the concrete circuit lower bound for SAT.
