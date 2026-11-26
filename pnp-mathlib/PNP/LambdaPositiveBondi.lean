@@ -925,6 +925,52 @@ theorem no_sign_flip_square
 
 end LinearizedFluxObstruction
 
+/- Nonlinear square obstruction obtained by linearizing at de Sitter.  If an
+    energy is a norm square whose background value and first variation vanish,
+    its second variation is nonnegative.  A sign-flippable second variation
+    must therefore vanish.  This is the finite scalar core of the statement
+    that no differentiable nonnegative news square can have the full ABK
+    linearized energy as its second variation. -/
+namespace NonlinearSquareLinearizationObstruction
+
+structure Model where
+  Q : ℝ
+  flip : ℝ
+  hflip : flip = -Q
+  energy : ℝ → ℝ
+  flipEnergy : ℝ → ℝ
+  news : ℝ → ℝ
+  flipNews : ℝ → ℝ
+  energy_eq : ∀ t : ℝ, energy t = news t ^ 2
+  flipEnergy_eq : ∀ t : ℝ, flipEnergy t = flipNews t ^ 2
+  energy_quad : ∀ t : ℝ, energy t = t ^ 2 * Q
+  flipEnergy_quad : ∀ t : ℝ, flipEnergy t = t ^ 2 * flip
+
+theorem Q_nonneg (M : Model) : 0 ≤ M.Q := by
+  have h := M.energy_eq 1
+  rw [M.energy_quad 1] at h
+  norm_num at h
+  rw [h]
+  positivity
+
+theorem flip_nonneg (M : Model) : 0 ≤ M.flip := by
+  have h := M.flipEnergy_eq 1
+  rw [M.flipEnergy_quad 1] at h
+  norm_num at h
+  rw [h]
+  positivity
+
+theorem Q_zero (M : Model) : M.Q = 0 := by
+  have hq := Q_nonneg M
+  have hf := flip_nonneg M
+  rw [M.hflip] at hf
+  linarith
+
+theorem impossible (M : Model) (hQ : M.Q ≠ 0) : False := by
+  exact hQ (Q_zero M)
+
+end NonlinearSquareLinearizationObstruction
+
 /- A rank-two news object is available only after strong equipment and a
    no-incoming condition.  Fernández-Álvarez--Senovilla define radiant news
    n^± = V + X^± on the cuts of a (strictly) equipped spacelike infinity and
@@ -1411,6 +1457,22 @@ theorem output_weight (M : Algebra) : M.T' = M.ω⁻¹ * M.T := by
   rw [M.T'_eq, M.Sinv_cov, M.μ'_eq, M.T_eq]
   field_simp [M.ω_ne, M.μ_ne]
 
+/- Uniqueness of the polar factor: if U and U' both satisfy U ∘ S = K and
+   S is invertible, then U = U'.  This is the algebraic core of the statement
+   that the conformally covariant isometric intertwiner is canonical. -/
+structure PolarAlgebra where
+  s : ℝ
+  k : ℝ
+  u : ℝ
+  u' : ℝ
+  s_ne : s ≠ 0
+  u_eq : u * s = k
+  u'_eq : u' * s = k
+
+theorem polar_unique (M : PolarAlgebra) : M.u = M.u' := by
+  apply mul_right_cancel₀ M.s_ne
+  rw [M.u_eq, M.u'_eq]
+
 structure NormAlgebra where
   ω : ℝ
   Csq : ℝ
@@ -1514,6 +1576,240 @@ theorem not_square_of_sign_flip {Phase News Charge : Type*} [Zero News]
 
 end SymplecticDualNews
 
+/- Finite algebra for the explicit local dual news of the linearized theory.
+   `dxiE` denotes D_c(xi^c E), `eDerXi` denotes E^{c(a}D_c xi^{b)}, and the
+   `ibp` field is the finite scalar form of integration by parts. -/
+namespace LocalDualNews
+
+structure GeneratorAlgebra where
+  dxiE : ℝ
+  eDerXi : ℝ
+  beta : ℝ
+
+def localDual (κ E H : ℝ) (ξ : GeneratorAlgebra) : ℝ :=
+  κ * (-ξ.dxiE + 2 * ξ.eDerXi + 2 * H * ξ.beta * E)
+
+theorem localDual_add (κ E H : ℝ) (ξ η : GeneratorAlgebra) :
+    localDual κ E H ⟨ξ.dxiE + η.dxiE, ξ.eDerXi + η.eDerXi, ξ.beta + η.beta⟩
+      = localDual κ E H ξ + localDual κ E H η := by
+  dsimp [localDual]
+  ring
+
+theorem localDual_smul (a κ E H : ℝ) (ξ : GeneratorAlgebra) :
+    localDual κ E H ⟨a * ξ.dxiE, a * ξ.eDerXi, a * ξ.beta⟩
+      = a * localDual κ E H ξ := by
+  dsimp [localDual]
+  ring
+
+structure PairingAlgebra where
+  κ : ℝ
+  xiDerh : ℝ
+  eDerh : ℝ
+  betaEh : ℝ
+  H : ℝ
+  dxiEh : ℝ
+  flux : ℝ
+  dualPair : ℝ
+  flux_eq : flux = κ * (xiDerh + 2 * eDerh + 2 * H * betaEh)
+  dual_eq : dualPair = κ * (-dxiEh + 2 * eDerh + 2 * H * betaEh)
+  ibp : xiDerh = -dxiEh
+
+theorem pairing (M : PairingAlgebra) : M.flux = M.dualPair := by
+  rw [M.flux_eq, M.dual_eq, M.ibp]
+
+end LocalDualNews
+
+/- Finite algebra for the retarded adjoint factorization.  `electric` and
+   `field` are the scalar representatives of P_rad E and P_rad A_xi h after
+   the radiative operators have acted; `adjoint_square` is the integrated
+   integration-by-parts identity supplied by retarded dynamics. -/
+namespace RetardedSquareCriterion
+
+structure Model where
+  κ : ℝ
+  c : ℝ
+  electric : ℝ
+  field : ℝ
+  seed : ℝ
+  flux : ℝ
+  flux_eq : flux = κ * electric * field
+  adjoint_square : κ * electric * field = c * seed * seed
+
+theorem square (M : Model) : M.flux = M.c * M.seed ^ 2 := by
+  calc
+    M.flux = M.κ * M.electric * M.field := M.flux_eq
+    _ = M.c * M.seed * M.seed := M.adjoint_square
+    _ = M.c * M.seed ^ 2 := by ring
+
+theorem nonnegative (M : Model) (hc : 0 ≤ M.c) : 0 ≤ M.flux := by
+  rw [RetardedSquareCriterion.square M]
+  exact mul_nonneg hc (sq_nonneg M.seed)
+
+theorem zero_iff (M : Model) (hc : 0 < M.c) : M.flux = 0 ↔ M.seed = 0 := by
+  rw [RetardedSquareCriterion.square M]
+  constructor
+  · intro h
+    rcases mul_eq_zero.mp h with hc0 | hs
+    · exact False.elim ((ne_of_gt hc) hc0)
+    · exact sq_eq_zero_iff.mp hs
+  · intro hs
+    rw [hs]
+    ring
+
+end RetardedSquareCriterion
+
+/- ABK's retarded-source square is stronger than the scalar criterion above:
+    the coefficient is the fixed positive constant G/(2π), and the integrated
+    source-radiation seed square is nonnegative by construction. -/
+namespace ABKRetardedSource
+
+structure Model where
+  G : ℝ
+  flux : ℝ
+  seedSq : ℝ
+  flux_eq : flux = G * seedSq / (2 * Real.pi)
+  seedSq_nonneg : 0 ≤ seedSq
+
+theorem flux_nonneg (M : Model) (hG : 0 ≤ M.G) : 0 ≤ M.flux := by
+  rw [M.flux_eq]
+  have hnum : 0 ≤ M.G * M.seedSq := mul_nonneg hG M.seedSq_nonneg
+  have hden : 0 ≤ (2 * Real.pi : ℝ) := by positivity
+  exact div_nonneg hnum hden
+
+theorem flux_zero_of_seedSq_zero (M : Model) (hs : M.seedSq = 0) : M.flux = 0 := by
+  rw [M.flux_eq, hs]
+  ring
+
+theorem seedSq_zero_of_flux_zero (M : Model) (hG : 0 < M.G) (hf : M.flux = 0) :
+    M.seedSq = 0 := by
+  have hpi : (2 * Real.pi : ℝ) ≠ 0 := by positivity
+  rw [M.flux_eq] at hf
+  field_simp [hpi] at hf
+  have hf' : M.G * M.seedSq = 0 := by simpa using hf
+  exact (mul_eq_zero.mp hf').resolve_left (ne_of_gt hG)
+
+theorem flux_zero_iff (M : Model) (hG : 0 < M.G) :
+    M.flux = 0 ↔ M.seedSq = 0 := by
+  constructor
+  · exact ABKRetardedSource.seedSq_zero_of_flux_zero M hG
+  · exact ABKRetardedSource.flux_zero_of_seedSq_zero M
+
+end ABKRetardedSource
+
+/- Scalar normalization of the flat Bondi bridge.  `nSq` is the Bondi news
+   square, `nuSq` the radial tt-projected source seed square, and the two flux
+   constants are the usual Bondi and ABK normalizations. -/
+namespace FlatBondiBridge
+
+structure Model where
+  G : ℝ
+  r : ℝ
+  nSq : ℝ
+  nuSq : ℝ
+  bondiFlux : ℝ
+  abkFlux : ℝ
+  hG : G ≠ 0
+  hr : r ≠ 0
+  hscaled : nSq = 16 * G ^ 2 * nuSq / r ^ 2
+  bondi_eq : bondiFlux = r ^ 2 * nSq / (32 * Real.pi * G)
+  abk_eq : abkFlux = G * nuSq / (2 * Real.pi)
+
+theorem scaled_seed_square (M : Model) :
+    M.nSq = 16 * M.G ^ 2 * M.nuSq / M.r ^ 2 :=
+  M.hscaled
+
+theorem flux_equivalence (M : Model) : M.bondiFlux = M.abkFlux := by
+  rw [M.bondi_eq, M.abk_eq, M.hscaled]
+  have hpi : Real.pi ≠ 0 := ne_of_gt Real.pi_pos
+  field_simp [M.hG, M.hr, hpi]
+  ring
+
+end FlatBondiBridge
+
+/- Retarded bridge from the first-jet tensor news to the Bondi/ABK flux.
+    `dotNewsSq` is the square of the limiting retarded derivative of the
+    rescaled Bondi news, while `integratedDotSq` is the square of its retarded
+    antiderivative, which equals the rescaled news square.  The pointwise
+    derivative square is not the flux; its retarded integral square is. -/
+namespace RetardedJetFluxBridge
+
+structure Model where
+  G : ℝ
+  nuSq : ℝ
+  dotNuSq : ℝ
+  dotNewsSq : ℝ
+  integratedDotSq : ℝ
+  flux : ℝ
+  hG : G ≠ 0
+  hdot : dotNewsSq = 16 * G ^ 2 * dotNuSq
+  hint : integratedDotSq = 16 * G ^ 2 * nuSq
+  hflux : flux = G * nuSq / (2 * Real.pi)
+
+theorem dotNewsSq_eq (M : Model) : M.dotNewsSq = 16 * M.G ^ 2 * M.dotNuSq :=
+  M.hdot
+
+theorem seedSq_eq_integratedDotSq (M : Model) :
+    M.nuSq = M.integratedDotSq / (16 * M.G ^ 2) := by
+  rw [M.hint]
+  have hG2 : M.G ^ 2 ≠ 0 := pow_ne_zero 2 M.hG
+  field_simp [hG2]
+  rw [div_eq_mul_inv]
+  rw [mul_assoc, mul_inv_cancel₀ M.hG, mul_one]
+
+theorem flux_eq_integratedDotSq (M : Model) :
+    M.flux = M.integratedDotSq / (32 * Real.pi * M.G) := by
+  rw [M.hflux, M.hint]
+  have hpi : Real.pi ≠ 0 := ne_of_gt Real.pi_pos
+  field_simp [M.hG, hpi]
+  ring
+
+theorem flux_zero_iff_integratedDotSq_zero (M : Model) :
+    M.flux = 0 ↔ M.integratedDotSq = 0 := by
+  rw [flux_eq_integratedDotSq M]
+  have hpi : Real.pi ≠ 0 := ne_of_gt Real.pi_pos
+  have hden : 32 * Real.pi * M.G ≠ 0 := by
+    exact mul_ne_zero (mul_ne_zero (by norm_num) hpi) M.hG
+  constructor
+  · intro h
+    rcases (div_eq_zero_iff.mp h) with hn | hd
+    · exact hn
+    · exact False.elim (hden hd)
+  · intro h
+    rw [h]
+    simp
+
+end RetardedJetFluxBridge
+
+/- Origin dependence of a retarded antiderivative.  Writing the flux as the
+    square of an integral requires a lower integration endpoint.  Two endpoints
+    differ by a u-independent shift, so the flux square changes unless that
+    shift vanishes or cancels exactly.  This is the finite algebra behind the
+    statement that the flat retarded bridge is not intrinsic to a single cut. -/
+namespace RetardedOriginAmbiguity
+
+structure Algebra where
+  I0 : ℝ
+  I1 : ℝ
+  shift : ℝ
+  hshift : I1 = I0 + shift
+
+theorem square_eq (M : Algebra) : M.I1 ^ 2 = M.I0 ^ 2 + 2 * M.shift * M.I0 + M.shift ^ 2 := by
+  rw [M.hshift]
+  ring
+
+theorem square_eq_iff (M : Algebra) :
+    M.I1 ^ 2 = M.I0 ^ 2 ↔ M.shift * (2 * M.I0 + M.shift) = 0 := by
+  rw [M.hshift]
+  constructor <;> intro h <;> nlinarith
+
+theorem square_ne_of_nonzero (M : Algebra)
+    (hs : M.shift ≠ 0) (hc : 2 * M.I0 + M.shift ≠ 0) :
+    M.I1 ^ 2 ≠ M.I0 ^ 2 := by
+  intro h
+  exact mul_ne_zero hs hc ((square_eq_iff M).mp h)
+
+end RetardedOriginAmbiguity
+
 /- Directional degeneracy in the FAS Λ→0 limit.  The omitted positive common
    factor is irrelevant to the zero-set implication formalized here. -/
 namespace FlatLimitDirection
@@ -1559,6 +1855,30 @@ end FlatLimitDirection
    outgoing radiant densities, alpha=N²W and beta=N²Z are the coefficients of
    the rescaled supermomentum in the finite K± basis, and phiSq=W/8, vectorSq=Z/4
    after the no-incoming detector identification. -/
+/- Algebraic core of the news-only first-jet square: the FAS radiant square
+   and divergence superenergy combine into N² times the jet norm. -/
+namespace NewsOnlyJetSquare
+
+structure Algebra where
+  N : ℝ
+  W : ℝ
+  Z : ℝ
+  dotSq : ℝ
+  divSq : ℝ
+  jetSq : ℝ
+  W_eq : N ^ 2 * W = dotSq
+  Z_eq : N ^ 2 * Z = divSq
+  jet_eq : jetSq = (W + Z) / 4
+
+theorem scaled_jet_sq (M : Algebra) :
+    M.N ^ 2 * M.jetSq = (M.dotSq + M.divSq) / 4 := by
+  rw [M.jet_eq]
+  field_simp
+  rw [← M.W_eq, ← M.Z_eq]
+  ring
+
+end NewsOnlyJetSquare
+
 namespace FirstJetFlatScaling
 
 structure Algebra where
@@ -1633,6 +1953,596 @@ theorem tendsto_scaled_jet {ι : Type*} (l : Filter ι)
     (tendsto_scaled_vector l N Z vectorSq qZ hvec hZ)
 
 end FirstJetFlatScaling
+
+/- Finite algebra and flat-limit algebra for β₊.  In the controlled sector the
+   vector detector is recovered from the divergence of the radiant news:
+   div n = -2 N C.  Hence β₊ = N² Z = |div n|² and the renormalized detector
+   N C is finite whenever n has a finite flat limit.  Bounded C itself is the
+   special case in which the limiting radiant news is divergence-free. -/
+namespace BetaPlusDivergence
+
+structure Algebra where
+  N : ℝ
+  beta : ℝ
+  C : ℝ
+  div : ℝ
+  hdiv : div = -2 * N * C
+  hbeta : beta = div ^ 2
+
+theorem beta_eq_div_sq (M : Algebra) : M.beta = M.div ^ 2 := M.hbeta
+
+theorem beta_nonneg (M : Algebra) : 0 ≤ M.beta := by
+  rw [M.hbeta]
+  positivity
+
+theorem beta_eq_four_Nsq_Csq (M : Algebra) : M.beta = 4 * M.N ^ 2 * M.C ^ 2 := by
+  rw [M.hbeta, M.hdiv]
+  ring
+
+theorem NC_eq_neg_half_div (M : Algebra) : M.N * M.C = -M.div / 2 := by
+  rw [M.hdiv]
+  ring
+
+structure LimitAlgebra {ι : Type*} (l : Filter ι) where
+  N : ι → ℝ
+  C : ι → ℝ
+  div : ι → ℝ
+  beta : ι → ℝ
+  hdiv : ∀ i, div i = -2 * N i * C i
+  hbeta : ∀ i, beta i = (div i) ^ 2
+  hN : Filter.Tendsto N l (nhds 0)
+
+theorem tendsto_beta {ι : Type*} {l : Filter ι} (M : LimitAlgebra l) {d : ℝ}
+    (hd : Filter.Tendsto M.div l (nhds d)) :
+    Filter.Tendsto M.beta l (nhds (d ^ 2)) := by
+  have hfun : M.beta = fun i => (M.div i) ^ 2 := by
+    funext i
+    exact M.hbeta i
+  rw [hfun]
+  exact hd.pow 2
+
+theorem tendsto_NC {ι : Type*} {l : Filter ι} (M : LimitAlgebra l) {d : ℝ}
+    (hd : Filter.Tendsto M.div l (nhds d)) :
+    Filter.Tendsto (fun i => M.N i * M.C i) l (nhds (-d / 2)) := by
+  have hfun : (fun i => M.N i * M.C i) = fun i => -M.div i / 2 := by
+    funext i
+    rw [M.hdiv i]
+    ring
+  rw [hfun]
+  simpa using hd.neg.div_const 2
+
+end BetaPlusDivergence
+
+/- Normalization of the flat radiant news.  In the Λ=0 companion paper the
+   longitudinal detector is Z = 2 |D N|², while the β₊ limit above is |D N|².
+   In a Bondi frame the covariant news is r times the physical Bondi news. -/
+namespace FlatNewsNormalization
+
+structure FlatFAS where
+  betaInf : ℝ
+  zFlat : ℝ
+  divSq : ℝ
+  hz : zFlat = 2 * divSq
+  hbeta : betaInf = divSq
+
+theorem betaInf_eq_half_zFlat (M : FlatFAS) : M.betaInf = M.zFlat / 2 := by
+  rw [M.hbeta, M.hz]
+  ring
+
+theorem zFlat_eq_two_betaInf (M : FlatFAS) : M.zFlat = 2 * M.betaInf := by
+  rw [M.hbeta, M.hz]
+
+structure BondiFrame where
+  r : ℝ
+  covDivSq : ℝ
+  bondiDivSq : ℝ
+  hdiv : covDivSq = r ^ 2 * bondiDivSq
+
+theorem covDivSq_eq (M : BondiFrame) : M.covDivSq = M.r ^ 2 * M.bondiDivSq := M.hdiv
+
+theorem betaInf_eq_bondiDivSq (F : FlatFAS) (B : BondiFrame)
+    (hdiv : F.divSq = B.covDivSq) :
+    F.betaInf = B.r ^ 2 * B.bondiDivSq := by
+  rw [F.hbeta, hdiv, B.hdiv]
+
+end FlatNewsNormalization
+
+/- Algebraic core of the controlled identification of the flat radiant news.
+    In a strongly equipped conformal frame with κ=Σ=ω=0 one has U=S, while
+    V=U-ρ.  If S and ρ converge to the flat Schouten and Geroch tensors, the
+    flat limit of V is the Λ=0 news S_flat-ρ_flat.  Analytic convergence and
+    elliptic uniqueness of ρ are external inputs, not Lean axioms. -/
+namespace ControlledFlatNewsIdentification
+
+structure Model (T : Type*) [AddCommGroup T] [Module ℝ T] where
+  U : T
+  S : T
+  rho : T
+  V : T
+  flatS : T
+  flatRho : T
+  flatNews : T
+  kappa : ℝ
+  Sigma : T
+  L : T
+  omega : ℝ
+  hV : V = U - rho
+  hU : U = S + (kappa / 2) • Sigma + L
+  hL : L = 0
+  hS : S = flatS
+  hrho : rho = flatRho
+  hflatNews : flatNews = flatS - flatRho
+
+theorem U_eq_S_of_strong_gauge {T : Type*} [AddCommGroup T] [Module ℝ T]
+    (M : Model T) (hkappa : M.kappa = 0) (hSigma : M.Sigma = 0)
+    (_homega : M.omega = 0) : M.U = M.S := by
+  rw [M.hU, hkappa, hSigma, M.hL]
+  simp
+
+theorem V_eq_flatNews {T : Type*} [AddCommGroup T] [Module ℝ T]
+    (M : Model T) (hkappa : M.kappa = 0) (hSigma : M.Sigma = 0)
+    (_homega : M.omega = 0) : M.V = M.flatNews := by
+  rw [M.hV, U_eq_S_of_strong_gauge M hkappa hSigma _homega, M.hS, M.hrho, M.hflatNews]
+
+theorem V_zero_iff_flatNews_zero {T : Type*} [AddCommGroup T] [Module ℝ T]
+    (M : Model T) (hkappa : M.kappa = 0) (hSigma : M.Sigma = 0)
+    (_homega : M.omega = 0) : M.V = 0 ↔ M.flatNews = 0 := by
+  rw [V_eq_flatNews M hkappa hSigma _homega]
+
+/- Convergence form.  The scalar κ and the terms κΣ/2 and L tend to zero in
+    the strongly equipped κ=0 frame; S and ρ tend to the flat Schouten and
+    Geroch tensors. -/
+structure LimitModel {ι : Type*} (l : Filter ι) (T : Type*)
+    [TopologicalSpace T] [AddCommGroup T] [Module ℝ T]
+    [ContinuousAdd T] [ContinuousNeg T] [ContinuousSub T] [ContinuousSMul ℝ T] where
+  U : ι → T
+  S : ι → T
+  rho : ι → T
+  V : ι → T
+  flatS : T
+  flatRho : T
+  flatNews : T
+  kappa : ι → ℝ
+  Sigma : ι → T
+  L : ι → T
+  omega : ι → ℝ
+  hV : ∀ i, V i = U i - rho i
+  hU : ∀ i, U i = S i + (kappa i / 2) • Sigma i + L i
+  hkappa : Filter.Tendsto kappa l (nhds 0)
+  hSigma : Filter.Tendsto Sigma l (nhds 0)
+  hL : Filter.Tendsto L l (nhds 0)
+  hS : Filter.Tendsto S l (nhds flatS)
+  hrho : Filter.Tendsto rho l (nhds flatRho)
+  hflatNews : flatNews = flatS - flatRho
+
+theorem tendsto_U {ι : Type*} {l : Filter ι} {T : Type*}
+    [TopologicalSpace T] [AddCommGroup T] [Module ℝ T]
+    [ContinuousAdd T] [ContinuousNeg T] [ContinuousSub T] [ContinuousSMul ℝ T]
+    (M : LimitModel l T) : Filter.Tendsto M.U l (nhds M.flatS) := by
+  have hfun : M.U = fun i => M.S i + (M.kappa i / 2) • M.Sigma i + M.L i := by
+    funext i
+    exact M.hU i
+  rw [hfun]
+  have hk : Filter.Tendsto (fun i => M.kappa i / 2) l (nhds 0) := by
+    simpa using M.hkappa.div_const 2
+  have hterm : Filter.Tendsto (fun i => (M.kappa i / 2) • M.Sigma i) l
+      (nhds ((0 : ℝ) • (0 : T))) := hk.smul M.hSigma
+  have hterm0 : Filter.Tendsto (fun i => (M.kappa i / 2) • M.Sigma i) l
+      (nhds (0 : T)) := by simpa using hterm
+  simpa using (M.hS.add hterm0).add M.hL
+
+theorem tendsto_V {ι : Type*} {l : Filter ι} {T : Type*}
+    [TopologicalSpace T] [AddCommGroup T] [Module ℝ T]
+    [ContinuousAdd T] [ContinuousNeg T] [ContinuousSub T] [ContinuousSMul ℝ T]
+    (M : LimitModel l T) : Filter.Tendsto M.V l (nhds M.flatNews) := by
+  have hfun : M.V = fun i => M.U i - M.rho i := by
+    funext i
+    exact M.hV i
+  rw [hfun]
+  rw [M.hflatNews]
+  simpa using (tendsto_U M).sub M.hrho
+
+end ControlledFlatNewsIdentification
+
+/- Spherical-harmonic weight of the flat detector square.  For an l≥2 STF
+   tensor harmonic E_AB on the unit round sphere,
+   ∫ D^B E_AB D_C E^CB = ((l-1)(l+2)/2) ∫ E_AB E^AB.  With the Bondi flux
+   constant 32πG this gives a sharp lower bound at fixed radiative flux. -/
+namespace BetaSpectralWeight
+
+structure Mode (G : ℝ) where
+  l : ℕ
+  lambda : ℝ
+  newsSq : ℝ
+  flux : ℝ
+  betaSq : ℝ
+  lambda_eq : lambda = ((l : ℝ) - 1) * ((l : ℝ) + 2) / 2
+  hl : 2 ≤ l
+  newsSq_eq : newsSq = 32 * Real.pi * G * flux
+  betaSq_eq : betaSq = lambda * newsSq
+
+theorem lambda_ge_two (G : ℝ) (m : Mode G) : 2 ≤ m.lambda := by
+  rw [m.lambda_eq]
+  have hlR : (2 : ℝ) ≤ (m.l : ℝ) := by exact_mod_cast m.hl
+  nlinarith
+
+theorem betaSq_eq_flux_weight (G : ℝ) (m : Mode G) :
+    m.betaSq = 32 * Real.pi * G * m.lambda * m.flux := by
+  rw [m.betaSq_eq, m.newsSq_eq]
+  ring
+
+theorem betaSq_ge_two_flux (G : ℝ) (m : Mode G)
+    (hG : 0 ≤ G) (hflux : 0 ≤ m.flux) :
+    64 * Real.pi * G * m.flux ≤ m.betaSq := by
+  rw [betaSq_eq_flux_weight G m]
+  have hpi : 0 < Real.pi := Real.pi_pos
+  have hc : 0 ≤ 32 * Real.pi * G * m.flux := by positivity
+  have hlam := lambda_ge_two G m
+  nlinarith
+
+theorem betaSq_eq_quadrupole (G : ℝ) (m : Mode G) (hl2 : m.l = 2) :
+    m.betaSq = 64 * Real.pi * G * m.flux := by
+  rw [betaSq_eq_flux_weight G m, m.lambda_eq, hl2]
+  ring_nf
+
+end BetaSpectralWeight
+
+/- Conditional flat first-jet detector balance.  Here dotSq and divSq are the
+   time- and angular-derivative squares of the conditionally identified flat
+   news; W and Z are the flat FAS detector densities. -/
+namespace FlatJetEnergy
+
+structure Algebra where
+  wFlat : ℝ
+  zFlat : ℝ
+  alphaInf : ℝ
+  betaInf : ℝ
+  dotSq : ℝ
+  divSq : ℝ
+  hw : wFlat = 2 * dotSq
+  hz : zFlat = 2 * divSq
+  halpha : alphaInf = 4 * dotSq
+  hbeta : betaInf = divSq
+
+theorem alphaInf_eq_two_wFlat (M : Algebra) : M.alphaInf = 2 * M.wFlat := by
+  rw [M.halpha, M.hw]
+  ring
+
+theorem betaInf_eq_half_zFlat (M : Algebra) : M.betaInf = M.zFlat / 2 := by
+  rw [M.hbeta, M.hz]
+  ring
+
+theorem jetLimit_eq_detector (M : Algebra) :
+    M.alphaInf / 4 + M.betaInf / 4 = M.wFlat / 2 + M.zFlat / 8 := by
+  rw [M.halpha, M.hbeta, M.hw, M.hz]
+  ring_nf
+
+end FlatJetEnergy
+
+/- Invariance of the flat detector balance under the nondegenerate generalized
+   FAS transport parameters.  The tensor and vector gauge parameters cancel
+   after normalization by their squared norms, so the flat coefficients depend
+   only on the normalized detector limits. -/
+namespace GeneralizedTransportFlatBalance
+
+structure Model where
+  delta : ℝ
+  gamma : ℝ
+  betaF : ℝ
+  lamF : ℝ
+  tensorSq : ℝ
+  divSq : ℝ
+  dotSq : ℝ
+  newsDivSq : ℝ
+  wFlat : ℝ
+  zFlat : ℝ
+  alphaInf : ℝ
+  betaInf : ℝ
+
+theorem tensor_normalization_gauge_free (M : Model)
+    (hT : M.tensorSq / (M.delta ^ 2 + M.gamma ^ 2) = M.dotSq)
+    (halpha : M.alphaInf = 4 * (M.tensorSq / (M.delta ^ 2 + M.gamma ^ 2))) :
+    M.alphaInf = 4 * M.dotSq := by
+  rw [halpha, hT]
+
+theorem vector_normalization_gauge_free (M : Model)
+    (hV : M.divSq / (M.betaF ^ 2 + M.lamF ^ 2) = M.newsDivSq)
+    (hbeta : M.betaInf = M.divSq / (M.betaF ^ 2 + M.lamF ^ 2)) :
+    M.betaInf = M.newsDivSq := by
+  rw [hbeta, hV]
+
+theorem alphaInf_eq_two_wFlat (M : Model)
+    (hT : M.tensorSq / (M.delta ^ 2 + M.gamma ^ 2) = M.dotSq)
+    (hw : M.wFlat = 2 * M.dotSq)
+    (halpha : M.alphaInf = 4 * (M.tensorSq / (M.delta ^ 2 + M.gamma ^ 2))) :
+    M.alphaInf = 2 * M.wFlat := by
+  rw [halpha, hT, hw]
+  ring
+
+theorem betaInf_eq_half_zFlat (M : Model)
+    (hV : M.divSq / (M.betaF ^ 2 + M.lamF ^ 2) = M.newsDivSq)
+    (hz : M.zFlat = 2 * M.newsDivSq)
+    (hbeta : M.betaInf = M.divSq / (M.betaF ^ 2 + M.lamF ^ 2)) :
+    M.betaInf = M.zFlat / 2 := by
+  rw [hbeta, hV, hz]
+  ring
+
+theorem jetLimit_eq_detector (M : Model)
+    (hT : M.tensorSq / (M.delta ^ 2 + M.gamma ^ 2) = M.dotSq)
+    (hV : M.divSq / (M.betaF ^ 2 + M.lamF ^ 2) = M.newsDivSq)
+    (hw : M.wFlat = 2 * M.dotSq)
+    (hz : M.zFlat = 2 * M.newsDivSq)
+    (halpha : M.alphaInf = 4 * (M.tensorSq / (M.delta ^ 2 + M.gamma ^ 2)))
+    (hbeta : M.betaInf = M.divSq / (M.betaF ^ 2 + M.lamF ^ 2)) :
+    M.alphaInf / 4 + M.betaInf / 4 = M.wFlat / 2 + M.zFlat / 8 := by
+  rw [halpha, hbeta, hT, hV, hw, hz]
+  ring_nf
+
+end GeneralizedTransportFlatBalance
+
+/- Finite algebra for the degenerate transport limit.  When the transport
+    normalization scale tends to zero, the detector equals the raw transport
+    derivative divided by that scale: a finite positive detector forces the raw
+    derivative to vanish at the same rate, while a nonzero raw limit forces the
+    detector to blow up. -/
+namespace DegenerateTransportLimit
+
+structure Algebra where
+  raw : ℝ
+  detector : ℝ
+  scale : ℝ
+  hscale : 0 < scale
+  hdet : detector = raw / scale
+
+theorem raw_eq_detector_mul_scale (M : Algebra) : M.raw = M.detector * M.scale := by
+  rw [M.hdet]
+  field_simp [ne_of_gt M.hscale]
+
+theorem detector_eq_mul_inv (M : Algebra) : M.detector = M.raw * M.scale⁻¹ := by
+  rw [M.hdet, div_eq_mul_inv]
+
+theorem detector_ge_of_raw_lower_bound (M : Algebra) (r : ℝ)
+    (hr : r ≤ M.raw) : r / M.scale ≤ M.detector := by
+  rw [M.hdet]
+  exact div_le_div_of_nonneg_right hr (le_of_lt M.hscale)
+
+theorem raw_le_of_detector_bound (M : Algebra) (D : ℝ)
+    (hD : M.detector ≤ D) : M.raw ≤ D * M.scale := by
+  rw [raw_eq_detector_mul_scale M]
+  exact mul_le_mul_of_nonneg_right hD (le_of_lt M.hscale)
+
+end DegenerateTransportLimit
+
+/- Normalization of the generalized strongly equipped radiant news.  FAS allow
+    a constant rescaling n^+ = 2 μ V.  The zero set is unchanged, but the
+    detector square scales by μ² and the radiated power by μ.  Matching the
+    geometric detector square forces μ²=1, and positivity of the base power
+    then forces μ=1.  This is a finite algebraic core, not a claim that the
+    unrestricted news problem is solved. -/
+namespace GeneralizedRadiantNewsNormalization
+
+structure Model where
+  mu : ℝ
+  baseSq : ℝ
+  scaledSq : ℝ
+  basePower : ℝ
+  power : ℝ
+  hsq_scale : scaledSq = mu ^ 2 * baseSq
+  hsq_match : scaledSq = baseSq
+  hbaseSq : baseSq ≠ 0
+  hpow_scale : power = mu * basePower
+  hbasePower_pos : 0 < basePower
+  hpower_nonneg : 0 ≤ power
+
+theorem mu_sq_eq_one (M : Model) : M.mu ^ 2 = 1 := by
+  have h : M.mu ^ 2 * M.baseSq = M.baseSq := by
+    rw [← M.hsq_scale, M.hsq_match]
+  have hfac : (M.mu ^ 2 - 1) * M.baseSq = 0 := by
+    nlinarith
+  rcases mul_eq_zero.mp hfac with hmu | hb
+  · nlinarith
+  · exact False.elim (M.hbaseSq hb)
+
+theorem mu_eq_one_or_neg_one (M : Model) : M.mu = 1 ∨ M.mu = -1 := by
+  have hfac : (M.mu - 1) * (M.mu + 1) = 0 := by
+    nlinarith [mu_sq_eq_one M]
+  rcases mul_eq_zero.mp hfac with h | h
+  · left
+    linarith
+  · right
+    linarith
+
+theorem mu_nonneg (M : Model) : 0 ≤ M.mu := by
+  by_contra h
+  have hmu : M.mu < 0 := lt_of_not_ge h
+  have hneg : M.mu * M.basePower < 0 := mul_neg_of_neg_of_pos hmu M.hbasePower_pos
+  rw [← M.hpow_scale] at hneg
+  exact (not_lt_of_ge M.hpower_nonneg) hneg
+
+theorem mu_eq_one (M : Model) : M.mu = 1 := by
+  rcases mu_eq_one_or_neg_one M with h | h
+  · exact h
+  · have hn := mu_nonneg M
+    rw [h] at hn
+    norm_num at hn
+
+end GeneralizedRadiantNewsNormalization
+
+/- Exact evaluation of the FAS second-class Bel--Robinson bitranslation
+   charge in the outgoing no-incoming sector, and its relation to the two
+   detector magnitudes.  This is finite algebra only; it does not compute the
+   intrinsic divergence that would turn the charge into a flux density. -/
+namespace SecondClassBRCharge
+
+structure Model where
+  Wplus : ℝ
+  Wminus : ℝ
+  Zplus : ℝ
+  Zminus : ℝ
+  coulomb : ℝ
+  chargeDensity : ℝ
+  charge_eq :
+    chargeDensity =
+      (1 / 4) * (Wplus + Wminus) - (Zplus + Zminus) + (3 / 2) * coulomb
+
+theorem outgoing_charge (M : Model) (hWm : M.Wminus = 0) (hZm : M.Zminus = 0) :
+    M.chargeDensity = (1 / 4) * M.Wplus - M.Zplus + (3 / 2) * M.coulomb := by
+  rw [M.charge_eq, hWm, hZm]
+  ring
+
+structure DetectorModel where
+  hatC2 : ℝ
+  C2 : ℝ
+  coulomb : ℝ
+  firstJetSq : ℝ
+  chargeDensity : ℝ
+  firstJet_eq : firstJetSq = hatC2 + C2
+  charge_rad_eq : chargeDensity = hatC2 - 4 * C2 + (3 / 2) * coulomb
+
+theorem radiative_charge_may_vanish_on_nonzero_news (M : DetectorModel)
+    (hCpos : 0 < M.C2) (hbal : M.hatC2 = 4 * M.C2) :
+    M.chargeDensity = (3 / 2) * M.coulomb ∧ 0 < M.firstJetSq := by
+  constructor
+  · rw [M.charge_rad_eq, hbal]
+    ring
+  · rw [M.firstJet_eq, hbal]
+    nlinarith
+
+theorem hatC2_from_square_and_charge (M : DetectorModel) :
+    M.hatC2 = (4 * M.firstJetSq + M.chargeDensity - (3 / 2) * M.coulomb) / 5 := by
+  rw [M.firstJet_eq, M.charge_rad_eq]
+  ring
+
+theorem C2_from_square_and_charge (M : DetectorModel) :
+    M.C2 = (M.firstJetSq - M.chargeDensity + (3 / 2) * M.coulomb) / 5 := by
+  rw [M.firstJet_eq, M.charge_rad_eq]
+  ring
+
+theorem no_scalar_charge_equals_detector_square (M : DetectorModel) (c : ℝ)
+    (hCpos : 0 < M.C2) (hbal : M.hatC2 = 4 * M.C2) :
+    c * (M.hatC2 - 4 * M.C2) ≠ M.firstJetSq := by
+  rw [M.firstJet_eq, hbal]
+  norm_num
+  nlinarith
+
+structure FlatDetectorModel where
+  dotSq : ℝ
+  divSq : ℝ
+  wFlat : ℝ
+  zFlat : ℝ
+  alphaInf : ℝ
+  betaInf : ℝ
+  halpha : alphaInf = 4 * dotSq
+  hw : wFlat = 2 * dotSq
+  hbeta : betaInf = divSq
+  hz : zFlat = 2 * divSq
+
+theorem flat_radiative_charge (M : FlatDetectorModel) :
+    M.alphaInf / 4 - M.betaInf = M.dotSq - M.divSq := by
+  rw [M.halpha, M.hbeta]
+  ring
+
+theorem flat_radiative_charge_detector (M : FlatDetectorModel) :
+    M.alphaInf / 4 - M.betaInf = M.wFlat / 2 - M.zFlat / 2 := by
+  rw [M.halpha, M.hbeta, M.hw, M.hz]
+  ring
+
+/- Pairing the FAS normal-triplet second-class charge density with the
+   bitranslation charge density.  This is finite algebra from FAS's exact
+   outgoing-sector densities; it does not provide a flux law. -/
+structure PairModel where
+  hatC2 : ℝ
+  C2 : ℝ
+  coulomb : ℝ
+  superEnergy : ℝ
+  bitranslationDensity : ℝ
+  detectorSq : ℝ
+  superEnergy_eq :
+    superEnergy = hatC2 + 4 * C2 + (3 / 2) * coulomb
+  bitranslation_eq :
+    bitranslationDensity = hatC2 - 4 * C2 + (3 / 2) * coulomb
+  detectorSq_eq : detectorSq = hatC2 + C2
+
+theorem hatC2_from_superEnergy_and_bitranslation (M : PairModel) :
+    M.hatC2 = (M.superEnergy + M.bitranslationDensity - 3 * M.coulomb) / 2 := by
+  rw [M.superEnergy_eq, M.bitranslation_eq]
+  ring
+
+theorem C2_from_superEnergy_and_bitranslation (M : PairModel) :
+    M.C2 = (M.superEnergy - M.bitranslationDensity) / 8 := by
+  rw [M.superEnergy_eq, M.bitranslation_eq]
+  ring
+
+theorem detectorSq_from_superEnergy_and_bitranslation (M : PairModel) :
+    M.detectorSq =
+      (5 * M.superEnergy + 3 * M.bitranslationDensity) / 8
+        - (3 / 2) * M.coulomb := by
+  rw [M.detectorSq_eq, M.superEnergy_eq, M.bitranslation_eq]
+  ring
+
+def pureTensorPair : PairModel where
+  hatC2 := 1
+  C2 := 0
+  coulomb := 0
+  superEnergy := 1
+  bitranslationDensity := 1
+  detectorSq := 1
+  superEnergy_eq := by norm_num
+  bitranslation_eq := by norm_num
+  detectorSq_eq := by norm_num
+
+noncomputable def pureCoulombPair : PairModel where
+  hatC2 := 0
+  C2 := 0
+  coulomb := (2 : ℝ) / 3
+  superEnergy := 1
+  bitranslationDensity := 1
+  detectorSq := 0
+  superEnergy_eq := by norm_num
+  bitranslation_eq := by norm_num
+  detectorSq_eq := by norm_num
+
+theorem pair_charge_blindness :
+    pureTensorPair.superEnergy = pureCoulombPair.superEnergy ∧
+    pureTensorPair.bitranslationDensity = pureCoulombPair.bitranslationDensity ∧
+    pureTensorPair.detectorSq ≠ pureCoulombPair.detectorSq := by
+  norm_num [pureTensorPair, pureCoulombPair]
+
+end SecondClassBRCharge
+
+/- Logical form of FAS's explicit obstruction: computing the intrinsic
+    divergence of the bitranslation current R^a requires the normal Lie
+    derivative of the rescaled Weyl tensor.  The algebraic model below does
+    not assert physical realizability of two extensions; it records that a
+    divergence depending on intrinsic data x and extra extension data y
+    cannot be a functional of x alone when y changes its value. -/
+namespace SecondClassCurrentDivergenceObstruction
+
+def FactorsThroughIntrinsic (X Y : Type*) (f : X → Y → ℝ) : Prop :=
+  ∃ g : X → ℝ, ∀ x y, f x y = g x
+
+structure Model (X Y : Type*) where
+  intrinsic : X
+  extension₁ : Y
+  extension₂ : Y
+  divergence : X → Y → ℝ
+  hdiff : divergence intrinsic extension₁ ≠ divergence intrinsic extension₂
+
+theorem not_factors_through_intrinsic {X Y : Type*} (M : Model X Y) :
+    ¬ FactorsThroughIntrinsic X Y M.divergence := by
+  rintro ⟨g, hg⟩
+  apply M.hdiff
+  calc
+    M.divergence M.intrinsic M.extension₁ = g M.intrinsic := hg M.intrinsic M.extension₁
+    _ = M.divergence M.intrinsic M.extension₂ := (hg M.intrinsic M.extension₂).symm
+
+theorem factors_with_fixed_extension {X Y : Type*} (f : X → Y → ℝ)
+    (ext : X → Y) : FactorsThroughIntrinsic X Y (fun x _ => f x (ext x)) := by
+  refine ⟨fun x => f x (ext x), ?_⟩
+  intro x y
+  rfl
+
+end SecondClassCurrentDivergenceObstruction
 
 /- Fernández--Álvarez--Senovilla's regular Λ→0 detector limit.  This encodes
    only the implication: regular metric limit + de Sitter no radiation implies

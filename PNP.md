@@ -60,6 +60,105 @@ mathlib for:
   and `or_encoding`: concrete transducers for the formula constructors.  Because
   the encoding is prefix-based, every constructor is a fixed-tag prepend; for
   binary connectives the pair format is `f.encode ++ g.encode`.
+- `Formula.unaryIndexEncode` and `dPolyTimeComputable_unaryIndexEncode`: turn a
+  unary index code `1^i 0` directly into `(var i).encode`.  This works because
+  `Formula.encodeNat i` is exactly that unary code, so only the variable tag is
+  prepended; it supplies the encoded literals needed by Tseitin constraints.
+- Constant formula encodings and the `.andConst`, `.orConst`, and `.notFormula`
+  combinators for `DPolyTimeComputable`, which assemble fixed clause shapes
+  around computed literal encodings.
+- `DNotBitsTM` and `dPolyTimeComputable_bitwise_not`: a linear-time transducer
+  that complements every input bit.
+- `DDoubleTM` and `dPolyTimeComputable_double`: a linear-time transducer for
+  `x ↦ x ++ x`.  It copies the input, rewinds using the two-way input head, and
+  copies it again while appending.
+- `DLengthPrefixTM` and `dPolyTimeComputable_length_prefix`: a linear-time
+  transducer for `x ↦ encodeNat |x| ++ x`, where the prefix is unary.  It emits
+  the length while scanning, rewinds, and then copies the original input.
+- `DPadTM` and `dPolyTimeComputable_pad`: a linear-time transducer for
+  `x ↦ x ++ replicate |x| false`, giving a canonical fixed-length padding whose
+  output length depends only on `|x|`.
+- `DMapTM` and `dPolyTimeComputable_map`: a generic linear-time transducer for
+  applying any fixed Boolean function pointwise, `x ↦ x.map g`.  The earlier
+  bitwise-complement transducer is a special case.
+- Closure corollaries for `DPolyTimeComputable`: `.map`, `.double`, `.pad`,
+  `.append`, `.prepend`, and `.copyMap`.  They turn the concrete subroutines
+  into reusable combinators for assembling larger formula transformations.
+- `DCopyMapTM` and `dPolyTimeComputable_copy_map`: a copy-and-map transducer for
+  `x ↦ x ++ x.map g`, generalizing both self-concatenation and fixed padding.
+- `DInsertSelfTM` and `dPolyTimeComputable_insert_self`: a transducer for
+  `x ↦ x ++ y ++ x`, with an arbitrary fixed word `y` inserted between two
+  copies of the input.  Its closure corollary is
+  `DPolyTimeComputable.insertSelf`.
+- `unarySwap`, `DUnarySwapTM`, and `dPolyTimeComputable_unary_swap`: a linear-time
+  transducer that moves an initial run of `true` bits behind the first `false`
+  and the remaining suffix; on an all-`true` word it returns the input unchanged.
+  This gives `DPolyTimeComputable.unarySwapPrefix` for rearranging a unary prefix
+  produced by an earlier subroutine.  The machine uses an explicit `start` state
+  so that the boundary reader cannot mistake the left boundary for the end of
+  the input.
+- `unarySub`, `DUnarySubTM`, and `dPolyTimeComputable_unary_sub`: a linear-time
+  transducer for subtracting the second unary counter from the first.  The
+  machine counts the leading `true` run on its work tape, consumes the second
+  run after the separator, emits the difference, and finally pads the output to
+  length `|x| + 1`.  It uses work-tape cell `0` as a boundary sentinel so that a
+  zero-origin mark block can be rewound unambiguously.  This gives
+  `DPolyTimeComputable.unarySubPrefix` for subtracting a unary prefix produced
+  by an earlier subroutine.
+- `dPolyTimeComputable_and_self_var_length`,
+  `dPolyTimeComputable_or_self_var_length`, and
+  `dPolyTimeComputable_not_var_length`: bounded formula-building examples obtained
+  by composing the constructor transducers with the variable-index and doubling
+  subroutines.
+- `insertVarTagTotal`, `DInsertVarTagTM`, and
+  `dPolyTimeComputable_insertVarTagTotal`: insert the variable tag `[false, false]`
+  after the first `false` bit.  On `encodeNat i ++ encodeNat j` this produces
+  `encodeNat i ++ [false, false] ++ encodeNat j`, the raw pair format needed by
+  two-variable literal clauses.
+- `insertNotVarTagTotal`, `DInsertNotVarTagTM`, and
+  `dPolyTimeComputable_insertNotVarTagTotal`: insert the negated-variable tag
+  `[false, true, false, false]` after the first `false` bit.  On
+  `encodeNat i ++ encodeNat j` this produces the separator for a negated second
+  literal.
+- `pairVarVarEncode`, `pairVarNotVarEncode`, `pairNotVarVarEncode`, and
+  `pairNotVarNotVarEncode`: fixed-prefix wrappers around the two insertion
+  transducers.  Each maps a pair of unary codes to the encoding of one of the
+  literal-disjunction shapes occurring in Tseitin constraints, and each has a
+  proved `DPolyTimeComputable` theorem.
+- `Circuit.encode`, `Circuit.decodeCircuit`, and `Circuit.encode_injective`: a
+  prefix code for circuits with a fuel-bounded parser.  The parser is proved to
+  invert `encode` on every circuit and suffix, which makes the circuit word a
+  canonical intermediate representation for the Cook–Levin assembly.
+- `NodeDesc` and `nodeConstraintEncode`: a compact word description of one
+  Tseitin constraint.  `nodeDescOfCircuit` supplies the descriptor of a circuit
+  node, and `nodeConstraintFormula_nodeDescOfCircuit` proves that the assembled
+  formula encoding is exactly `tseitinConstraint`.  This isolates the
+  constraint-assembly step from the machine that will enumerate circuit nodes.
+- `NodeDescSeq`, `parseNodeDescSeq`, and `nodeConstraintSeqEncode`: a terminated
+  sequence of node descriptors that assembles to the encoding of
+  `andMany (tseitinConstraints c)`.  `tseitinDescEncode` and `tseitinAssemble`
+  add the output-variable index and reconstruct the full `tseitinFormula`.
+- `npReductionCoreTseitin` and `npReductionAssemblerTseitin`: a richer pure
+  decomposition where the core already carries the Tseitin descriptors and the
+  assembler rebuilds the fixed-length SAT instance from them.
+  `NPReductionDTMSubroutineObligation_of_tseitin` reduces the DTM obligation to
+  polynomial-time computability of these two functions.
+- `npReductionCoreDAG` and `npReductionAssemblerDAG`: the sharing-aware variant,
+  where the core emits only a unary length plus the DAG descriptors.  Unlike
+  `Circuit.encode`, the descriptor sequence is polynomial in `c.size`, as shown
+  by `tseitinDescEncode_length_le`.  `npReductionCoreDAG_length_le_poly` gives
+  the corresponding polynomial bound for the whole core with respect to
+  `npReductionDAGPoly`.  `NodeDescSeq.encode_injective` and
+  `nodeDescSeqOfCircuit_nodup` provide parser uniqueness and distinctness of the
+  enumerated nodes.  `NPReductionDTMSubroutineObligation_of_dag` reduces the DTM
+  obligation to these two functions.
+- `npReductionFixedFromCircuit`, `npReductionCore`, and `npReductionAssembler`:
+  a pure decomposition of `npReductionFixed`.  The core emits a unary output
+  length followed by the encoded verifier circuit; the assembler parses that
+  representation and rebuilds the fixed-length SAT instance.
+  `npReductionAssembler_core` proves the round trip, and
+  `NPReductionDTMSubroutineObligation_of_canonical` reduces the remaining DTM
+  obligation to polynomial-time computability of these two functions.
 - `DTMPolyTimeBridge`: an explicit proposition connecting the composable model
   to the concrete TM model used by `Reducible`.  It is not assumed.
 - `InP L`: a Turing machine **halts on every input** within a polynomial time
