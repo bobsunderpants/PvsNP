@@ -29,7 +29,9 @@ mathlib for:
   sequential composition needs.  The original decider model and all
   circuit-compilation lemmas remain unchanged.
 - `DPolyTimeComputable`: polynomial-time computability in the composable model,
-  with separate time and length polynomials.
+  with separate time and length polynomials.  The output-length polynomial is an
+  upper bound, not an exact equality, so variable-length splitters such as
+  `dropFirstUnary` and `firstUnaryCode` are admitted.
 - `Dcompose`, `liftFirst`, and `liftSecond`: the sequential-composition machine
   and the two phase-simulation invariants.  A first-phase halting step performs
   the handoff; subsequent steps mirror the second machine.
@@ -129,15 +131,103 @@ mathlib for:
   prefix code for circuits with a fuel-bounded parser.  The parser is proved to
   invert `encode` on every circuit and suffix, which makes the circuit word a
   canonical intermediate representation for the Cook–Levin assembly.
+- `constTrueConstraintEncode` and `constFalseConstraintEncode`: concrete
+  DTM-computable encoders for the constant-node constraint forms, proved correct
+  on unary index codes.
+- `varNodeConstraintEncodeFromPair`, `notNodeConstraintEncodeFromPair`,
+  `andNodeConstraintEncodeFromTriple`, and `orNodeConstraintEncodeFromTriple`:
+  pure encoders for the non-constant Tseitin constraint shapes from concatenated
+  unary index codes, each proved correct against `nodeConstraintFormula`.  All
+  four non-constant encoders now have proved `DPolyTimeComputable` realizations:
+  `varNodeConstraintDTMObligation_proved`,
+  `notNodeConstraintDTMObligation_proved`,
+  `andNodeConstraintDTMObligation_proved`, and
+  `orNodeConstraintDTMObligation_proved`.  The triple encoders use
+  `firstUnaryCode`/`dropFirstUnary` to select the needed index pairs.
+- `DDropFirstUnaryTM`, `DDropFirstUnaryTM_output`, `DDropFirstUnaryTM_halts`,
+  and `dPolyTimeComputable_dropFirstUnary`: a concrete linear-time transducer that
+  skips the leading unary code and emits the remainder.  It is proved correct on
+  every input and packaged as a `DPolyTimeComputable` function using the relaxed
+  output-length bound.
+- `DFirstUnaryCodeTM`, `DFirstUnaryCodeTM_output`, `DFirstUnaryCodeTM_halts`,
+  and `dPolyTimeComputable_firstUnaryCode`: the complementary linear-time
+  transducer that emits the leading unary code, including its terminator.
+- `DFirstTwoCodesTM` and `DFirstThirdCodesTM`: concrete linear-time transducers
+  for the first two codes and the first-and-third codes of a concatenated unary
+  triple.  Their output, halting, and length lemmas give
+  `dPolyTimeComputable_firstTwoCodes` and `dPolyTimeComputable_firstThirdCodes`;
+  composing the drop machine twice gives `dPolyTimeComputable_thirdCode`.
+  These splitters feed the and/or triple constraint encoders.
+- `DPolyTimeComputableClean`, `DPolyTimeComputableClean.of_machine`,
+  `DPolyTimeComputableCleanAppend`, and `DPolyTimeComputableClean_prepend`: a
+  stronger transducer predicate for machines that neither hand off nor touch the
+  work tape.  Such subroutines can be rerun on the same original input; the
+  append controller resets the input head between phases.  `headReset` is now
+  propagated through `Dcompose` and `Dappend`, and clean witnesses are proved for
+  the constant, tag-insertion, splitter, and truncating two-code transducers.
+  In particular `DTrunc2VarTagTM` and `DTrunc2NotVarTagTM` compute
+  `insertVarTagTotal (firstTwoCodes z)` and
+  `insertNotVarTagTotal (firstTwoCodes z)` directly, giving clean witnesses for
+  the two-code pair encoders used by the and/or constraints.  Direct
+  truncating three-code transducers `DTrunc3VarTagTM` and
+  `DTrunc3NotVarTagTM` also compute
+  `insertVarTagTotal (firstThirdCodes z)` and
+  `insertNotVarTagTotal (firstThirdCodes z)`, giving clean witnesses for the
+  first-third pair encoders.  With those and the clean splitters, all four
+  non-constant node-constraint DTM obligations are proved.
+- `DVarNodePairTM`, `DVarNodePairTM_full`, and
+  `dPolyTimeComputable_varNodeConstraintEncodeFromPair`: a concrete linear-time
+  transducer that emits both Tseitin pair constraints for a variable node from
+  one concatenated unary index pair.  It emits the constant pair prefixes,
+  copies the pair twice with distinct insertion tags, and is proved to halt with
+  the exact expected output.  `varNodeConstraintDTMObligation_proved` therefore
+  discharges the variable-node DTM obligation.
+- `DNotNodePairTM`, `DNotNodePairTM_full`, and
+  `dPolyTimeComputable_notNodeConstraintEncodeFromPair`: the analogous linear-time
+  transducer for negation nodes.  It swaps the two insertion tags relative to
+  the variable-node machine and is proved correct and polynomially bounded;
+  `notNodeConstraintDTMObligation_proved` discharges the negation-node obligation.
 - `NodeDesc` and `nodeConstraintEncode`: a compact word description of one
   Tseitin constraint.  `nodeDescOfCircuit` supplies the descriptor of a circuit
   node, and `nodeConstraintFormula_nodeDescOfCircuit` proves that the assembled
   formula encoding is exactly `tseitinConstraint`.  This isolates the
   constraint-assembly step from the machine that will enumerate circuit nodes.
+  `dPolyTimeComputable_nodeConstraintEncode` now proves that this total
+  descriptor encoder is polynomial-time computable in the composable DTM model.
+  The machine uses a boundary-marker dispatcher: after the initial marker step it
+  recognizes the six valid descriptor prefixes, copies the remaining unary codes
+  into a clean handoff, runs the corresponding verified branch transducer, and
+  rejects every malformed prefix to the empty word.  The branch proofs combine
+  the to-entry lemmas with the generic lift/halt/output lemmas, and the global
+  polynomial bounds are obtained by composing the six branch time and length
+  bounds with the dispatcher's linear overhead.
+- `DPolyTimeComputableClean` witnesses for the identity, constant-node, pair,
+  truncating, and node-from-pair encoders.  These machines never hand off and
+  leave the work tape untouched, so they can be rerun on the same input inside a
+  larger controller; `dPolyTimeComputableClean_id`, the clean constant encoders,
+  and the clean var/not/and/or node encoders are now proved.
+- `DFirstUnaryTM` and `dPolyTimeComputableClean_firstUnaryCode`: a clean
+  linear-time transducer that copies only the first unary code and ignores any
+  trailing descriptor data.  It is used by the constant-node branches of the
+  descriptor dispatcher.
+- `DDescDispatchTM`, `liftDispatch`, `haltLiftDispatch`,
+  `Dstep_DDescDispatchTM_branch`, and `Drun_DDescDispatchTM_branch`: a
+  hand-built finite-state dispatcher that copies the suffix after a descriptor
+  tag into a clean handoff input and then runs one of six branch machines.  The
+  step and run lemmas are proved, including halting normalization and the
+  reject/freezing cases.  This is the reusable controller for assembling
+  `nodeConstraintEncode` from the verified branch witnesses.
 - `NodeDescSeq`, `parseNodeDescSeq`, and `nodeConstraintSeqEncode`: a terminated
   sequence of node descriptors that assembles to the encoding of
-  `andMany (tseitinConstraints c)`.  `tseitinDescEncode` and `tseitinAssemble`
-  add the output-variable index and reconstruct the full `tseitinFormula`.
+  `andMany (tseitinConstraints c)`.  `nodeConstraintSeqEncode_singleton` records
+  the one-descriptor special case.  `Circuit.parseNat_spec`,
+  `parseNat2_spec`, `parseNat3_spec`, `parseNodeDescRest_spec`, and
+  `parseNodeDescSeq_spec` prove the converse parser property: every successful
+  parse identifies the canonical encoded prefix.  `andMany_encode_length_le`,
+  `nodeConstraintSeqEncode_length_le_poly`, and
+  `tseitinAssemble_length_le_poly` give the corresponding polynomial output
+  bounds.  `tseitinDescEncode` and `tseitinAssemble` add the output-variable
+  index and reconstruct the full `tseitinFormula`.
 - `npReductionCoreTseitin` and `npReductionAssemblerTseitin`: a richer pure
   decomposition where the core already carries the Tseitin descriptors and the
   assembler rebuilds the fixed-length SAT instance from them.
@@ -148,7 +238,9 @@ mathlib for:
   `Circuit.encode`, the descriptor sequence is polynomial in `c.size`, as shown
   by `tseitinDescEncode_length_le`.  `npReductionCoreDAG_length_le_poly` gives
   the corresponding polynomial bound for the whole core with respect to
-  `npReductionDAGPoly`.  `NodeDescSeq.encode_injective` and
+  `npReductionDAGPoly`, and `npReductionAssemblerDAG_length_le_poly` gives the
+  matching polynomial bound for the fixed-length assembler output.
+  `NodeDescSeq.encode_injective` and
   `nodeDescSeqOfCircuit_nodup` provide parser uniqueness and distinctness of the
   enumerated nodes.  `NPReductionDTMSubroutineObligation_of_dag` reduces the DTM
   obligation to these two functions.
@@ -358,6 +450,8 @@ To make the lower bound concrete:
 - `NPNotInPPoly_iff_SATNotInPPoly`: assuming SAT NP-completeness, the abstract
   and concrete lower bounds are equivalent (closure is now discharged).
 - `SATNPComplete_and_not_PPoly_implies_not_PEqualsNP`: the final concrete route.
+- `not_PEqualsNP_of_DTM_obligations`: the same conclusion, packaging the DTM
+  bridge and DTM reduction subroutines into the semantic reduction hypothesis.
 
 ## Section 12: polynomial-size Tseitin translation
 
@@ -481,6 +575,67 @@ is needed for this direction.  In particular,
 `SAT_in_P_implies_not_SATNotInPPoly` shows that SAT in P contradicts the
 concrete lower-bound hypothesis.
 
+Within the composable DTM reduction construction, the one-descriptor encoder,
+all pure parser/length facts, and the unary arithmetic needed for padding are
+now fully proved.  `unaryPred`, `dPolyTimeComputableClean_unaryPred`,
+`unaryPredIter`, and `unaryPred5` compute truncated unary subtraction;
+`unarySubInput` cleanly rewrites `encodeNat L ++ y` into two unary codes, and
+`paddingCode_of_length` proves that composing it with `unarySub` and
+`unaryPred5` yields the exact code `Formula.encodeNat ((L - y.length) - 5)`.
+The transducer composition theorem packages this as
+`dPolyTimeComputable_paddingCode`.  The same arithmetic is also available for
+an explicit pair of unary codes through `dPolyTimeComputable_paddingFromHeader`
+and `paddingFromHeader_encodeNat`.  `dropFirstUnary` is now also available as a
+clean transducer, so unary fields can be stripped in same-input append
+pipelines.  These results supply the arithmetic part of
+the padding computation for `npReductionAssemblerDAG`; the remaining
+machine-realization steps are still explicit rather than assumed:
+
+1. Iterate `nodeConstraintEncode` over `parseNodeDescSeq` to prove
+   `DPolyTimeComputable nodeConstraintSeqEncode`, then add the final output
+   variable to obtain `DPolyTimeComputable tseitinAssemble`.  These gaps are
+   named as `NodeConstraintSeqEncodeComputable` and
+   `TseitinAssembleComputable`.
+2. Build the verifier-circuit enumeration transducer so that
+   `npReductionCoreDAG V p q` is polynomial-time computable, and add the
+   fixed-length assembly transducer so that `npReductionAssemblerDAG V p q` is
+   polynomial-time computable.  Their conjunction is named
+   `DAGReductionSubroutinesComputable`; it instantiates
+   `NPReductionDTMSubroutineObligation_of_dag_computable`.
+
+A parallel header-format decomposition is also available.  `npReductionCoreHeader`
+emits the target length, the exact Tseitin-encoding length, and the Tseitin
+formula itself; `npReductionAssemblerHeader_core` proves that
+`npReductionAssemblerHeader` rebuilds `npReductionFixed` from that format.
+`npReductionCoreHeader_length_le_poly` records the polynomial size bound, and
+`NPReductionDTMSubroutineObligation_of_header_computable` packages the remaining
+header-transducer obligation.  This format isolates the arithmetic proved by
+`dPolyTimeComputable_paddingFromHeader`, but the header assembler itself is not
+yet a proved transducer.
+
+A second header format moves the padding arithmetic into the core.
+`npReductionCorePadded` emits `encodeNat k ++ f.encode`, where `k` is exactly the
+fresh-variable index used by `npReductionFixed`.  The corresponding assembler
+only concatenates a constant prefix, the formula field, a constant separator,
+and the unary padding field; `dPolyTimeComputableClean_npReductionAssemblerPadded`
+proves that this assembler is a clean polynomial-time transducer, and
+`npReductionPadded_mem_SAT_iff_accepts` transfers the SAT/NP semantic correctness
+through the assembly step.  The core
+remains an explicit computability obligation, but the end-to-end assembler no
+longer needs to recompute subtraction while preserving the original input.
+`PaddedHeaderReductionSubroutinesComputable` and
+`NPReductionDTMSubroutineObligation_of_paddedHeader_computable` package this
+route.  The packaged consequences include
+`SATNPComplete_of_paddedHeader_obligations`,
+`NP_subset_PPoly_of_paddedHeader_obligations`, and
+`NPNotInPPoly_implies_SATNotInPPoly_of_paddedHeader_obligations`.
+
+`not_PEqualsNP_of_dag_obligations` packages the entire route: once the DAG
+transducers, the DTM/TM bridge, the SAT verifier realization, and the concrete
+lower bound are supplied, the conclusion `¬ PEqualsNP` follows.  These remain
+construction gaps, not axioms; the corresponding `Prop`s are uninstantiated in
+the canonical file.
+
 Mathlib's `Computability/TuringMachine` files do contain a constructive chain
 from `Computable`/`Partrec` functions to TM2 and then TM1/TM0 machines, but the
 pinned library has no theorem promoting that simulation to polynomial time and
@@ -512,4 +667,5 @@ lake update
 lake build Mathlib.Algebra.Polynomial.Eval.Defs
 ```
 
-There should be no errors or warnings.
+There should be no errors; the pinned build emits only non-fatal linter
+warnings from the long constructive proofs.

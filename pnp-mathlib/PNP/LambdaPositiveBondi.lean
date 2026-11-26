@@ -748,6 +748,48 @@ theorem no_nonzero_constant_square (R : Representation (V := V)) {ξ : V}
 
 end LinearFluxObstruction
 
+/- Generator-kernel obstruction.  Suppose one tried to represent two generator
+    fluxes by constants times one fixed news square.  A sector with positive
+    news square but zero momentum flux forces the momentum coefficient to
+    vanish; a second sector with nonzero momentum flux then gives a
+    contradiction.  This is the finite core of the parity-selection argument
+    for even versus mixed-parity retarded multipoles. -/
+namespace FluxGeneratorKernelObstruction
+
+structure Sector where
+  newsSq : ℝ
+  energy : ℝ
+  momentum : ℝ
+
+structure Model where
+  evenSector : Sector
+  mixedSector : Sector
+  cEnergy : ℝ
+  cMomentum : ℝ
+  evenEnergy_eq : evenSector.energy = cEnergy * evenSector.newsSq
+  mixedEnergy_eq : mixedSector.energy = cEnergy * mixedSector.newsSq
+  evenMomentum_eq : evenSector.momentum = cMomentum * evenSector.newsSq
+  mixedMomentum_eq : mixedSector.momentum = cMomentum * mixedSector.newsSq
+  evenNewsPos : 0 < evenSector.newsSq
+  evenMomentumZero : evenSector.momentum = 0
+  mixedMomentumNonzero : mixedSector.momentum ≠ 0
+
+theorem evenMomentumCoefficient_zero (M : Model) : M.cMomentum = 0 := by
+  have hprod : M.cMomentum * M.evenSector.newsSq = 0 := by
+    rw [← M.evenMomentum_eq, M.evenMomentumZero]
+  rcases mul_eq_zero.mp hprod with hc | hn
+  · exact hc
+  · exact False.elim ((ne_of_gt M.evenNewsPos) hn)
+
+theorem no_universal_news_square (M : Model) : False := by
+  have hc := evenMomentumCoefficient_zero M
+  have hmix : M.mixedSector.momentum = 0 := by
+    rw [M.mixedMomentum_eq, hc]
+    simp
+  exact M.mixedMomentumNonzero hmix
+
+end FluxGeneratorKernelObstruction
+
 /- Linearized Hamiltonian news: the flux is a phase-space pairing between a
    news object and the symmetry generator acting on trace-free metric data.
    This records only the exact ξ-linearity of that construction. -/
@@ -1337,6 +1379,45 @@ theorem not_flux_zero_imp_news_zero {Phase News Charge : Type*}
 
 end ChargeFluxBlindness
 
+/- No-go for an unrestricted central theorem on the full linearized phase
+    space.  If news-zero is equivalent to no radiation and zero time-translation
+    flux is also equivalent to no radiation, the ABK blind example gives a
+    state with zero flux but nonzero news, a contradiction.  Thus a central
+    theorem must restrict the admissible phase space or weaken the flux-zero
+    equivalence. -/
+namespace UnrestrictedCentralNoGo
+
+structure Model (Phase News Charge : Type*) extends ChargeFluxBlindness.Model Phase News Charge where
+  timeTranslation : Charge
+  noRadiation : Phase → Prop
+  news_zero_iff_noRadiation : ∀ p : Phase, newsZero (news p) ↔ noRadiation p
+  flux_zero_iff_noRadiation : ∀ p : Phase, flux timeTranslation p = 0 ↔ noRadiation p
+
+theorem impossible (M : Model Phase News Charge) : False := by
+  obtain ⟨p, hpflux, hpnews⟩ := M.blindExample
+  have hnr : M.noRadiation p :=
+    (M.flux_zero_iff_noRadiation p).mp (hpflux M.timeTranslation)
+  have hnz : M.newsZero (M.news p) :=
+    (M.news_zero_iff_noRadiation p).mpr hnr
+  exact hpnews hnz
+
+end UnrestrictedCentralNoGo
+
+/- Finite-dimensional shadow of charge blindness.  The outgoing detector pair
+    has eight local STF-plus-vector components while the de Sitter charge group
+    supplies seven generators, so no linear charge map can be injective on the
+    local detector space.  This records only the dimension count; the full ABK
+    blindness is a separate global result. -/
+namespace FiniteChargeDetectionObstruction
+
+theorem no_injective_fin8_to_fin7
+    (f : (Fin 8 → ℝ) →ₗ[ℝ] (Fin 7 → ℝ)) : ¬ Function.Injective f := by
+  intro hf
+  have hle := f.finrank_le_finrank_of_injective hf
+  norm_num at hle
+
+end FiniteChargeDetectionObstruction
+
 /- Conformal weights force any rank-two realization of the first-jet news to
    use a nonlocal operator.  The detector tensor has lower weight -1 and the
    detector vector has lower weight -2; a rank-two tensor pair needs a map of
@@ -1809,6 +1890,46 @@ theorem square_ne_of_nonzero (M : Algebra)
   exact mul_ne_zero hs hc ((square_eq_iff M).mp h)
 
 end RetardedOriginAmbiguity
+
+/- Packaging of the central flux properties in the linear retarded-source
+    sector.  The open part is the construction of `newsSq` from arbitrary
+    boundary data; here it is identified with the ABK retarded seed square. -/
+namespace LinearRetardedCentralCore
+
+structure Model where
+  G : ℝ
+  flux : ℝ
+  newsSq : ℝ
+  seedSq : ℝ
+  newsSq_nonneg : 0 ≤ newsSq
+  newsSq_eq : newsSq = seedSq
+  flux_eq : flux = G * newsSq / (2 * Real.pi)
+
+theorem flux_nonneg (M : Model) (hG : 0 ≤ M.G) : 0 ≤ M.flux := by
+  rw [M.flux_eq]
+  have hnum : 0 ≤ M.G * M.newsSq := mul_nonneg hG M.newsSq_nonneg
+  have hden : 0 ≤ (2 * Real.pi : ℝ) := by positivity
+  exact div_nonneg hnum hden
+
+theorem flux_zero_of_news_zero (M : Model) (h : M.newsSq = 0) : M.flux = 0 := by
+  rw [M.flux_eq, h]
+  ring
+
+theorem newsSq_zero_of_flux_zero (M : Model) (hG : 0 < M.G) (hf : M.flux = 0) :
+    M.newsSq = 0 := by
+  have hpi : (2 * Real.pi : ℝ) ≠ 0 := by positivity
+  rw [M.flux_eq] at hf
+  field_simp [hpi] at hf
+  have hf' : M.G * M.newsSq = 0 := by simpa using hf
+  exact (mul_eq_zero.mp hf').resolve_left (ne_of_gt hG)
+
+theorem flux_zero_iff_news_zero (M : Model) (hG : 0 < M.G) :
+    M.flux = 0 ↔ M.newsSq = 0 := by
+  constructor
+  · exact newsSq_zero_of_flux_zero M hG
+  · exact flux_zero_of_news_zero M
+
+end LinearRetardedCentralCore
 
 /- Directional degeneracy in the FAS Λ→0 limit.  The omitted positive common
    factor is irrelevant to the zero-set implication formalized here. -/

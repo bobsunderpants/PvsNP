@@ -223,6 +223,7 @@ structure DAction (σ : Type) where
 structure DTM (σ : Type) [Fintype σ] [DecidableEq σ] where
   step : σ → Option Bool → Bool → DAction σ
   handoff : σ → Bool := fun _ => false
+  headReset : σ → Bool := fun _ => false
   start : σ
   accept : σ
   reject : σ
@@ -271,7 +272,7 @@ def Dstep {σ : Type} [Fintype σ] [DecidableEq σ] (M : DTM σ) (c : DConfig σ
   let tr := M.step c.state sym (c.work c.workHead)
   let hand := M.handoff c.state
   let input' := if hand then c.output else c.input
-  let head' := if hand then 0 else match tr.inputMove with
+  let head' := if hand then 0 else if M.headReset c.state then 0 else match tr.inputMove with
     | none => c.head
     | some dir => Dmove dir c.head
   let output' := if hand then [] else match tr.output with
@@ -342,7 +343,7 @@ def DPolyTimeComputable (f : Word → Word) : Prop :=
     (M : DTM σ) (p r : TimeBound),
     (∀ x : Word, Dhalted M (Drun M (p.eval x.length) (Dinit M x)) = true) ∧
     ∀ x : Word,
-      Dboutput M (p.eval x.length) x = f x ∧ (f x).length = r.eval x.length
+      Dboutput M (p.eval x.length) x = f x ∧ (f x).length ≤ r.eval x.length
 
 /-- States of a sequential composition: first subroutine, then second. -/
 inductive DCompState (σ τ : Type) where
@@ -401,6 +402,9 @@ def Dcompose {σ τ : Type} [Fintype σ] [DecidableEq σ] [Fintype τ] [Decidabl
   handoff
     | DCompState.first q => M.handoff q || (decide (q = M.accept) || decide (q = M.reject))
     | DCompState.second q => N.handoff q
+  headReset
+    | DCompState.first q => M.headReset q
+    | DCompState.second q => N.headReset q
   start := DCompState.first M.start
   accept := DCompState.second N.accept
   reject := DCompState.second N.reject
@@ -564,9 +568,10 @@ theorem DPolyTimeComputableClosedUnderComposition :
       rw [htotal_time]
       rw [Dhalted_compose_liftSecond]
       simpa [K] using hNhaltx
-    have hpn : pn = (q.comp r).eval x.length := by
+    have hpn_le : pn ≤ (q.comp r).eval x.length := by
       have hlen := (hMout x).2
-      simp [pn, hlen, Polynomial.eval_comp]
+      have hmono := timeBound_eval_monotone q hlen
+      simpa [pn, Polynomial.eval_comp] using hmono
     have hP : P.eval x.length = pm + 1 + (q.comp r).eval x.length := by
       simp [P, pm]
     have hle_total : (t0 + 1) + pn ≤ P.eval x.length := by omega
@@ -581,9 +586,415 @@ theorem DPolyTimeComputableClosedUnderComposition :
     · change (Drun K (P.eval x.length) (Dinit K x)).output = g (f x)
       rw [hcomp_run x]
       simpa [liftSecond] using (hNout (f x)).1
-    · have hlenf : (f x).length = r.eval x.length := (hMout x).2
-      rw [(hNout (f x)).2, hlenf]
-      simp [R, Polynomial.eval_comp]
+    · have hlenf : (f x).length ≤ r.eval x.length := (hMout x).2
+      have hmono := timeBound_eval_monotone s hlenf
+      simpa [R, Polynomial.eval_comp] using ((hNout (f x)).2).trans hmono
+
+/-- A transducer uses no work tape if every step leaves both work fields alone. -/
+def DNoWork {σ : Type} [Fintype σ] [DecidableEq σ] (M : DTM σ) : Prop :=
+  ∀ q sym wsym,
+    (M.step q sym wsym).workWrite = none ∧ (M.step q sym wsym).workMove = none
+
+/-- A stronger computability predicate for transducers that do not hand off
+    and never touch the work tape.  These are exactly the subroutines that can
+    be rerun on the same input; the append controller resets the input head. -/
+def DPolyTimeComputableClean (f : Word → Word) : Prop :=
+  ∃ (σ : Type) (_instσ : Fintype σ) (_decσ : DecidableEq σ)
+    (M : DTM σ) (p r : TimeBound),
+    (∀ q : σ, M.handoff q = false) ∧
+    DNoWork M ∧
+    (∀ x : Word, Dhalted M (Drun M (p.eval x.length) (Dinit M x)) = true) ∧
+    ∀ x : Word,
+      Dboutput M (p.eval x.length) x = f x ∧ (f x).length ≤ r.eval x.length
+
+theorem DPolyTimeComputableClean.toPoly {f : Word → Word} :
+    DPolyTimeComputableClean f → DPolyTimeComputable f := by
+  intro h
+  rcases h with ⟨σ, _, _, M, p, r, _hno, _hwork, hhalt, hout⟩
+  exact ⟨σ, inferInstance, inferInstance, M, p, r, hhalt, hout⟩
+
+lemma Drun_noWork_work_of {σ : Type} [Fintype σ] [DecidableEq σ]
+    (M : DTM σ) (hno : ∀ q : σ, M.handoff q = false) (hM : DNoWork M) (t : Nat) (c : DConfig σ)
+    (hc : c.work = fun _ : Nat => false) :
+    (Drun M t c).work = fun _ : Nat => false := by
+  induction t generalizing c with
+  | zero => exact hc
+  | succ t ih =>
+      rw [Drun_succ_eq_run_nextConfig]
+      by_cases hh : Dhalted M c = true
+      · simpa [DnextConfig, hh] using ih c hc
+      · have htr := hM c.state (Dread c) (c.work c.workHead)
+        have hwrite : DwriteWork c.work c.workHead
+              (M.step c.state (Dread c) (c.work c.workHead)).workWrite = c.work := by
+          rw [htr.1]
+          simp
+        have hstep : (Dstep M c).work = c.work := by
+          dsimp [Dstep]
+          rw [hno c.state]
+          exact hwrite
+        simpa [DnextConfig, hh] using ih (Dstep M c) (hstep.trans hc)
+
+lemma Drun_noWork_workHead_of {σ : Type} [Fintype σ] [DecidableEq σ]
+    (M : DTM σ) (hno : ∀ q : σ, M.handoff q = false) (hM : DNoWork M) (t : Nat) (c : DConfig σ)
+    (hc : c.workHead = 0) :
+    (Drun M t c).workHead = 0 := by
+  induction t generalizing c with
+  | zero => exact hc
+  | succ t ih =>
+      rw [Drun_succ_eq_run_nextConfig]
+      by_cases hh : Dhalted M c = true
+      · simpa [DnextConfig, hh] using ih c hc
+      · have htr := hM c.state (Dread c) (c.work c.workHead)
+        have hmove : (match (M.step c.state (Dread c) (c.work c.workHead)).workMove with
+              | none => c.workHead
+              | some dir => Dmove dir c.workHead) = c.workHead := by
+          rw [htr.2]
+        have hstep : (Dstep M c).workHead = c.workHead := by
+          dsimp [Dstep]
+          rw [hno c.state]
+          exact hmove
+        simpa [DnextConfig, hh] using ih (Dstep M c) (hstep.trans hc)
+
+lemma Drun_noWork_work {σ : Type} [Fintype σ] [DecidableEq σ]
+    (M : DTM σ) (hno : ∀ q : σ, M.handoff q = false) (hM : DNoWork M) (t : Nat) (x : Word) :
+    (Drun M t (Dinit M x)).work = fun _ : Nat => false := by
+  exact Drun_noWork_work_of M hno hM t (Dinit M x) rfl
+
+lemma Drun_noWork_workHead {σ : Type} [Fintype σ] [DecidableEq σ]
+    (M : DTM σ) (hno : ∀ q : σ, M.handoff q = false) (hM : DNoWork M) (t : Nat) (x : Word) :
+    (Drun M t (Dinit M x)).workHead = 0 := by
+  exact Drun_noWork_workHead_of M hno hM t (Dinit M x) rfl
+
+lemma Drun_noHandoff_input {σ : Type} [Fintype σ] [DecidableEq σ]
+    (M : DTM σ) (hno : ∀ q : σ, M.handoff q = false)
+    (t : Nat) (c : DConfig σ) : (Drun M t c).input = c.input := by
+  induction t generalizing c with
+  | zero => rfl
+  | succ t ih =>
+      rw [Drun_succ_eq_run_nextConfig]
+      by_cases hh : Dhalted M c = true
+      · simpa [DnextConfig, hh] using ih c
+      · have hf : Dhalted M c = false := by cases h' : Dhalted M c <;> simp_all
+        have hstep : (Dstep M c).input = c.input := by simp [Dstep, hno c.state]
+        rw [DnextConfig, hf]
+        exact (ih (Dstep M c)).trans hstep
+
+lemma DConfig.ext_eq {σ : Type} {c c' : DConfig σ}
+    (hstate : c.state = c'.state) (hinput : c.input = c'.input)
+    (hhead : c.head = c'.head) (houtput : c.output = c'.output)
+    (hwork : c.work = c'.work) (hworkHead : c.workHead = c'.workHead) : c = c' := by
+  cases c
+  cases c'
+  simp_all
+
+/-- Replace a configuration's output by a fixed prefix followed by its output. -/
+def DwithOutput {σ : Type} (c : DConfig σ) (o : Word) : DConfig σ :=
+  { state := c.state, input := c.input, head := c.head,
+    output := o ++ c.output, work := c.work, workHead := c.workHead }
+
+lemma Drun_withOutput_of {σ : Type} [Fintype σ] [DecidableEq σ]
+    (M : DTM σ) (hno : ∀ q : σ, M.handoff q = false)
+    (t : Nat) (c c0 : DConfig σ) (o : Word)
+    (h : c = DwithOutput c0 o) :
+    Drun M t c = DwithOutput (Drun M t c0) o := by
+  induction t generalizing c c0 with
+  | zero => simpa [Drun, DwithOutput] using h
+  | succ t ih =>
+      rw [Drun_succ_eq_run_nextConfig]
+      rw [Drun_succ_eq_run_nextConfig]
+      by_cases hh : Dhalted M c0 = true
+      · have hh' : Dhalted M c = true := by
+          simpa [h, DwithOutput, Dhalted] using hh
+        simpa [DnextConfig, hh, hh'] using ih c c0 h
+      · have hh' : Dhalted M c = false := by
+          simpa [h, DwithOutput, Dhalted] using hh
+        have hstep : Dstep M c = DwithOutput (Dstep M c0) o := by
+          subst c
+          have hread : Dread (DwithOutput c0 o) = Dread c0 := by rfl
+          have hread' : Dread
+              { state := c0.state, input := c0.input, head := c0.head, output := o ++ c0.output,
+                work := c0.work, workHead := c0.workHead } = Dread c0 := by rfl
+          apply DConfig.ext_eq
+          · simp [Dstep, DwithOutput, hno, hread, hread'] <;> rfl
+          · simp [Dstep, DwithOutput, hno, hread, hread'] <;> rfl
+          · simp [Dstep, DwithOutput, hno, hread, hread'] <;> rfl
+          · generalize hopt : (M.step c0.state (Dread c0) (c0.work c0.workHead)).output = opt
+            cases opt <;> simp [Dstep, DwithOutput, hno, hread, hread', List.append_assoc, hopt] <;> rfl
+          · simp [Dstep, DwithOutput, hno, hread, hread'] <;> rfl
+          · simp [Dstep, DwithOutput, hno, hread, hread'] <;> rfl
+        simpa [DnextConfig, hh, hh'] using ih (Dstep M c) (Dstep M c0) hstep
+
+/-- Running a no-handoff transducer from a configuration that differs from
+    `Dinit` only in its output prefixes every output bit by that output. -/
+lemma Drun_withOutput {σ : Type} [Fintype σ] [DecidableEq σ]
+    (M : DTM σ) (hno : ∀ q : σ, M.handoff q = false)
+    (t : Nat) (x o : Word) :
+    Drun M t
+        { state := M.start, input := x, head := 0, output := o,
+          work := fun _ : Nat => false, workHead := 0 } =
+      DwithOutput (Drun M t (Dinit M x)) o := by
+  apply Drun_withOutput_of M hno
+  simp [DwithOutput, Dinit]
+
+lemma Drun_output_append {σ : Type} [Fintype σ] [DecidableEq σ]
+    (M : DTM σ) (hno : ∀ q : σ, M.handoff q = false)
+    (t : Nat) (x o : Word) :
+    (Drun M t
+      { state := M.start, input := x, head := 0, output := o,
+        work := fun _ : Nat => false, workHead := 0 }).output =
+      o ++ Dboutput M t x := by
+  rw [Drun_withOutput M hno t x o]
+  rfl
+
+/-- Append composition: run the first clean transducer, then rerun the second
+    clean transducer on the unchanged original input while preserving the first
+    output. -/
+def Dappend {σ τ : Type} [Fintype σ] [DecidableEq σ] [Fintype τ] [DecidableEq τ]
+    (M : DTM σ) (N : DTM τ) : DTM (DCompState σ τ) where
+  step
+    | DCompState.first q, sym, wsym =>
+        if decide (q = M.accept) || decide (q = M.reject) then
+          { next := DCompState.second N.start, output := none, inputMove := none
+            workWrite := none, workMove := none }
+        else
+          let tr := M.step q sym wsym
+          { next := DCompState.first tr.next, output := tr.output
+            inputMove := tr.inputMove, workWrite := tr.workWrite, workMove := tr.workMove }
+    | DCompState.second q, sym, wsym =>
+        if decide (q = N.accept) || decide (q = N.reject) then
+          { next := DCompState.second q, output := none, inputMove := none
+            workWrite := none, workMove := none }
+        else
+          let tr := N.step q sym wsym
+          { next := DCompState.second tr.next, output := tr.output
+            inputMove := tr.inputMove, workWrite := tr.workWrite, workMove := tr.workMove }
+  handoff := fun _ => false
+  headReset := fun s => match s with
+    | DCompState.first q => M.headReset q || decide (q = M.accept ∨ q = M.reject)
+    | DCompState.second q => N.headReset q
+  start := DCompState.first M.start
+  accept := DCompState.second N.accept
+  reject := DCompState.second N.reject
+
+lemma Dhalted_append_liftFirst {σ τ : Type} [Fintype σ] [DecidableEq σ]
+    [Fintype τ] [DecidableEq τ] (M : DTM σ) (N : DTM τ) (c : DConfig σ) :
+    Dhalted (Dappend M N) (liftFirst M N c) = false := by
+  rcases c with ⟨q, inp, hd, out, wk, wh⟩
+  simp [Dhalted, liftFirst, Dappend]
+
+lemma Dhalted_append_liftSecond {σ τ : Type} [Fintype σ] [DecidableEq σ]
+    [Fintype τ] [DecidableEq τ] (M : DTM σ) (N : DTM τ) (c : DConfig τ) :
+    Dhalted (Dappend M N) (liftSecond M N c) = Dhalted N c := by
+  rcases c with ⟨q, inp, hd, out, wk, wh⟩
+  simp [Dhalted, liftSecond, Dappend]
+
+lemma Dstep_append_first_of_not_halted {σ τ : Type} [Fintype σ] [DecidableEq σ]
+    [Fintype τ] [DecidableEq τ] (M : DTM σ) (N : DTM τ) (hMno : ∀ q : σ, M.handoff q = false)
+    (c : DConfig σ) (hnot : Dhalted M c = false) :
+    Dstep (Dappend M N) (liftFirst M N c) = liftFirst M N (Dstep M c) := by
+  rcases c with ⟨q, inp, hd, out, wk, wh⟩
+  dsimp [liftFirst, Dstep, Dread, Dhalted] at hnot ⊢
+  have hqp : ¬ (q = M.accept ∨ q = M.reject) := by simpa using hnot
+  simp [Dappend, hqp, hMno q]
+
+lemma Dstep_append_first_halted {σ τ : Type} [Fintype σ] [DecidableEq σ]
+    [Fintype τ] [DecidableEq τ] (M : DTM σ) (N : DTM τ) (c : DConfig σ)
+    (hhalt : Dhalted M c = true) :
+    Dstep (Dappend M N) (liftFirst M N c) =
+      liftSecond M N
+        { state := N.start, input := c.input, head := 0,
+          output := c.output, work := c.work, workHead := c.workHead } := by
+  rcases c with ⟨q, inp, hd, out, wk, wh⟩
+  dsimp [liftFirst, liftSecond, Dstep, Dread, Dhalted] at hhalt ⊢
+  have hqp : q = M.accept ∨ q = M.reject := by simpa using hhalt
+  simp [Dappend, hqp]
+
+lemma Dstep_append_second_of_not_halted {σ τ : Type} [Fintype σ] [DecidableEq σ]
+    [Fintype τ] [DecidableEq τ] (M : DTM σ) (N : DTM τ) (hNno : ∀ q : τ, N.handoff q = false)
+    (c : DConfig τ) (hnot : Dhalted N c = false) :
+    Dstep (Dappend M N) (liftSecond M N c) = liftSecond M N (Dstep N c) := by
+  rcases c with ⟨q, inp, hd, out, wk, wh⟩
+  dsimp [liftSecond, Dstep, Dread, Dhalted] at hnot ⊢
+  have hqp : ¬ (q = N.accept ∨ q = N.reject) := by simpa using hnot
+  simp [Dappend, hqp, hNno q]
+
+lemma DnextConfig_append_second {σ τ : Type} [Fintype σ] [DecidableEq σ]
+    [Fintype τ] [DecidableEq τ] (M : DTM σ) (N : DTM τ) (hNno : ∀ q : τ, N.handoff q = false)
+    (c : DConfig τ) :
+    DnextConfig (Dappend M N) (liftSecond M N c) =
+      liftSecond M N (DnextConfig N c) := by
+  by_cases h : Dhalted N c = true
+  · have hc : Dhalted (Dappend M N) (liftSecond M N c) = true := by
+      rw [Dhalted_append_liftSecond]
+      exact h
+    simp [DnextConfig, h, hc]
+  · have hf : Dhalted N c = false := by cases h' : Dhalted N c <;> simp_all
+    have hc : Dhalted (Dappend M N) (liftSecond M N c) = false := by
+      rw [Dhalted_append_liftSecond]
+      exact hf
+    simp [DnextConfig, hf, hc, Dstep_append_second_of_not_halted M N hNno c hf]
+
+lemma Drun_append_second {σ τ : Type} [Fintype σ] [DecidableEq σ]
+    [Fintype τ] [DecidableEq τ] (M : DTM σ) (N : DTM τ) (hNno : ∀ q : τ, N.handoff q = false)
+    (k : Nat) (c : DConfig τ) :
+    Drun (Dappend M N) k (liftSecond M N c) = liftSecond M N (Drun N k c) := by
+  induction k generalizing c with
+  | zero => simp [Drun, liftSecond]
+  | succ k ih =>
+      rw [Drun_succ_eq_run_nextConfig]
+      rw [Drun_succ_eq_run_nextConfig]
+      rw [DnextConfig_append_second M N hNno c]
+      exact ih (DnextConfig N c)
+
+lemma DnextConfig_append_first_of_not_halted {σ τ : Type} [Fintype σ] [DecidableEq σ]
+    [Fintype τ] [DecidableEq τ] (M : DTM σ) (N : DTM τ) (hMno : ∀ q : σ, M.handoff q = false)
+    (c : DConfig σ) (hnot : Dhalted M c = false) :
+    DnextConfig (Dappend M N) (liftFirst M N c) =
+      liftFirst M N (DnextConfig M c) := by
+  have hcnot : Dhalted (Dappend M N) (liftFirst M N c) = false :=
+    Dhalted_append_liftFirst M N c
+  simp [DnextConfig, hnot, hcnot, Dstep_append_first_of_not_halted M N hMno c hnot]
+
+lemma Drun_append_first {σ τ : Type} [Fintype σ] [DecidableEq σ]
+    [Fintype τ] [DecidableEq τ] (M : DTM σ) (N : DTM τ) (hMno : ∀ q : σ, M.handoff q = false)
+    (t : Nat) (c : DConfig σ)
+    (hnone : ∀ s : Nat, s < t → Dhalted M (Drun M s c) = false) :
+    Drun (Dappend M N) t (liftFirst M N c) = liftFirst M N (Drun M t c) := by
+  induction t generalizing c with
+  | zero => simp [Drun, liftFirst]
+  | succ t ih =>
+      rw [Drun_succ_eq_run_nextConfig]
+      rw [Drun_succ_eq_run_nextConfig]
+      have hnot_c : Dhalted M c = false := by
+        simpa [Drun] using hnone 0 (Nat.succ_pos t)
+      rw [DnextConfig_append_first_of_not_halted M N hMno c hnot_c]
+      apply ih (DnextConfig M c)
+      intro s hs
+      have hs' : s + 1 < t + 1 := Nat.succ_lt_succ hs
+      have h := hnone (s + 1) hs'
+      simpa [Drun_succ_eq_run_nextConfig] using h
+
+theorem DPolyTimeComputableCleanAppend :
+    ∀ f g : Word → Word,
+      DPolyTimeComputableClean f → DPolyTimeComputableClean g →
+      DPolyTimeComputableClean (fun x => f x ++ g x) := by
+  intro f g hf hg
+  rcases hf with ⟨σ, _instσ, _decσ, M, p, r, hMno, hMwork, hMhalt, hMout⟩
+  rcases hg with ⟨τ, _instτ, _decτ, N, q, s, hNno, hNwork, hNhalt, hNout⟩
+  let K := Dappend M N
+  let P : TimeBound := p + C 1 + q
+  let R : TimeBound := r + s
+  have hcomp_run : ∀ x : Word,
+      Drun K (P.eval x.length) (Dinit K x) =
+        liftSecond M N
+          (Drun N (q.eval x.length)
+            { state := N.start, input := x, head := 0, output := f x,
+              work := fun _ : Nat => false, workHead := 0 }) := by
+    intro x
+    let cN0 : DConfig τ :=
+      { state := N.start, input := x, head := 0, output := f x,
+        work := fun _ : Nat => false, workHead := 0 }
+    change Drun K (P.eval x.length) (Dinit K x) = liftSecond M N (Drun N (q.eval x.length) cN0)
+    let pm := p.eval x.length
+    let c0 := Dinit K x
+    let cM0 := Dinit M x
+    let hex : ∃ t : Nat, t ≤ pm ∧ Dhalted M (Drun M t cM0) = true :=
+      ⟨pm, le_rfl, by simpa [pm] using hMhalt x⟩
+    let t0 := Nat.find hex
+    have ht0halt : Dhalted M (Drun M t0 cM0) = true := (Nat.find_spec hex).2
+    have ht0le : t0 ≤ pm := Nat.find_min' hex (by simpa [pm] using hMhalt x)
+    have hnone : ∀ s' : Nat, s' < t0 → Dhalted M (Drun M s' cM0) = false := by
+      intro s' hs
+      have hle : s' ≤ pm := by omega
+      by_contra hh
+      exact (Nat.find_min hex hs) ⟨hle, by simpa using hh⟩
+    have hfirst : Drun K t0 (liftFirst M N cM0) = liftFirst M N (Drun M t0 cM0) := by
+      simpa [K] using Drun_append_first M N hMno t0 cM0 hnone
+    have hfreeze : Drun M pm cM0 = Drun M t0 cM0 :=
+      Drun_eq_of_halted_within M cM0 ht0le ht0halt
+    have hout_t0 : (Drun M t0 cM0).output = f x := by
+      rw [← hfreeze]
+      exact (hMout x).1
+    have hwork_t0 : (Drun M t0 cM0).work = fun _ : Nat => false := by
+      rw [← hfreeze]
+      simpa [pm] using Drun_noWork_work M hMno hMwork pm x
+    have hwh_t0 : (Drun M t0 cM0).workHead = 0 := by
+      rw [← hfreeze]
+      simpa [pm] using Drun_noWork_workHead M hMno hMwork pm x
+    have hinput_t0 : (Drun M t0 cM0).input = x := by
+      rw [← hfreeze]
+      exact Drun_noHandoff_input M hMno pm cM0
+    have hswitch : Drun K (t0 + 1) c0 =
+        liftSecond M N
+          { state := N.start, input := x, head := 0, output := f x,
+            work := fun _ : Nat => false, workHead := 0 } := by
+      dsimp [c0]
+      change Drun K (t0 + 1) (liftFirst M N cM0) = _
+      rw [Drun_add_eq]
+      rw [hfirst]
+      change Drun K 1 (liftFirst M N (Drun M t0 cM0)) = _
+      rw [show Drun K 1 (liftFirst M N (Drun M t0 cM0)) =
+          DnextConfig K (liftFirst M N (Drun M t0 cM0)) by
+        simp [Drun, DnextConfig, Dhalted_append_liftFirst]]
+      rw [DnextConfig, Dhalted_append_liftFirst]
+      simp [K, Dstep_append_first_halted M N (Drun M t0 cM0) ht0halt,
+        hout_t0, hinput_t0, hwork_t0, hwh_t0]
+    let pn := q.eval x.length
+    have htotal_time : Drun K ((t0 + 1) + pn) c0 =
+        liftSecond M N (Drun N pn cN0) := by
+      rw [Drun_add_eq]
+      rw [hswitch]
+      simpa [K] using Drun_append_second M N hNno pn
+        cN0
+    have hhalt_total : Dhalted K (Drun K ((t0 + 1) + pn) c0) = true := by
+      rw [htotal_time]
+      rw [Dhalted_append_liftSecond]
+      have hstate : (Drun N pn cN0).state =
+          (Drun N (q.eval x.length) (Dinit N x)).state := by
+        dsimp [cN0]
+        rw [Drun_withOutput N hNno pn x (f x)]
+        dsimp [DwithOutput]
+      simpa [Dhalted, hstate, pn] using hNhalt x
+    have hP : P.eval x.length = pm + 1 + q.eval x.length := by
+      simp [P, pm]
+    have hle_total : (t0 + 1) + pn ≤ P.eval x.length := by omega
+    exact (Drun_eq_of_halted_within K c0 hle_total hhalt_total).trans htotal_time
+  refine ⟨DCompState σ τ, inferInstance, inferInstance, K, P, R, ?_, ?_, ?_, ?_⟩
+  · intro u
+    cases u <;> rfl
+  · intro u sym wsym
+    cases u with
+    | first u =>
+        by_cases hq : u = M.accept ∨ u = M.reject
+        · simp [K, Dappend, hq]
+        · simpa [K, Dappend, hq] using hMwork u sym wsym
+    | second u =>
+        by_cases hq : u = N.accept ∨ u = N.reject
+        · simp [K, Dappend, hq]
+        · simpa [K, Dappend, hq] using hNwork u sym wsym
+  · intro x
+    rw [hcomp_run x]
+    rw [Dhalted_append_liftSecond]
+    have hstate : (Drun N (q.eval x.length)
+          { state := N.start, input := x, head := 0, output := f x,
+            work := fun _ : Nat => false, workHead := 0 }).state =
+        (Drun N (q.eval x.length) (Dinit N x)).state := by
+      rw [Drun_withOutput N hNno (q.eval x.length) x (f x)]
+      dsimp [DwithOutput]
+    simpa [Dhalted, hstate] using hNhalt x
+  · intro x
+    constructor
+    · change (Drun K (P.eval x.length) (Dinit K x)).output = f x ++ g x
+      rw [hcomp_run x]
+      change (Drun N (q.eval x.length)
+        { state := N.start, input := x, head := 0, output := f x,
+          work := fun _ : Nat => false, workHead := 0 }).output = f x ++ g x
+      rw [Drun_output_append N hNno (q.eval x.length) x (f x)]
+      simpa [liftSecond] using congrArg (fun z => f x ++ z) (hNout x).1
+    · have hlenf : (f x).length ≤ r.eval x.length := (hMout x).2
+      have hleng : (g x).length ≤ s.eval x.length := (hNout x).2
+      simp [R]
+      omega
 
 -- -----------------------------------------------------------------------------
 -- 2c. A first concrete transducer subroutine
@@ -10935,6 +11346,5541 @@ def nodeConstraintFormula : NodeDesc → Formula
         (Formula.or (Formula.or (Formula.not (Formula.var a)) (Formula.var b))
           (Formula.var c))
 
+/-- Assemble the equality constraint of a variable node from the two unary
+    index codes.  The first pair encoder produces `¬a ∨ i` and the second
+    produces `a ∨ ¬i`; the outer tag conjoins them. -/
+def varNodeConstraintEncodeFromPair (z : Word) : Word :=
+  ([true, false] : Word) ++ Formula.pairOrNotVarVarEncode z ++
+    Formula.pairVarNotVarEncode z
+
+lemma varNodeConstraintEncodeFromPair_unary_pair (a i : Nat) :
+    varNodeConstraintEncodeFromPair (Formula.encodeNat a ++ Formula.encodeNat i) =
+      (nodeConstraintFormula (NodeDesc.var a i)).encode := by
+  rw [varNodeConstraintEncodeFromPair, Formula.pairOrNotVarVarEncode_unary_pair,
+    Formula.pairVarNotVarEncode_unary_pair]
+  simp [nodeConstraintFormula, Formula.encode_and_eq]
+
+/-- DTM realization of the variable-node constraint encoder.  The pure
+    encoding is available; the machine must copy the two unary codes so that
+    both pair encoders can consume them. -/
+def varNodeConstraintDTMObligation : Prop :=
+  DPolyTimeComputable varNodeConstraintEncodeFromPair
+
+/-- Assemble the equivalence constraint of a negation node from the two unary
+    index codes. -/
+def notNodeConstraintEncodeFromPair (z : Word) : Word :=
+  ([true, false] : Word) ++ Formula.pairNotVarNotVarEncode z ++
+    Formula.pairVarVarEncode z
+
+lemma notNodeConstraintEncodeFromPair_unary_pair (a b : Nat) :
+    notNodeConstraintEncodeFromPair (Formula.encodeNat a ++ Formula.encodeNat b) =
+      (nodeConstraintFormula (NodeDesc.not a b)).encode := by
+  rw [notNodeConstraintEncodeFromPair, Formula.pairNotVarNotVarEncode_unary_pair,
+    Formula.pairVarVarEncode_unary_pair]
+  simp [nodeConstraintFormula, Formula.encode_and_eq]
+
+def notNodeConstraintDTMObligation : Prop :=
+  DPolyTimeComputable notNodeConstraintEncodeFromPair
+
+-- ---------------------------------------------------------------------------
+-- Splitting a concatenated unary triple into its component codes
+-- ---------------------------------------------------------------------------
+
+/-- The first unary code of a word, including its terminating `false`. -/
+def firstUnaryCode : Word → Word
+  | [] => []
+  | true :: zs => true :: firstUnaryCode zs
+  | false :: _ => [false]
+
+/-- Remove the first unary code of a word. -/
+def dropFirstUnary : Word → Word
+  | [] => []
+  | true :: zs => dropFirstUnary zs
+  | false :: zs => zs
+
+lemma firstUnaryCode_replicate_true_false (i : Nat) (rest : Word) :
+    firstUnaryCode (List.replicate i true ++ false :: rest) =
+      List.replicate i true ++ [false] := by
+  induction i with
+  | zero => simp [firstUnaryCode]
+  | succ i ih => simp [List.replicate_succ, firstUnaryCode, ih]
+
+lemma dropFirstUnary_replicate_true_false (i : Nat) (rest : Word) :
+    dropFirstUnary (List.replicate i true ++ false :: rest) = rest := by
+  induction i with
+  | zero => simp [dropFirstUnary]
+  | succ i ih => simp [List.replicate_succ, dropFirstUnary, ih]
+
+lemma firstUnaryCode_encodeNat_append (i : Nat) (rest : Word) :
+    firstUnaryCode (Formula.encodeNat i ++ rest) = Formula.encodeNat i := by
+  simpa [Formula.encodeNat] using firstUnaryCode_replicate_true_false i rest
+
+lemma dropFirstUnary_encodeNat_append (i : Nat) (rest : Word) :
+    dropFirstUnary (Formula.encodeNat i ++ rest) = rest := by
+  simpa [Formula.encodeNat] using dropFirstUnary_replicate_true_false i rest
+
+/-- The first two unary codes of a word. -/
+def firstTwoCodes (z : Word) : Word :=
+  firstUnaryCode z ++ firstUnaryCode (dropFirstUnary z)
+
+/-- The first and third unary codes of a word. -/
+def firstThirdCodes (z : Word) : Word :=
+  firstUnaryCode z ++ dropFirstUnary (dropFirstUnary z)
+
+/-- The third unary code of a word. -/
+def thirdCode (z : Word) : Word :=
+  dropFirstUnary (dropFirstUnary z)
+
+lemma firstTwoCodes_triple (a b c : Nat) :
+    firstTwoCodes (Formula.encodeNat a ++ Formula.encodeNat b ++ Formula.encodeNat c) =
+      Formula.encodeNat a ++ Formula.encodeNat b := by
+  simp [firstTwoCodes, firstUnaryCode_encodeNat_append, dropFirstUnary_encodeNat_append,
+    List.append_assoc]
+
+lemma firstThirdCodes_triple (a b c : Nat) :
+    firstThirdCodes (Formula.encodeNat a ++ Formula.encodeNat b ++ Formula.encodeNat c) =
+      Formula.encodeNat a ++ Formula.encodeNat c := by
+  simp [firstThirdCodes, firstUnaryCode_encodeNat_append, dropFirstUnary_encodeNat_append,
+    List.append_assoc]
+
+lemma thirdCode_triple (a b c : Nat) :
+    thirdCode (Formula.encodeNat a ++ Formula.encodeNat b ++ Formula.encodeNat c) =
+      Formula.encodeNat c := by
+  simp [thirdCode, dropFirstUnary_encodeNat_append, List.append_assoc]
+
+-- ---------------------------------------------------------------------------
+-- A concrete DTM that drops the first unary code
+-- ---------------------------------------------------------------------------
+
+abbrev DDropFirstUnaryState := Fin 5
+
+namespace DDropFirstUnaryState
+
+def start : DDropFirstUnaryState := ⟨0, by decide⟩
+def scan : DDropFirstUnaryState := ⟨1, by decide⟩
+def copy : DDropFirstUnaryState := ⟨2, by decide⟩
+def done : DDropFirstUnaryState := ⟨3, by decide⟩
+def reject : DDropFirstUnaryState := ⟨4, by decide⟩
+
+end DDropFirstUnaryState
+
+/-- Skip the first unary code and emit the rest of the input. -/
+def DDropFirstUnaryTM : DTM DDropFirstUnaryState where
+  step := fun q sym _ =>
+    if q = DDropFirstUnaryState.start then
+      { next := DDropFirstUnaryState.scan, output := none, inputMove := some true
+        workWrite := none, workMove := none }
+    else if q = DDropFirstUnaryState.scan then
+      match sym with
+      | some true =>
+          { next := DDropFirstUnaryState.scan, output := none, inputMove := some true
+            workWrite := none, workMove := none }
+      | some false =>
+          { next := DDropFirstUnaryState.copy, output := none, inputMove := some true
+            workWrite := none, workMove := none }
+      | none =>
+          { next := DDropFirstUnaryState.done, output := none, inputMove := none
+            workWrite := none, workMove := none }
+    else if q = DDropFirstUnaryState.copy then
+      match sym with
+      | some b =>
+          { next := DDropFirstUnaryState.copy, output := some b, inputMove := some true
+            workWrite := none, workMove := none }
+      | none =>
+          { next := DDropFirstUnaryState.done, output := none, inputMove := none
+            workWrite := none, workMove := none }
+    else
+      { next := q, output := none, inputMove := none
+        workWrite := none, workMove := none }
+  start := DDropFirstUnaryState.start
+  accept := DDropFirstUnaryState.done
+  reject := DDropFirstUnaryState.reject
+
+lemma Drun_DDropFirstUnaryTM_start (z : Word) :
+    Drun DDropFirstUnaryTM 1 (Dinit DDropFirstUnaryTM z) =
+      { state := DDropFirstUnaryState.scan, input := z, head := 1, output := [],
+        work := fun _ : Nat => false, workHead := 0 } := by
+  simp [Drun, Dhalted, Dinit, Dstep, Dread, DDropFirstUnaryTM, Dmove,
+    DDropFirstUnaryState.start, DDropFirstUnaryState.scan,
+    DDropFirstUnaryState.copy, DDropFirstUnaryState.done,
+    DDropFirstUnaryState.reject]
+
+lemma Drun_DDropFirstUnaryTM_copy (skipped rest out : Word)
+    (wk : Nat → Bool) (wh : Nat) :
+    Drun DDropFirstUnaryTM (rest.length + 1)
+      { state := DDropFirstUnaryState.copy, input := skipped ++ rest,
+        head := skipped.length + 1, output := out, work := wk, workHead := wh } =
+      { state := DDropFirstUnaryState.done, input := skipped ++ rest,
+        head := skipped.length + rest.length + 1, output := out ++ rest,
+        work := wk, workHead := wh } := by
+  induction rest generalizing skipped out with
+  | nil =>
+      simp [Drun, Dhalted, Dstep, Dread, DDropFirstUnaryTM,
+        DDropFirstUnaryState.start, DDropFirstUnaryState.scan,
+        DDropFirstUnaryState.copy, DDropFirstUnaryState.done,
+        DDropFirstUnaryState.reject]
+  | cons b bs ih =>
+      rw [show (b :: bs).length + 1 = 1 + (bs.length + 1) by
+        simp [Nat.add_comm, Nat.add_left_comm], Drun_add_eq]
+      let c : DConfig DDropFirstUnaryState :=
+        { state := DDropFirstUnaryState.copy, input := skipped ++ b :: bs,
+          head := skipped.length + 1, output := out, work := wk, workHead := wh }
+      let c' : DConfig DDropFirstUnaryState :=
+        { state := DDropFirstUnaryState.copy, input := skipped ++ b :: bs,
+          head := skipped.length + 2, output := out ++ [b], work := wk, workHead := wh }
+      have hstep : Drun DDropFirstUnaryTM 1 c = c' := by
+        simp [c, c', Drun, Dhalted, Dstep, Dread, DDropFirstUnaryTM, Dmove,
+          DDropFirstUnaryState.start, DDropFirstUnaryState.scan,
+          DDropFirstUnaryState.copy, DDropFirstUnaryState.done,
+          DDropFirstUnaryState.reject]
+      change Drun DDropFirstUnaryTM (bs.length + 1) (Drun DDropFirstUnaryTM 1 c) = _
+      rw [hstep]
+      simpa [c', List.append_assoc, Nat.add_assoc, Nat.add_comm, Nat.add_left_comm]
+        using ih (skipped := skipped ++ [b]) (out := out ++ [b])
+
+lemma Drun_DDropFirstUnaryTM_scan (pre z out : Word)
+    (wk : Nat → Bool) (wh : Nat) :
+    Drun DDropFirstUnaryTM (z.length + 1)
+      { state := DDropFirstUnaryState.scan, input := pre ++ z,
+        head := pre.length + 1, output := out, work := wk, workHead := wh } =
+      { state := DDropFirstUnaryState.done, input := pre ++ z,
+        head := pre.length + z.length + 1, output := out ++ dropFirstUnary z,
+        work := wk, workHead := wh } := by
+  induction z generalizing pre out with
+  | nil =>
+      simp [Drun, Dhalted, Dstep, Dread, DDropFirstUnaryTM,
+        DDropFirstUnaryState.start, DDropFirstUnaryState.scan,
+        DDropFirstUnaryState.copy, DDropFirstUnaryState.done,
+        DDropFirstUnaryState.reject, dropFirstUnary]
+  | cons b bs ih =>
+      rw [show (b :: bs).length + 1 = 1 + (bs.length + 1) by
+        simp [Nat.add_comm, Nat.add_left_comm], Drun_add_eq]
+      let c : DConfig DDropFirstUnaryState :=
+        { state := DDropFirstUnaryState.scan, input := pre ++ b :: bs,
+          head := pre.length + 1, output := out, work := wk, workHead := wh }
+      have hstep : Drun DDropFirstUnaryTM 1 c =
+          { state := if b then DDropFirstUnaryState.scan else DDropFirstUnaryState.copy,
+            input := pre ++ b :: bs, head := pre.length + 2, output := out,
+            work := wk, workHead := wh } := by
+        cases b <;>
+          simp [c, Drun, Dhalted, Dstep, Dread, DDropFirstUnaryTM, Dmove,
+            DDropFirstUnaryState.start, DDropFirstUnaryState.scan,
+            DDropFirstUnaryState.copy, DDropFirstUnaryState.done,
+            DDropFirstUnaryState.reject]
+      cases b with
+      | false =>
+          change Drun DDropFirstUnaryTM (bs.length + 1) (Drun DDropFirstUnaryTM 1 c) = _
+          rw [hstep]
+          simpa [List.append_assoc, Nat.add_assoc, Nat.add_comm, Nat.add_left_comm,
+            dropFirstUnary] using
+            (Drun_DDropFirstUnaryTM_copy (skipped := pre ++ [false]) (rest := bs)
+              (out := out) wk wh)
+      | true =>
+          change Drun DDropFirstUnaryTM (bs.length + 1) (Drun DDropFirstUnaryTM 1 c) = _
+          rw [hstep]
+          simpa [List.append_assoc, Nat.add_assoc, Nat.add_comm, Nat.add_left_comm,
+            dropFirstUnary] using ih (pre := pre ++ [true]) (out := out)
+
+lemma DDropFirstUnaryTM_output (x : Word) :
+    Dboutput DDropFirstUnaryTM (x.length + 2) x = dropFirstUnary x := by
+  dsimp [Dboutput]
+  rw [show x.length + 2 = 1 + (x.length + 1) by omega, Drun_add_eq]
+  rw [Drun_DDropFirstUnaryTM_start x]
+  simpa [List.append_assoc] using congrArg DConfig.output
+    (Drun_DDropFirstUnaryTM_scan (pre := []) (z := x) (out := [])
+      (fun _ : Nat => false) 0)
+
+lemma DDropFirstUnaryTM_halts (x : Word) :
+    Dhalted DDropFirstUnaryTM
+      (Drun DDropFirstUnaryTM (x.length + 2) (Dinit DDropFirstUnaryTM x)) = true := by
+  rw [show x.length + 2 = 1 + (x.length + 1) by omega, Drun_add_eq]
+  rw [Drun_DDropFirstUnaryTM_start x]
+  have hscan := Drun_DDropFirstUnaryTM_scan (pre := []) (z := x) (out := [])
+    (fun _ : Nat => false) 0
+  simp at hscan
+  rw [hscan]
+  simp [Dhalted, DDropFirstUnaryTM, DDropFirstUnaryState.done]
+
+lemma dropFirstUnary_length_le (x : Word) : (dropFirstUnary x).length ≤ x.length := by
+  induction x with
+  | nil => simp [dropFirstUnary]
+  | cons b bs ih =>
+      cases b with
+      | false => simp [dropFirstUnary]
+      | true =>
+          simpa [dropFirstUnary] using Nat.le_trans ih (Nat.le_succ bs.length)
+
+theorem dPolyTimeComputable_dropFirstUnary : DPolyTimeComputable dropFirstUnary := by
+  refine ⟨DDropFirstUnaryState, inferInstance, inferInstance, DDropFirstUnaryTM,
+    X + C 2, X, ?_, ?_⟩
+  · intro x
+    simpa using DDropFirstUnaryTM_halts x
+  · intro x
+    constructor
+    · change Dboutput DDropFirstUnaryTM ((X + C 2).eval x.length) x = dropFirstUnary x
+      simpa using DDropFirstUnaryTM_output x
+    · simpa using dropFirstUnary_length_le x
+
+-- ---------------------------------------------------------------------------
+-- A concrete DTM that emits the first unary code
+-- ---------------------------------------------------------------------------
+
+abbrev DFirstUnaryCodeState := Fin 4
+
+namespace DFirstUnaryCodeState
+
+def start : DFirstUnaryCodeState := ⟨0, by decide⟩
+def scan : DFirstUnaryCodeState := ⟨1, by decide⟩
+def done : DFirstUnaryCodeState := ⟨2, by decide⟩
+def reject : DFirstUnaryCodeState := ⟨3, by decide⟩
+
+end DFirstUnaryCodeState
+
+/-- Emit the leading unary code, including its terminating `false`. -/
+def DFirstUnaryCodeTM : DTM DFirstUnaryCodeState where
+  step := fun q sym _ =>
+    if q = DFirstUnaryCodeState.start then
+      { next := DFirstUnaryCodeState.scan, output := none, inputMove := some true
+        workWrite := none, workMove := none }
+    else if q = DFirstUnaryCodeState.scan then
+      match sym with
+      | some true =>
+          { next := DFirstUnaryCodeState.scan, output := some true, inputMove := some true
+            workWrite := none, workMove := none }
+      | some false =>
+          { next := DFirstUnaryCodeState.done, output := some false, inputMove := some true
+            workWrite := none, workMove := none }
+      | none =>
+          { next := DFirstUnaryCodeState.done, output := none, inputMove := none
+            workWrite := none, workMove := none }
+    else
+      { next := q, output := none, inputMove := none
+        workWrite := none, workMove := none }
+  start := DFirstUnaryCodeState.start
+  accept := DFirstUnaryCodeState.done
+  reject := DFirstUnaryCodeState.reject
+
+lemma Drun_DFirstUnaryCodeTM_start (z : Word) :
+    Drun DFirstUnaryCodeTM 1 (Dinit DFirstUnaryCodeTM z) =
+      { state := DFirstUnaryCodeState.scan, input := z, head := 1, output := [],
+        work := fun _ : Nat => false, workHead := 0 } := by
+  simp [Drun, Dhalted, Dinit, Dstep, Dread, DFirstUnaryCodeTM, Dmove,
+    DFirstUnaryCodeState.start, DFirstUnaryCodeState.scan,
+    DFirstUnaryCodeState.done, DFirstUnaryCodeState.reject]
+
+lemma Drun_DFirstUnaryCodeTM_scan (pre z out : Word)
+    (wk : Nat → Bool) (wh : Nat) :
+    Drun DFirstUnaryCodeTM (z.length + 1)
+      { state := DFirstUnaryCodeState.scan, input := pre ++ z,
+        head := pre.length + 1, output := out, work := wk, workHead := wh } =
+      { state := DFirstUnaryCodeState.done, input := pre ++ z,
+        head := pre.length + (firstUnaryCode z).length + 1,
+        output := out ++ firstUnaryCode z, work := wk, workHead := wh } := by
+  induction z generalizing pre out with
+  | nil =>
+      simp [Drun, Dhalted, Dstep, Dread, DFirstUnaryCodeTM,
+        DFirstUnaryCodeState.start, DFirstUnaryCodeState.scan,
+        DFirstUnaryCodeState.done, DFirstUnaryCodeState.reject, firstUnaryCode]
+  | cons b bs ih =>
+      rw [show (b :: bs).length + 1 = 1 + (bs.length + 1) by
+        simp [Nat.add_comm, Nat.add_left_comm], Drun_add_eq]
+      let c : DConfig DFirstUnaryCodeState :=
+        { state := DFirstUnaryCodeState.scan, input := pre ++ b :: bs,
+          head := pre.length + 1, output := out, work := wk, workHead := wh }
+      cases b with
+      | true =>
+          let c' : DConfig DFirstUnaryCodeState :=
+            { state := DFirstUnaryCodeState.scan, input := pre ++ true :: bs,
+              head := pre.length + 2, output := out ++ [true], work := wk, workHead := wh }
+          have hstep : Drun DFirstUnaryCodeTM 1 c = c' := by
+            simp [c, c', Drun, Dhalted, Dstep, Dread, DFirstUnaryCodeTM, Dmove,
+              DFirstUnaryCodeState.start, DFirstUnaryCodeState.scan,
+              DFirstUnaryCodeState.done, DFirstUnaryCodeState.reject]
+          change Drun DFirstUnaryCodeTM (bs.length + 1) (Drun DFirstUnaryCodeTM 1 c) = _
+          rw [hstep]
+          simpa [c', List.append_assoc, Nat.add_assoc, Nat.add_comm, Nat.add_left_comm,
+            firstUnaryCode] using ih (pre := pre ++ [true]) (out := out ++ [true])
+      | false =>
+          let c' : DConfig DFirstUnaryCodeState :=
+            { state := DFirstUnaryCodeState.done, input := pre ++ false :: bs,
+              head := pre.length + 2, output := out ++ [false], work := wk, workHead := wh }
+          have hstep : Drun DFirstUnaryCodeTM 1 c = c' := by
+            simp [c, c', Drun, Dhalted, Dstep, Dread, DFirstUnaryCodeTM, Dmove,
+              DFirstUnaryCodeState.start, DFirstUnaryCodeState.scan,
+              DFirstUnaryCodeState.done, DFirstUnaryCodeState.reject]
+          have hhalt : Dhalted DFirstUnaryCodeTM c' = true := by
+            simp [c', Dhalted, DFirstUnaryCodeTM, DFirstUnaryCodeState.done]
+          change Drun DFirstUnaryCodeTM (bs.length + 1) (Drun DFirstUnaryCodeTM 1 c) = _
+          rw [hstep]
+          rw [Drun_halted DFirstUnaryCodeTM c' (bs.length + 1) hhalt]
+          simp [c', firstUnaryCode]
+
+lemma DFirstUnaryCodeTM_output (x : Word) :
+    Dboutput DFirstUnaryCodeTM (x.length + 2) x = firstUnaryCode x := by
+  dsimp [Dboutput]
+  rw [show x.length + 2 = 1 + (x.length + 1) by omega, Drun_add_eq]
+  rw [Drun_DFirstUnaryCodeTM_start x]
+  simpa [List.append_assoc] using congrArg DConfig.output
+    (Drun_DFirstUnaryCodeTM_scan (pre := []) (z := x) (out := [])
+      (fun _ : Nat => false) 0)
+
+lemma DFirstUnaryCodeTM_halts (x : Word) :
+    Dhalted DFirstUnaryCodeTM
+      (Drun DFirstUnaryCodeTM (x.length + 2) (Dinit DFirstUnaryCodeTM x)) = true := by
+  rw [show x.length + 2 = 1 + (x.length + 1) by omega, Drun_add_eq]
+  rw [Drun_DFirstUnaryCodeTM_start x]
+  have hscan := Drun_DFirstUnaryCodeTM_scan (pre := []) (z := x) (out := [])
+    (fun _ : Nat => false) 0
+  simp at hscan
+  rw [hscan]
+  simp [Dhalted, DFirstUnaryCodeTM, DFirstUnaryCodeState.done]
+
+-- ---------------------------------------------------------------------------
+-- A concrete DTM that emits the first two unary codes
+-- ---------------------------------------------------------------------------
+
+abbrev DFirstTwoCodesState := Fin 7
+
+namespace DFirstTwoCodesState
+
+def start : DFirstTwoCodesState := ⟨0, by decide⟩
+def scanFirst : DFirstTwoCodesState := ⟨1, by decide⟩
+def scanSecond : DFirstTwoCodesState := ⟨2, by decide⟩
+def done : DFirstTwoCodesState := ⟨5, by decide⟩
+def reject : DFirstTwoCodesState := ⟨6, by decide⟩
+
+end DFirstTwoCodesState
+
+/-- Copy the first two unary codes of the input, including their terminating
+    `false` bits, and ignore the rest. -/
+def DFirstTwoCodesTM : DTM DFirstTwoCodesState where
+  step := fun q sym _ =>
+    if q = DFirstTwoCodesState.start then
+      { next := DFirstTwoCodesState.scanFirst, output := none, inputMove := some true
+        workWrite := none, workMove := none }
+    else if q = DFirstTwoCodesState.scanFirst then
+      match sym with
+      | some true =>
+          { next := DFirstTwoCodesState.scanFirst, output := some true, inputMove := some true
+            workWrite := none, workMove := none }
+      | some false =>
+          { next := DFirstTwoCodesState.scanSecond, output := some false, inputMove := some true
+            workWrite := none, workMove := none }
+      | none =>
+          { next := DFirstTwoCodesState.done, output := none, inputMove := none
+            workWrite := none, workMove := none }
+    else if q = DFirstTwoCodesState.scanSecond then
+      match sym with
+      | some true =>
+          { next := DFirstTwoCodesState.scanSecond, output := some true, inputMove := some true
+            workWrite := none, workMove := none }
+      | some false =>
+          { next := DFirstTwoCodesState.done, output := some false, inputMove := some true
+            workWrite := none, workMove := none }
+      | none =>
+          { next := DFirstTwoCodesState.done, output := none, inputMove := none
+            workWrite := none, workMove := none }
+    else
+      { next := q, output := none, inputMove := none
+        workWrite := none, workMove := none }
+  start := DFirstTwoCodesState.start
+  accept := DFirstTwoCodesState.done
+  reject := DFirstTwoCodesState.reject
+
+lemma Drun_DFirstTwoCodesTM_start (z : Word) :
+    Drun DFirstTwoCodesTM 1 (Dinit DFirstTwoCodesTM z) =
+      { state := DFirstTwoCodesState.scanFirst, input := z, head := 1,
+        output := [], work := fun _ : Nat => false, workHead := 0 } := by
+  simp [Drun, Dhalted, Dinit, Dstep, Dread, DFirstTwoCodesTM, Dmove,
+    DFirstTwoCodesState.start, DFirstTwoCodesState.scanFirst,
+    DFirstTwoCodesState.scanSecond, DFirstTwoCodesState.done,
+    DFirstTwoCodesState.reject]
+
+lemma Drun_DFirstTwoCodesTM_scanFirst_trues (pre zs out : Word) (i : Nat)
+    (wk : Nat → Bool) (wh : Nat) :
+    Drun DFirstTwoCodesTM (i + 1)
+      { state := DFirstTwoCodesState.scanFirst,
+        input := pre ++ List.replicate i true ++ false :: zs,
+        head := pre.length + 1, output := out, work := wk, workHead := wh } =
+      { state := DFirstTwoCodesState.scanSecond,
+        input := pre ++ List.replicate i true ++ false :: zs,
+        head := pre.length + i + 2,
+        output := out ++ List.replicate i true ++ [false],
+        work := wk, workHead := wh } := by
+  induction i generalizing pre out with
+  | zero =>
+      simp [Drun, Dhalted, Dstep, Dread, DFirstTwoCodesTM, Dmove,
+        DFirstTwoCodesState.start, DFirstTwoCodesState.scanFirst,
+        DFirstTwoCodesState.scanSecond, DFirstTwoCodesState.done,
+        DFirstTwoCodesState.reject]
+  | succ i ih =>
+      rw [show i.succ + 1 = 1 + (i + 1) by omega, Drun_add_eq]
+      let c : DConfig DFirstTwoCodesState :=
+        { state := DFirstTwoCodesState.scanFirst,
+          input := pre ++ List.replicate i.succ true ++ false :: zs,
+          head := pre.length + 1, output := out, work := wk, workHead := wh }
+      let c' : DConfig DFirstTwoCodesState :=
+        { state := DFirstTwoCodesState.scanFirst,
+          input := pre ++ List.replicate i.succ true ++ false :: zs,
+          head := pre.length + 2, output := out ++ [true], work := wk, workHead := wh }
+      have hstep : Drun DFirstTwoCodesTM 1 c = c' := by
+        simp [c, c', Drun, Dhalted, Dstep, Dread, DFirstTwoCodesTM, Dmove,
+          List.replicate_succ, DFirstTwoCodesState.start,
+          DFirstTwoCodesState.scanFirst, DFirstTwoCodesState.scanSecond,
+          DFirstTwoCodesState.done, DFirstTwoCodesState.reject]
+      change Drun DFirstTwoCodesTM (i + 1) (Drun DFirstTwoCodesTM 1 c) = _
+      rw [hstep]
+      simpa [c', List.replicate_succ, List.append_assoc, Nat.add_assoc,
+        Nat.add_comm, Nat.add_left_comm] using ih (pre := pre ++ [true]) (out := out ++ [true])
+
+lemma Drun_DFirstTwoCodesTM_scanFirst_all_true (pre out : Word) (i : Nat)
+    (wk : Nat → Bool) (wh : Nat) :
+    Drun DFirstTwoCodesTM (i + 1)
+      { state := DFirstTwoCodesState.scanFirst, input := pre ++ List.replicate i true,
+        head := pre.length + 1, output := out, work := wk, workHead := wh } =
+      { state := DFirstTwoCodesState.done, input := pre ++ List.replicate i true,
+        head := pre.length + i + 1, output := out ++ List.replicate i true,
+        work := wk, workHead := wh } := by
+  induction i generalizing pre out with
+  | zero =>
+      simp [Drun, Dhalted, Dstep, Dread, DFirstTwoCodesTM, Dmove,
+        DFirstTwoCodesState.start, DFirstTwoCodesState.scanFirst,
+        DFirstTwoCodesState.scanSecond, DFirstTwoCodesState.done,
+        DFirstTwoCodesState.reject]
+  | succ i ih =>
+      rw [show i.succ + 1 = 1 + (i + 1) by omega, Drun_add_eq]
+      let c : DConfig DFirstTwoCodesState :=
+        { state := DFirstTwoCodesState.scanFirst,
+          input := pre ++ List.replicate i.succ true,
+          head := pre.length + 1, output := out, work := wk, workHead := wh }
+      let c' : DConfig DFirstTwoCodesState :=
+        { state := DFirstTwoCodesState.scanFirst,
+          input := pre ++ List.replicate i.succ true,
+          head := pre.length + 2, output := out ++ [true], work := wk, workHead := wh }
+      have hstep : Drun DFirstTwoCodesTM 1 c = c' := by
+        simp [c, c', Drun, Dhalted, Dstep, Dread, DFirstTwoCodesTM, Dmove,
+          List.replicate_succ, DFirstTwoCodesState.start,
+          DFirstTwoCodesState.scanFirst, DFirstTwoCodesState.scanSecond,
+          DFirstTwoCodesState.done, DFirstTwoCodesState.reject]
+      change Drun DFirstTwoCodesTM (i + 1) (Drun DFirstTwoCodesTM 1 c) = _
+      rw [hstep]
+      simpa [c', List.replicate_succ, List.append_assoc, Nat.add_assoc,
+        Nat.add_comm, Nat.add_left_comm] using ih (pre := pre ++ [true]) (out := out ++ [true])
+
+lemma Drun_DFirstTwoCodesTM_scanSecond (pre z out : Word)
+    (wk : Nat → Bool) (wh : Nat) :
+    Drun DFirstTwoCodesTM (z.length + 1)
+      { state := DFirstTwoCodesState.scanSecond, input := pre ++ z,
+        head := pre.length + 1, output := out, work := wk, workHead := wh } =
+      { state := DFirstTwoCodesState.done, input := pre ++ z,
+        head := pre.length + (firstUnaryCode z).length + 1,
+        output := out ++ firstUnaryCode z, work := wk, workHead := wh } := by
+  induction z generalizing pre out with
+  | nil =>
+      simp [Drun, Dhalted, Dstep, Dread, DFirstTwoCodesTM,
+        DFirstTwoCodesState.start, DFirstTwoCodesState.scanFirst,
+        DFirstTwoCodesState.scanSecond, DFirstTwoCodesState.done,
+        DFirstTwoCodesState.reject, firstUnaryCode]
+  | cons b bs ih =>
+      rw [show (b :: bs).length + 1 = 1 + (bs.length + 1) by
+        simp [Nat.add_comm, Nat.add_left_comm], Drun_add_eq]
+      let c : DConfig DFirstTwoCodesState :=
+        { state := DFirstTwoCodesState.scanSecond, input := pre ++ b :: bs,
+          head := pre.length + 1, output := out, work := wk, workHead := wh }
+      cases b with
+      | true =>
+          let c' : DConfig DFirstTwoCodesState :=
+            { state := DFirstTwoCodesState.scanSecond, input := pre ++ true :: bs,
+              head := pre.length + 2, output := out ++ [true], work := wk, workHead := wh }
+          have hstep : Drun DFirstTwoCodesTM 1 c = c' := by
+            simp [c, c', Drun, Dhalted, Dstep, Dread, DFirstTwoCodesTM, Dmove,
+              DFirstTwoCodesState.start, DFirstTwoCodesState.scanFirst,
+              DFirstTwoCodesState.scanSecond, DFirstTwoCodesState.done,
+              DFirstTwoCodesState.reject]
+          change Drun DFirstTwoCodesTM (bs.length + 1) (Drun DFirstTwoCodesTM 1 c) = _
+          rw [hstep]
+          simpa [c', List.append_assoc, Nat.add_assoc, Nat.add_comm, Nat.add_left_comm,
+            firstUnaryCode] using ih (pre := pre ++ [true]) (out := out ++ [true])
+      | false =>
+          let c' : DConfig DFirstTwoCodesState :=
+            { state := DFirstTwoCodesState.done, input := pre ++ false :: bs,
+              head := pre.length + 2, output := out ++ [false], work := wk, workHead := wh }
+          have hstep : Drun DFirstTwoCodesTM 1 c = c' := by
+            simp [c, c', Drun, Dhalted, Dstep, Dread, DFirstTwoCodesTM, Dmove,
+              DFirstTwoCodesState.start, DFirstTwoCodesState.scanFirst,
+              DFirstTwoCodesState.scanSecond, DFirstTwoCodesState.done,
+              DFirstTwoCodesState.reject]
+          have hhalt : Dhalted DFirstTwoCodesTM c' = true := by
+            simp [c', Dhalted, DFirstTwoCodesTM, DFirstTwoCodesState.done]
+          change Drun DFirstTwoCodesTM (bs.length + 1) (Drun DFirstTwoCodesTM 1 c) = _
+          rw [hstep]
+          rw [Drun_halted DFirstTwoCodesTM c' (bs.length + 1) hhalt]
+          simp [c', firstUnaryCode]
+
+lemma firstUnaryCode_all_true_aux (i : Nat) :
+    firstUnaryCode (List.replicate i true) = List.replicate i true := by
+  induction i with
+  | zero => simp [firstUnaryCode]
+  | succ i ih => simp [List.replicate_succ, firstUnaryCode, ih]
+
+lemma dropFirstUnary_all_true_aux (i : Nat) :
+    dropFirstUnary (List.replicate i true) = [] := by
+  induction i with
+  | zero => simp [dropFirstUnary]
+  | succ i ih => simp [List.replicate_succ, dropFirstUnary, ih]
+
+lemma firstTwoCodes_all_true (i : Nat) :
+    firstTwoCodes (List.replicate i true) = List.replicate i true := by
+  rw [firstTwoCodes, firstUnaryCode_all_true_aux, dropFirstUnary_all_true_aux]
+  simp [firstUnaryCode]
+
+lemma firstTwoCodes_true_false (i : Nat) (zs : Word) :
+    firstTwoCodes (List.replicate i true ++ false :: zs) =
+      List.replicate i true ++ [false] ++ firstUnaryCode zs := by
+  rw [firstTwoCodes, firstUnaryCode_replicate_true_false,
+    dropFirstUnary_replicate_true_false]
+
+lemma DFirstTwoCodesTM_output (x : Word) :
+    Dboutput DFirstTwoCodesTM (x.length + 3) x = firstTwoCodes x := by
+  dsimp [Dboutput]
+  rcases word_eq_replicate_true_append x with ⟨i, y, hxy, hy⟩
+  subst x
+  rw [show (List.replicate i true ++ y).length + 3 =
+      1 + ((List.replicate i true ++ y).length + 2) by omega, Drun_add_eq]
+  rw [Drun_DFirstTwoCodesTM_start]
+  rcases hy with rfl | ⟨zs, rfl⟩
+  · have hscan0 : Drun DFirstTwoCodesTM (i + 1)
+        { state := DFirstTwoCodesState.scanFirst,
+          input := List.replicate i true, head := 1, output := [],
+          work := fun _ : Nat => false, workHead := 0 } =
+        { state := DFirstTwoCodesState.done, input := List.replicate i true,
+          head := i + 1, output := List.replicate i true,
+          work := fun _ : Nat => false, workHead := 0 } := by
+      simpa using (Drun_DFirstTwoCodesTM_scanFirst_all_true (pre := []) (out := []) i
+        (fun _ : Nat => false) 0)
+    have hscan : Drun DFirstTwoCodesTM (i + 2)
+        { state := DFirstTwoCodesState.scanFirst,
+          input := List.replicate i true, head := 1, output := [],
+          work := fun _ : Nat => false, workHead := 0 } =
+        { state := DFirstTwoCodesState.done, input := List.replicate i true,
+          head := i + 1, output := List.replicate i true,
+          work := fun _ : Nat => false, workHead := 0 } := by
+      rw [show i + 2 = (i + 1) + 1 by omega, Drun_add_eq, hscan0]
+      simp [Drun, Dhalted, DFirstTwoCodesTM, DFirstTwoCodesState.done]
+    have hlen : (List.replicate i true ++ []).length + 2 = i + 2 := by simp
+    rw [hlen]
+    have hscan' : Drun DFirstTwoCodesTM (i + 2)
+        { state := DFirstTwoCodesState.scanFirst,
+          input := List.replicate i true ++ [], head := 1, output := [],
+          work := fun _ : Nat => false, workHead := 0 } =
+        { state := DFirstTwoCodesState.done, input := List.replicate i true ++ [],
+          head := i + 1, output := List.replicate i true,
+          work := fun _ : Nat => false, workHead := 0 } := by
+      simpa using hscan
+    rw [hscan']
+    simp [firstTwoCodes_all_true]
+  · have hscan0 : Drun DFirstTwoCodesTM (i + 1)
+        { state := DFirstTwoCodesState.scanFirst,
+          input := List.replicate i true ++ false :: zs, head := 1, output := [],
+          work := fun _ : Nat => false, workHead := 0 } =
+        { state := DFirstTwoCodesState.scanSecond,
+          input := List.replicate i true ++ false :: zs, head := i + 2,
+          output := List.replicate i true ++ [false],
+          work := fun _ : Nat => false, workHead := 0 } := by
+      simpa using (Drun_DFirstTwoCodesTM_scanFirst_trues (pre := []) (zs := zs) (out := []) i
+        (fun _ : Nat => false) 0)
+    have hscan : Drun DFirstTwoCodesTM (i + 1)
+        { state := DFirstTwoCodesState.scanFirst,
+          input := List.replicate i true ++ false :: zs, head := 1, output := [],
+          work := fun _ : Nat => false, workHead := 0 } =
+        { state := DFirstTwoCodesState.scanSecond,
+          input := List.replicate i true ++ false :: zs, head := i + 2,
+          output := List.replicate i true ++ [false],
+          work := fun _ : Nat => false, workHead := 0 } := hscan0
+    have hsecond0 := Drun_DFirstTwoCodesTM_scanSecond
+      (pre := List.replicate i true ++ [false]) (z := zs)
+      (out := List.replicate i true ++ [false]) (fun _ : Nat => false) 0
+    have hsecond : Drun DFirstTwoCodesTM (zs.length + 2)
+        { state := DFirstTwoCodesState.scanSecond,
+          input := List.replicate i true ++ false :: zs, head := i + 2,
+          output := List.replicate i true ++ [false],
+          work := fun _ : Nat => false, workHead := 0 } =
+        { state := DFirstTwoCodesState.done,
+          input := List.replicate i true ++ false :: zs,
+          head := i + (1 + (1 + (firstUnaryCode zs).length)),
+          output := List.replicate i true ++ [false] ++ firstUnaryCode zs,
+          work := fun _ : Nat => false, workHead := 0 } := by
+      rw [show zs.length + 2 = (zs.length + 1) + 1 by omega, Drun_add_eq]
+      have hsecond1 : Drun DFirstTwoCodesTM (zs.length + 1)
+          { state := DFirstTwoCodesState.scanSecond,
+            input := List.replicate i true ++ false :: zs, head := i + 2,
+            output := List.replicate i true ++ [false],
+            work := fun _ : Nat => false, workHead := 0 } =
+          { state := DFirstTwoCodesState.done,
+            input := List.replicate i true ++ false :: zs,
+            head := i + (1 + (1 + (firstUnaryCode zs).length)),
+            output := List.replicate i true ++ [false] ++ firstUnaryCode zs,
+            work := fun _ : Nat => false, workHead := 0 } := by
+        simpa [List.append_assoc, Nat.add_assoc, Nat.add_comm, Nat.add_left_comm] using hsecond0
+      rw [hsecond1]
+      simp [Drun, Dhalted, DFirstTwoCodesTM, DFirstTwoCodesState.done]
+    rw [show (List.replicate i true ++ false :: zs).length + 2 =
+        (i + 1) + (zs.length + 2) by simp; omega, Drun_add_eq]
+    rw [hscan]
+    rw [hsecond]
+    simp [firstTwoCodes_true_false, List.append_assoc]
+
+lemma DFirstTwoCodesTM_halts (x : Word) :
+    Dhalted DFirstTwoCodesTM
+      (Drun DFirstTwoCodesTM (x.length + 3) (Dinit DFirstTwoCodesTM x)) = true := by
+  rcases word_eq_replicate_true_append x with ⟨i, y, hxy, hy⟩
+  subst x
+  rw [show (List.replicate i true ++ y).length + 3 =
+      1 + ((List.replicate i true ++ y).length + 2) by omega, Drun_add_eq]
+  rw [Drun_DFirstTwoCodesTM_start]
+  rcases hy with rfl | ⟨zs, rfl⟩
+  · have hscan0 : Drun DFirstTwoCodesTM (i + 1)
+        { state := DFirstTwoCodesState.scanFirst,
+          input := List.replicate i true, head := 1, output := [],
+          work := fun _ : Nat => false, workHead := 0 } =
+        { state := DFirstTwoCodesState.done, input := List.replicate i true,
+          head := i + 1, output := List.replicate i true,
+          work := fun _ : Nat => false, workHead := 0 } := by
+      simpa using (Drun_DFirstTwoCodesTM_scanFirst_all_true (pre := []) (out := []) i
+        (fun _ : Nat => false) 0)
+    have hscan : Drun DFirstTwoCodesTM (i + 2)
+        { state := DFirstTwoCodesState.scanFirst,
+          input := List.replicate i true, head := 1, output := [],
+          work := fun _ : Nat => false, workHead := 0 } =
+        { state := DFirstTwoCodesState.done, input := List.replicate i true,
+          head := i + 1, output := List.replicate i true,
+          work := fun _ : Nat => false, workHead := 0 } := by
+      rw [show i + 2 = (i + 1) + 1 by omega, Drun_add_eq, hscan0]
+      simp [Drun, Dhalted, DFirstTwoCodesTM, DFirstTwoCodesState.done]
+    have hlen : (List.replicate i true ++ []).length + 2 = i + 2 := by simp
+    rw [hlen]
+    have hscan' : Drun DFirstTwoCodesTM (i + 2)
+        { state := DFirstTwoCodesState.scanFirst,
+          input := List.replicate i true ++ [], head := 1, output := [],
+          work := fun _ : Nat => false, workHead := 0 } =
+        { state := DFirstTwoCodesState.done, input := List.replicate i true ++ [],
+          head := i + 1, output := List.replicate i true,
+          work := fun _ : Nat => false, workHead := 0 } := by
+      simpa using hscan
+    rw [hscan']
+    simp [Dhalted, DFirstTwoCodesTM, DFirstTwoCodesState.done]
+  · have hscan : Drun DFirstTwoCodesTM (i + 1)
+        { state := DFirstTwoCodesState.scanFirst,
+          input := List.replicate i true ++ false :: zs, head := 1, output := [],
+          work := fun _ : Nat => false, workHead := 0 } =
+        { state := DFirstTwoCodesState.scanSecond,
+          input := List.replicate i true ++ false :: zs, head := i + 2,
+          output := List.replicate i true ++ [false],
+          work := fun _ : Nat => false, workHead := 0 } := by
+      simpa using (Drun_DFirstTwoCodesTM_scanFirst_trues (pre := []) (zs := zs) (out := []) i
+        (fun _ : Nat => false) 0)
+    have hsecond0 := Drun_DFirstTwoCodesTM_scanSecond
+      (pre := List.replicate i true ++ [false]) (z := zs)
+      (out := List.replicate i true ++ [false]) (fun _ : Nat => false) 0
+    have hsecond : Drun DFirstTwoCodesTM (zs.length + 2)
+        { state := DFirstTwoCodesState.scanSecond,
+          input := List.replicate i true ++ false :: zs, head := i + 2,
+          output := List.replicate i true ++ [false],
+          work := fun _ : Nat => false, workHead := 0 } =
+        { state := DFirstTwoCodesState.done,
+          input := List.replicate i true ++ false :: zs,
+          head := i + (1 + (1 + (firstUnaryCode zs).length)),
+          output := List.replicate i true ++ [false] ++ firstUnaryCode zs,
+          work := fun _ : Nat => false, workHead := 0 } := by
+      rw [show zs.length + 2 = (zs.length + 1) + 1 by omega, Drun_add_eq]
+      have hsecond1 : Drun DFirstTwoCodesTM (zs.length + 1)
+          { state := DFirstTwoCodesState.scanSecond,
+            input := List.replicate i true ++ false :: zs, head := i + 2,
+            output := List.replicate i true ++ [false],
+            work := fun _ : Nat => false, workHead := 0 } =
+          { state := DFirstTwoCodesState.done,
+            input := List.replicate i true ++ false :: zs,
+            head := i + (1 + (1 + (firstUnaryCode zs).length)),
+            output := List.replicate i true ++ [false] ++ firstUnaryCode zs,
+            work := fun _ : Nat => false, workHead := 0 } := by
+        simpa [List.append_assoc, Nat.add_assoc, Nat.add_comm, Nat.add_left_comm] using hsecond0
+      rw [hsecond1]
+      simp [Drun, Dhalted, DFirstTwoCodesTM, DFirstTwoCodesState.done]
+    rw [show (List.replicate i true ++ false :: zs).length + 2 =
+        (i + 1) + (zs.length + 2) by simp; omega, Drun_add_eq]
+    rw [hscan]
+    rw [hsecond]
+    simp [Dhalted, DFirstTwoCodesTM, DFirstTwoCodesState.done]
+
+lemma firstUnaryCode_length_le_aux (x : Word) : (firstUnaryCode x).length ≤ x.length := by
+  induction x with
+  | nil => simp [firstUnaryCode]
+  | cons b bs ih =>
+      cases b with
+      | false => simp [firstUnaryCode]
+      | true => simp [firstUnaryCode]; omega
+
+lemma firstUnaryCode_length_add_dropFirstUnary_length (x : Word) :
+    (firstUnaryCode x).length + (dropFirstUnary x).length ≤ x.length := by
+  induction x with
+  | nil => simp [firstUnaryCode, dropFirstUnary]
+  | cons b bs ih =>
+      cases b with
+      | false => simp [firstUnaryCode, dropFirstUnary]; omega
+      | true =>
+          simp [firstUnaryCode, dropFirstUnary, List.append_assoc]
+          omega
+
+lemma firstTwoCodes_length_le (x : Word) : (firstTwoCodes x).length ≤ x.length := by
+  have hsplit := firstUnaryCode_length_add_dropFirstUnary_length x
+  have htail := firstUnaryCode_length_le_aux (dropFirstUnary x)
+  simp [firstTwoCodes]
+  omega
+
+theorem dPolyTimeComputable_firstTwoCodes : DPolyTimeComputable firstTwoCodes := by
+  refine ⟨DFirstTwoCodesState, inferInstance, inferInstance, DFirstTwoCodesTM,
+    X + C 3, X, ?_, ?_⟩
+  · intro x
+    simpa using DFirstTwoCodesTM_halts x
+  · intro x
+    constructor
+    · change Dboutput DFirstTwoCodesTM ((X + C 3).eval x.length) x = firstTwoCodes x
+      simpa using DFirstTwoCodesTM_output x
+    · simpa using firstTwoCodes_length_le x
+
+-- ---------------------------------------------------------------------------
+-- A concrete DTM that emits the first and third unary codes
+-- ---------------------------------------------------------------------------
+
+abbrev DFirstThirdCodesState := Fin 7
+
+namespace DFirstThirdCodesState
+
+def start : DFirstThirdCodesState := ⟨0, by decide⟩
+def scanFirst : DFirstThirdCodesState := ⟨1, by decide⟩
+def skipSecond : DFirstThirdCodesState := ⟨2, by decide⟩
+def copyRest : DFirstThirdCodesState := ⟨3, by decide⟩
+def done : DFirstThirdCodesState := ⟨5, by decide⟩
+def reject : DFirstThirdCodesState := ⟨6, by decide⟩
+
+end DFirstThirdCodesState
+
+/-- Copy the first unary code, skip the second, and emit the remaining word. -/
+def DFirstThirdCodesTM : DTM DFirstThirdCodesState where
+  step := fun q sym _ =>
+    if q = DFirstThirdCodesState.start then
+      { next := DFirstThirdCodesState.scanFirst, output := none, inputMove := some true
+        workWrite := none, workMove := none }
+    else if q = DFirstThirdCodesState.scanFirst then
+      match sym with
+      | some true =>
+          { next := DFirstThirdCodesState.scanFirst, output := some true, inputMove := some true
+            workWrite := none, workMove := none }
+      | some false =>
+          { next := DFirstThirdCodesState.skipSecond, output := some false, inputMove := some true
+            workWrite := none, workMove := none }
+      | none =>
+          { next := DFirstThirdCodesState.done, output := none, inputMove := none
+            workWrite := none, workMove := none }
+    else if q = DFirstThirdCodesState.skipSecond then
+      match sym with
+      | some true =>
+          { next := DFirstThirdCodesState.skipSecond, output := none, inputMove := some true
+            workWrite := none, workMove := none }
+      | some false =>
+          { next := DFirstThirdCodesState.copyRest, output := none, inputMove := some true
+            workWrite := none, workMove := none }
+      | none =>
+          { next := DFirstThirdCodesState.done, output := none, inputMove := none
+            workWrite := none, workMove := none }
+    else if q = DFirstThirdCodesState.copyRest then
+      match sym with
+      | some b =>
+          { next := DFirstThirdCodesState.copyRest, output := some b, inputMove := some true
+            workWrite := none, workMove := none }
+      | none =>
+          { next := DFirstThirdCodesState.done, output := none, inputMove := none
+            workWrite := none, workMove := none }
+    else
+      { next := q, output := none, inputMove := none
+        workWrite := none, workMove := none }
+  start := DFirstThirdCodesState.start
+  accept := DFirstThirdCodesState.done
+  reject := DFirstThirdCodesState.reject
+
+lemma Drun_DFirstThirdCodesTM_start (z : Word) :
+    Drun DFirstThirdCodesTM 1 (Dinit DFirstThirdCodesTM z) =
+      { state := DFirstThirdCodesState.scanFirst, input := z, head := 1,
+        output := [], work := fun _ : Nat => false, workHead := 0 } := by
+  simp [Drun, Dhalted, Dinit, Dstep, Dread, DFirstThirdCodesTM, Dmove,
+    DFirstThirdCodesState.start, DFirstThirdCodesState.scanFirst,
+    DFirstThirdCodesState.skipSecond, DFirstThirdCodesState.copyRest,
+    DFirstThirdCodesState.done, DFirstThirdCodesState.reject]
+
+lemma Drun_DFirstThirdCodesTM_scanFirst_trues (pre zs out : Word) (i : Nat)
+    (wk : Nat → Bool) (wh : Nat) :
+    Drun DFirstThirdCodesTM (i + 1)
+      { state := DFirstThirdCodesState.scanFirst,
+        input := pre ++ List.replicate i true ++ false :: zs,
+        head := pre.length + 1, output := out, work := wk, workHead := wh } =
+      { state := DFirstThirdCodesState.skipSecond,
+        input := pre ++ List.replicate i true ++ false :: zs,
+        head := pre.length + i + 2,
+        output := out ++ List.replicate i true ++ [false],
+        work := wk, workHead := wh } := by
+  induction i generalizing pre out with
+  | zero =>
+      simp [Drun, Dhalted, Dstep, Dread, DFirstThirdCodesTM, Dmove,
+        DFirstThirdCodesState.start, DFirstThirdCodesState.scanFirst,
+        DFirstThirdCodesState.skipSecond, DFirstThirdCodesState.copyRest,
+        DFirstThirdCodesState.done, DFirstThirdCodesState.reject]
+  | succ i ih =>
+      rw [show i.succ + 1 = 1 + (i + 1) by omega, Drun_add_eq]
+      let c : DConfig DFirstThirdCodesState :=
+        { state := DFirstThirdCodesState.scanFirst,
+          input := pre ++ List.replicate i.succ true ++ false :: zs,
+          head := pre.length + 1, output := out, work := wk, workHead := wh }
+      let c' : DConfig DFirstThirdCodesState :=
+        { state := DFirstThirdCodesState.scanFirst,
+          input := pre ++ List.replicate i.succ true ++ false :: zs,
+          head := pre.length + 2, output := out ++ [true], work := wk, workHead := wh }
+      have hstep : Drun DFirstThirdCodesTM 1 c = c' := by
+        simp [c, c', Drun, Dhalted, Dstep, Dread, DFirstThirdCodesTM, Dmove,
+          List.replicate_succ, DFirstThirdCodesState.start,
+          DFirstThirdCodesState.scanFirst, DFirstThirdCodesState.skipSecond,
+          DFirstThirdCodesState.copyRest, DFirstThirdCodesState.done,
+          DFirstThirdCodesState.reject]
+      change Drun DFirstThirdCodesTM (i + 1) (Drun DFirstThirdCodesTM 1 c) = _
+      rw [hstep]
+      simpa [c', List.replicate_succ, List.append_assoc, Nat.add_assoc,
+        Nat.add_comm, Nat.add_left_comm] using ih (pre := pre ++ [true]) (out := out ++ [true])
+
+lemma Drun_DFirstThirdCodesTM_scanFirst_all_true (pre out : Word) (i : Nat)
+    (wk : Nat → Bool) (wh : Nat) :
+    Drun DFirstThirdCodesTM (i + 1)
+      { state := DFirstThirdCodesState.scanFirst, input := pre ++ List.replicate i true,
+        head := pre.length + 1, output := out, work := wk, workHead := wh } =
+      { state := DFirstThirdCodesState.done, input := pre ++ List.replicate i true,
+        head := pre.length + i + 1, output := out ++ List.replicate i true,
+        work := wk, workHead := wh } := by
+  induction i generalizing pre out with
+  | zero =>
+      simp [Drun, Dhalted, Dstep, Dread, DFirstThirdCodesTM, Dmove,
+        DFirstThirdCodesState.start, DFirstThirdCodesState.scanFirst,
+        DFirstThirdCodesState.skipSecond, DFirstThirdCodesState.copyRest,
+        DFirstThirdCodesState.done, DFirstThirdCodesState.reject]
+  | succ i ih =>
+      rw [show i.succ + 1 = 1 + (i + 1) by omega, Drun_add_eq]
+      let c : DConfig DFirstThirdCodesState :=
+        { state := DFirstThirdCodesState.scanFirst,
+          input := pre ++ List.replicate i.succ true,
+          head := pre.length + 1, output := out, work := wk, workHead := wh }
+      let c' : DConfig DFirstThirdCodesState :=
+        { state := DFirstThirdCodesState.scanFirst,
+          input := pre ++ List.replicate i.succ true,
+          head := pre.length + 2, output := out ++ [true], work := wk, workHead := wh }
+      have hstep : Drun DFirstThirdCodesTM 1 c = c' := by
+        simp [c, c', Drun, Dhalted, Dstep, Dread, DFirstThirdCodesTM, Dmove,
+          List.replicate_succ, DFirstThirdCodesState.start,
+          DFirstThirdCodesState.scanFirst, DFirstThirdCodesState.skipSecond,
+          DFirstThirdCodesState.copyRest, DFirstThirdCodesState.done,
+          DFirstThirdCodesState.reject]
+      change Drun DFirstThirdCodesTM (i + 1) (Drun DFirstThirdCodesTM 1 c) = _
+      rw [hstep]
+      simpa [c', List.replicate_succ, List.append_assoc, Nat.add_assoc,
+        Nat.add_comm, Nat.add_left_comm] using ih (pre := pre ++ [true]) (out := out ++ [true])
+
+lemma Drun_DFirstThirdCodesTM_skipSecond_trues (pre zs out : Word) (j : Nat)
+    (wk : Nat → Bool) (wh : Nat) :
+    Drun DFirstThirdCodesTM (j + 1)
+      { state := DFirstThirdCodesState.skipSecond,
+        input := pre ++ List.replicate j true ++ false :: zs,
+        head := pre.length + 1, output := out, work := wk, workHead := wh } =
+      { state := DFirstThirdCodesState.copyRest,
+        input := pre ++ List.replicate j true ++ false :: zs,
+        head := pre.length + j + 2, output := out,
+        work := wk, workHead := wh } := by
+  induction j generalizing pre out with
+  | zero =>
+      simp [Drun, Dhalted, Dstep, Dread, DFirstThirdCodesTM, Dmove,
+        DFirstThirdCodesState.start, DFirstThirdCodesState.scanFirst,
+        DFirstThirdCodesState.skipSecond, DFirstThirdCodesState.copyRest,
+        DFirstThirdCodesState.done, DFirstThirdCodesState.reject]
+  | succ j ih =>
+      rw [show j.succ + 1 = 1 + (j + 1) by omega, Drun_add_eq]
+      let c : DConfig DFirstThirdCodesState :=
+        { state := DFirstThirdCodesState.skipSecond,
+          input := pre ++ List.replicate j.succ true ++ false :: zs,
+          head := pre.length + 1, output := out, work := wk, workHead := wh }
+      let c' : DConfig DFirstThirdCodesState :=
+        { state := DFirstThirdCodesState.skipSecond,
+          input := pre ++ List.replicate j.succ true ++ false :: zs,
+          head := pre.length + 2, output := out, work := wk, workHead := wh }
+      have hstep : Drun DFirstThirdCodesTM 1 c = c' := by
+        simp [c, c', Drun, Dhalted, Dstep, Dread, DFirstThirdCodesTM, Dmove,
+          List.replicate_succ, DFirstThirdCodesState.start,
+          DFirstThirdCodesState.scanFirst, DFirstThirdCodesState.skipSecond,
+          DFirstThirdCodesState.copyRest, DFirstThirdCodesState.done,
+          DFirstThirdCodesState.reject]
+      change Drun DFirstThirdCodesTM (j + 1) (Drun DFirstThirdCodesTM 1 c) = _
+      rw [hstep]
+      simpa [c', List.replicate_succ, List.append_assoc, Nat.add_assoc,
+        Nat.add_comm, Nat.add_left_comm] using ih (pre := pre ++ [true]) (out := out)
+
+lemma Drun_DFirstThirdCodesTM_skipSecond_all_true (pre out : Word) (j : Nat)
+    (wk : Nat → Bool) (wh : Nat) :
+    Drun DFirstThirdCodesTM (j + 1)
+      { state := DFirstThirdCodesState.skipSecond, input := pre ++ List.replicate j true,
+        head := pre.length + 1, output := out, work := wk, workHead := wh } =
+      { state := DFirstThirdCodesState.done, input := pre ++ List.replicate j true,
+        head := pre.length + j + 1, output := out, work := wk, workHead := wh } := by
+  induction j generalizing pre out with
+  | zero =>
+      simp [Drun, Dhalted, Dstep, Dread, DFirstThirdCodesTM, Dmove,
+        DFirstThirdCodesState.start, DFirstThirdCodesState.scanFirst,
+        DFirstThirdCodesState.skipSecond, DFirstThirdCodesState.copyRest,
+        DFirstThirdCodesState.done, DFirstThirdCodesState.reject]
+  | succ j ih =>
+      rw [show j.succ + 1 = 1 + (j + 1) by omega, Drun_add_eq]
+      let c : DConfig DFirstThirdCodesState :=
+        { state := DFirstThirdCodesState.skipSecond,
+          input := pre ++ List.replicate j.succ true,
+          head := pre.length + 1, output := out, work := wk, workHead := wh }
+      let c' : DConfig DFirstThirdCodesState :=
+        { state := DFirstThirdCodesState.skipSecond,
+          input := pre ++ List.replicate j.succ true,
+          head := pre.length + 2, output := out, work := wk, workHead := wh }
+      have hstep : Drun DFirstThirdCodesTM 1 c = c' := by
+        simp [c, c', Drun, Dhalted, Dstep, Dread, DFirstThirdCodesTM, Dmove,
+          List.replicate_succ, DFirstThirdCodesState.start,
+          DFirstThirdCodesState.scanFirst, DFirstThirdCodesState.skipSecond,
+          DFirstThirdCodesState.copyRest, DFirstThirdCodesState.done,
+          DFirstThirdCodesState.reject]
+      change Drun DFirstThirdCodesTM (j + 1) (Drun DFirstThirdCodesTM 1 c) = _
+      rw [hstep]
+      simpa [c', List.replicate_succ, List.append_assoc, Nat.add_assoc,
+        Nat.add_comm, Nat.add_left_comm] using ih (pre := pre ++ [true]) (out := out)
+
+lemma Drun_DFirstThirdCodesTM_copyRest (pre z out : Word)
+    (wk : Nat → Bool) (wh : Nat) :
+    Drun DFirstThirdCodesTM (z.length + 1)
+      { state := DFirstThirdCodesState.copyRest, input := pre ++ z,
+        head := pre.length + 1, output := out, work := wk, workHead := wh } =
+      { state := DFirstThirdCodesState.done, input := pre ++ z,
+        head := pre.length + z.length + 1, output := out ++ z,
+        work := wk, workHead := wh } := by
+  induction z generalizing pre out with
+  | nil =>
+      simp [Drun, Dhalted, Dstep, Dread, DFirstThirdCodesTM,
+        DFirstThirdCodesState.start, DFirstThirdCodesState.scanFirst,
+        DFirstThirdCodesState.skipSecond, DFirstThirdCodesState.copyRest,
+        DFirstThirdCodesState.done, DFirstThirdCodesState.reject]
+  | cons b bs ih =>
+      rw [show (b :: bs).length + 1 = 1 + (bs.length + 1) by
+        simp [Nat.add_comm, Nat.add_left_comm], Drun_add_eq]
+      let c : DConfig DFirstThirdCodesState :=
+        { state := DFirstThirdCodesState.copyRest, input := pre ++ b :: bs,
+          head := pre.length + 1, output := out, work := wk, workHead := wh }
+      let c' : DConfig DFirstThirdCodesState :=
+        { state := DFirstThirdCodesState.copyRest, input := pre ++ b :: bs,
+          head := pre.length + 2, output := out ++ [b], work := wk, workHead := wh }
+      have hstep : Drun DFirstThirdCodesTM 1 c = c' := by
+        simp [c, c', Drun, Dhalted, Dstep, Dread, DFirstThirdCodesTM, Dmove,
+          DFirstThirdCodesState.start, DFirstThirdCodesState.scanFirst,
+          DFirstThirdCodesState.skipSecond, DFirstThirdCodesState.copyRest,
+          DFirstThirdCodesState.done, DFirstThirdCodesState.reject]
+      change Drun DFirstThirdCodesTM (bs.length + 1) (Drun DFirstThirdCodesTM 1 c) = _
+      rw [hstep]
+      simpa [c', List.append_assoc, Nat.add_assoc, Nat.add_comm, Nat.add_left_comm] using
+        ih (pre := pre ++ [b]) (out := out ++ [b])
+
+lemma firstThirdCodes_all_true_aux (i : Nat) :
+    firstThirdCodes (List.replicate i true) = List.replicate i true := by
+  rw [firstThirdCodes, firstUnaryCode_all_true_aux, dropFirstUnary_all_true_aux]
+  simp [dropFirstUnary]
+
+lemma firstThirdCodes_true_false_all_true (i j : Nat) :
+    firstThirdCodes (List.replicate i true ++ false :: List.replicate j true) =
+      List.replicate i true ++ [false] := by
+  rw [firstThirdCodes, firstUnaryCode_replicate_true_false,
+    dropFirstUnary_replicate_true_false, dropFirstUnary_all_true_aux]
+  simp [List.append_assoc]
+
+lemma firstThirdCodes_true_false_rest (i j : Nat) (zs : Word) :
+    firstThirdCodes (List.replicate i true ++ false :: List.replicate j true ++ false :: zs) =
+      List.replicate i true ++ [false] ++ zs := by
+  simp [firstThirdCodes, firstUnaryCode_replicate_true_false,
+    dropFirstUnary_replicate_true_false, List.append_assoc]
+
+lemma firstThirdCodes_true_false_rest' (i j : Nat) (rest : Word) :
+    firstThirdCodes
+        (List.replicate i true ++ (false :: (List.replicate j true ++ false :: rest))) =
+      List.replicate i true ++ false :: rest := by
+  simp [firstThirdCodes, firstUnaryCode_replicate_true_false,
+    dropFirstUnary_replicate_true_false]
+
+lemma DFirstThirdCodesTM_output (x : Word) :
+    Dboutput DFirstThirdCodesTM (x.length + 3) x = firstThirdCodes x := by
+  dsimp [Dboutput]
+  rcases word_eq_replicate_true_append x with ⟨i, y, hxy, hy⟩
+  subst x
+  rw [show (List.replicate i true ++ y).length + 3 =
+      1 + ((List.replicate i true ++ y).length + 2) by omega, Drun_add_eq]
+  rw [Drun_DFirstThirdCodesTM_start]
+  rcases hy with rfl | ⟨zs, rfl⟩
+  · simp only [List.append_nil]
+    have hscan0 : Drun DFirstThirdCodesTM (i + 1)
+        { state := DFirstThirdCodesState.scanFirst, input := List.replicate i true,
+          head := 1, output := [], work := fun _ : Nat => false, workHead := 0 } =
+        { state := DFirstThirdCodesState.done, input := List.replicate i true,
+          head := i + 1, output := List.replicate i true,
+          work := fun _ : Nat => false, workHead := 0 } := by
+      simpa using (Drun_DFirstThirdCodesTM_scanFirst_all_true (pre := []) (out := []) i
+        (fun _ : Nat => false) 0)
+    have hscan : Drun DFirstThirdCodesTM (i + 2)
+        { state := DFirstThirdCodesState.scanFirst, input := List.replicate i true,
+          head := 1, output := [], work := fun _ : Nat => false, workHead := 0 } =
+        { state := DFirstThirdCodesState.done, input := List.replicate i true,
+          head := i + 1, output := List.replicate i true,
+          work := fun _ : Nat => false, workHead := 0 } := by
+      rw [show i + 2 = (i + 1) + 1 by omega, Drun_add_eq, hscan0]
+      simp [Drun, Dhalted, DFirstThirdCodesTM, DFirstThirdCodesState.done]
+    rw [show (List.replicate i true).length + 2 = i + 2 by simp]
+    rw [hscan]
+    simp [firstThirdCodes_all_true_aux]
+  · have hscan : Drun DFirstThirdCodesTM (i + 1)
+        { state := DFirstThirdCodesState.scanFirst,
+          input := List.replicate i true ++ false :: zs, head := 1, output := [],
+          work := fun _ : Nat => false, workHead := 0 } =
+        { state := DFirstThirdCodesState.skipSecond,
+          input := List.replicate i true ++ false :: zs, head := i + 2,
+          output := List.replicate i true ++ [false],
+          work := fun _ : Nat => false, workHead := 0 } := by
+      simpa [List.append_assoc] using
+        (Drun_DFirstThirdCodesTM_scanFirst_trues (pre := []) (zs := zs) (out := []) i
+          (fun _ : Nat => false) 0)
+    rw [show (List.replicate i true ++ false :: zs).length + 2 =
+        (i + 1) + (zs.length + 2) by simp; omega, Drun_add_eq]
+    rw [hscan]
+    rcases word_eq_replicate_true_append zs with ⟨j, ys, hzs, hys⟩
+    subst zs
+    rcases hys with rfl | ⟨rest, rfl⟩
+    · simp only [List.append_nil]
+      have hskip0 : Drun DFirstThirdCodesTM (j + 1)
+          { state := DFirstThirdCodesState.skipSecond,
+            input := List.replicate i true ++ false :: List.replicate j true,
+            head := i + 2, output := List.replicate i true ++ [false],
+            work := fun _ : Nat => false, workHead := 0 } =
+          { state := DFirstThirdCodesState.done,
+            input := List.replicate i true ++ false :: List.replicate j true,
+            head := i + 2 + j, output := List.replicate i true ++ [false],
+            work := fun _ : Nat => false, workHead := 0 } := by
+        simpa [List.append_assoc, Nat.add_assoc, Nat.add_comm, Nat.add_left_comm] using
+          (Drun_DFirstThirdCodesTM_skipSecond_all_true
+            (pre := List.replicate i true ++ [false])
+            (out := List.replicate i true ++ [false]) j
+            (fun _ : Nat => false) 0)
+      have hskip : Drun DFirstThirdCodesTM (j + 2)
+          { state := DFirstThirdCodesState.skipSecond,
+            input := List.replicate i true ++ false :: List.replicate j true,
+            head := i + 2, output := List.replicate i true ++ [false],
+            work := fun _ : Nat => false, workHead := 0 } =
+          { state := DFirstThirdCodesState.done,
+            input := List.replicate i true ++ false :: List.replicate j true,
+            head := i + 2 + j, output := List.replicate i true ++ [false],
+            work := fun _ : Nat => false, workHead := 0 } := by
+        rw [show j + 2 = (j + 1) + 1 by omega, Drun_add_eq, hskip0]
+        simp [Drun, Dhalted, DFirstThirdCodesTM, DFirstThirdCodesState.done]
+      rw [show (List.replicate j true).length + 2 = j + 2 by simp]
+      rw [hskip]
+      simp [firstThirdCodes_true_false_all_true]
+    · have hskip : Drun DFirstThirdCodesTM (j + 1)
+          { state := DFirstThirdCodesState.skipSecond,
+            input := List.replicate i true ++ (false :: (List.replicate j true ++ false :: rest)),
+            head := i + 2, output := List.replicate i true ++ [false],
+            work := fun _ : Nat => false, workHead := 0 } =
+          { state := DFirstThirdCodesState.copyRest,
+            input := List.replicate i true ++ (false :: (List.replicate j true ++ false :: rest)),
+            head := i + 2 + j + 1, output := List.replicate i true ++ [false],
+            work := fun _ : Nat => false, workHead := 0 } := by
+        simpa [List.append_assoc, Nat.add_assoc, Nat.add_comm, Nat.add_left_comm] using
+          (Drun_DFirstThirdCodesTM_skipSecond_trues
+            (pre := List.replicate i true ++ [false]) (zs := rest)
+            (out := List.replicate i true ++ [false]) j
+            (fun _ : Nat => false) 0)
+      have hcopy0 := Drun_DFirstThirdCodesTM_copyRest
+        (pre := (List.replicate i true ++ [false]) ++ (List.replicate j true ++ [false]))
+        (z := rest) (out := List.replicate i true ++ [false])
+        (fun _ : Nat => false) 0
+      have hcopy1 : Drun DFirstThirdCodesTM (rest.length + 1)
+          { state := DFirstThirdCodesState.copyRest,
+            input := List.replicate i true ++ (false :: (List.replicate j true ++ false :: rest)),
+            head := i + 2 + j + 1, output := List.replicate i true ++ [false],
+            work := fun _ : Nat => false, workHead := 0 } =
+          { state := DFirstThirdCodesState.done,
+            input := List.replicate i true ++ (false :: (List.replicate j true ++ false :: rest)),
+            head := i + 2 + j + rest.length + 1,
+            output := List.replicate i true ++ [false] ++ rest,
+            work := fun _ : Nat => false, workHead := 0 } := by
+        simpa [List.append_assoc, Nat.add_assoc, Nat.add_comm, Nat.add_left_comm] using hcopy0
+      have hcopy : Drun DFirstThirdCodesTM (rest.length + 2)
+          { state := DFirstThirdCodesState.copyRest,
+            input := List.replicate i true ++ (false :: (List.replicate j true ++ false :: rest)),
+            head := i + 2 + j + 1, output := List.replicate i true ++ [false],
+            work := fun _ : Nat => false, workHead := 0 } =
+          { state := DFirstThirdCodesState.done,
+            input := List.replicate i true ++ (false :: (List.replicate j true ++ false :: rest)),
+            head := i + 2 + j + rest.length + 1,
+            output := List.replicate i true ++ [false] ++ rest,
+            work := fun _ : Nat => false, workHead := 0 } := by
+        rw [show rest.length + 2 = (rest.length + 1) + 1 by omega, Drun_add_eq, hcopy1]
+        simp [Drun, Dhalted, DFirstThirdCodesTM, DFirstThirdCodesState.done]
+      rw [show (List.replicate j true ++ false :: rest).length + 2 =
+          (j + 1) + (rest.length + 2) by simp; omega, Drun_add_eq]
+      rw [hskip]
+      rw [hcopy]
+      simp [firstThirdCodes_true_false_rest']
+
+lemma DFirstThirdCodesTM_halts (x : Word) :
+    Dhalted DFirstThirdCodesTM
+      (Drun DFirstThirdCodesTM (x.length + 3) (Dinit DFirstThirdCodesTM x)) = true := by
+  rcases word_eq_replicate_true_append x with ⟨i, y, hxy, hy⟩
+  subst x
+  rw [show (List.replicate i true ++ y).length + 3 =
+      1 + ((List.replicate i true ++ y).length + 2) by omega, Drun_add_eq]
+  rw [Drun_DFirstThirdCodesTM_start]
+  rcases hy with rfl | ⟨zs, rfl⟩
+  · simp only [List.append_nil]
+    have hscan0 : Drun DFirstThirdCodesTM (i + 1)
+        { state := DFirstThirdCodesState.scanFirst, input := List.replicate i true,
+          head := 1, output := [], work := fun _ : Nat => false, workHead := 0 } =
+        { state := DFirstThirdCodesState.done, input := List.replicate i true,
+          head := i + 1, output := List.replicate i true,
+          work := fun _ : Nat => false, workHead := 0 } := by
+      simpa using (Drun_DFirstThirdCodesTM_scanFirst_all_true (pre := []) (out := []) i
+        (fun _ : Nat => false) 0)
+    have hscan : Drun DFirstThirdCodesTM (i + 2)
+        { state := DFirstThirdCodesState.scanFirst, input := List.replicate i true,
+          head := 1, output := [], work := fun _ : Nat => false, workHead := 0 } =
+        { state := DFirstThirdCodesState.done, input := List.replicate i true,
+          head := i + 1, output := List.replicate i true,
+          work := fun _ : Nat => false, workHead := 0 } := by
+      rw [show i + 2 = (i + 1) + 1 by omega, Drun_add_eq, hscan0]
+      simp [Drun, Dhalted, DFirstThirdCodesTM, DFirstThirdCodesState.done]
+    rw [show (List.replicate i true).length + 2 = i + 2 by simp]
+    rw [hscan]
+    simp [Dhalted, DFirstThirdCodesTM, DFirstThirdCodesState.done]
+  · have hscan : Drun DFirstThirdCodesTM (i + 1)
+        { state := DFirstThirdCodesState.scanFirst,
+          input := List.replicate i true ++ false :: zs, head := 1, output := [],
+          work := fun _ : Nat => false, workHead := 0 } =
+        { state := DFirstThirdCodesState.skipSecond,
+          input := List.replicate i true ++ false :: zs, head := i + 2,
+          output := List.replicate i true ++ [false],
+          work := fun _ : Nat => false, workHead := 0 } := by
+      simpa [List.append_assoc] using
+        (Drun_DFirstThirdCodesTM_scanFirst_trues (pre := []) (zs := zs) (out := []) i
+          (fun _ : Nat => false) 0)
+    rw [show (List.replicate i true ++ false :: zs).length + 2 =
+        (i + 1) + (zs.length + 2) by simp; omega, Drun_add_eq]
+    rw [hscan]
+    rcases word_eq_replicate_true_append zs with ⟨j, ys, hzs, hys⟩
+    subst zs
+    rcases hys with rfl | ⟨rest, rfl⟩
+    · simp only [List.append_nil]
+      have hskip0 : Drun DFirstThirdCodesTM (j + 1)
+          { state := DFirstThirdCodesState.skipSecond,
+            input := List.replicate i true ++ false :: List.replicate j true,
+            head := i + 2, output := List.replicate i true ++ [false],
+            work := fun _ : Nat => false, workHead := 0 } =
+          { state := DFirstThirdCodesState.done,
+            input := List.replicate i true ++ false :: List.replicate j true,
+            head := i + 2 + j, output := List.replicate i true ++ [false],
+            work := fun _ : Nat => false, workHead := 0 } := by
+        simpa [List.append_assoc, Nat.add_assoc, Nat.add_comm, Nat.add_left_comm] using
+          (Drun_DFirstThirdCodesTM_skipSecond_all_true
+            (pre := List.replicate i true ++ [false])
+            (out := List.replicate i true ++ [false]) j
+            (fun _ : Nat => false) 0)
+      have hskip : Drun DFirstThirdCodesTM (j + 2)
+          { state := DFirstThirdCodesState.skipSecond,
+            input := List.replicate i true ++ false :: List.replicate j true,
+            head := i + 2, output := List.replicate i true ++ [false],
+            work := fun _ : Nat => false, workHead := 0 } =
+          { state := DFirstThirdCodesState.done,
+            input := List.replicate i true ++ false :: List.replicate j true,
+            head := i + 2 + j, output := List.replicate i true ++ [false],
+            work := fun _ : Nat => false, workHead := 0 } := by
+        rw [show j + 2 = (j + 1) + 1 by omega, Drun_add_eq, hskip0]
+        simp [Drun, Dhalted, DFirstThirdCodesTM, DFirstThirdCodesState.done]
+      rw [show (List.replicate j true).length + 2 = j + 2 by simp]
+      rw [hskip]
+      simp [Dhalted, DFirstThirdCodesTM, DFirstThirdCodesState.done]
+    · have hskip : Drun DFirstThirdCodesTM (j + 1)
+          { state := DFirstThirdCodesState.skipSecond,
+            input := List.replicate i true ++ (false :: (List.replicate j true ++ false :: rest)),
+            head := i + 2, output := List.replicate i true ++ [false],
+            work := fun _ : Nat => false, workHead := 0 } =
+          { state := DFirstThirdCodesState.copyRest,
+            input := List.replicate i true ++ (false :: (List.replicate j true ++ false :: rest)),
+            head := i + 2 + j + 1, output := List.replicate i true ++ [false],
+            work := fun _ : Nat => false, workHead := 0 } := by
+        simpa [List.append_assoc, Nat.add_assoc, Nat.add_comm, Nat.add_left_comm] using
+          (Drun_DFirstThirdCodesTM_skipSecond_trues
+            (pre := List.replicate i true ++ [false]) (zs := rest)
+            (out := List.replicate i true ++ [false]) j
+            (fun _ : Nat => false) 0)
+      have hcopy0 := Drun_DFirstThirdCodesTM_copyRest
+        (pre := (List.replicate i true ++ [false]) ++ (List.replicate j true ++ [false]))
+        (z := rest) (out := List.replicate i true ++ [false])
+        (fun _ : Nat => false) 0
+      have hcopy1 : Drun DFirstThirdCodesTM (rest.length + 1)
+          { state := DFirstThirdCodesState.copyRest,
+            input := List.replicate i true ++ (false :: (List.replicate j true ++ false :: rest)),
+            head := i + 2 + j + 1, output := List.replicate i true ++ [false],
+            work := fun _ : Nat => false, workHead := 0 } =
+          { state := DFirstThirdCodesState.done,
+            input := List.replicate i true ++ (false :: (List.replicate j true ++ false :: rest)),
+            head := i + 2 + j + rest.length + 1,
+            output := List.replicate i true ++ [false] ++ rest,
+            work := fun _ : Nat => false, workHead := 0 } := by
+        simpa [List.append_assoc, Nat.add_assoc, Nat.add_comm, Nat.add_left_comm] using hcopy0
+      have hcopy : Drun DFirstThirdCodesTM (rest.length + 2)
+          { state := DFirstThirdCodesState.copyRest,
+            input := List.replicate i true ++ (false :: (List.replicate j true ++ false :: rest)),
+            head := i + 2 + j + 1, output := List.replicate i true ++ [false],
+            work := fun _ : Nat => false, workHead := 0 } =
+          { state := DFirstThirdCodesState.done,
+            input := List.replicate i true ++ (false :: (List.replicate j true ++ false :: rest)),
+            head := i + 2 + j + rest.length + 1,
+            output := List.replicate i true ++ [false] ++ rest,
+            work := fun _ : Nat => false, workHead := 0 } := by
+        rw [show rest.length + 2 = (rest.length + 1) + 1 by omega, Drun_add_eq, hcopy1]
+        simp [Drun, Dhalted, DFirstThirdCodesTM, DFirstThirdCodesState.done]
+      rw [show (List.replicate j true ++ false :: rest).length + 2 =
+          (j + 1) + (rest.length + 2) by simp; omega, Drun_add_eq]
+      rw [hskip]
+      rw [hcopy]
+      simp [Dhalted, DFirstThirdCodesTM, DFirstThirdCodesState.done]
+
+lemma firstThirdCodes_length_le (x : Word) : (firstThirdCodes x).length ≤ x.length := by
+  have hsplit := firstUnaryCode_length_add_dropFirstUnary_length x
+  have htail := firstUnaryCode_length_le_aux (dropFirstUnary x)
+  have hdrop := dropFirstUnary_length_le (dropFirstUnary x)
+  simp [firstThirdCodes]
+  omega
+
+theorem dPolyTimeComputable_firstThirdCodes : DPolyTimeComputable firstThirdCodes := by
+  refine ⟨DFirstThirdCodesState, inferInstance, inferInstance, DFirstThirdCodesTM,
+    X + C 3, X, ?_, ?_⟩
+  · intro x
+    simpa using DFirstThirdCodesTM_halts x
+  · intro x
+    constructor
+    · change Dboutput DFirstThirdCodesTM ((X + C 3).eval x.length) x = firstThirdCodes x
+      simpa using DFirstThirdCodesTM_output x
+    · simpa using firstThirdCodes_length_le x
+
+theorem dPolyTimeComputable_thirdCode : DPolyTimeComputable thirdCode := by
+  have h := DPolyTimeComputableClosedUnderComposition
+    dropFirstUnary dropFirstUnary
+    dPolyTimeComputable_dropFirstUnary dPolyTimeComputable_dropFirstUnary
+  change DPolyTimeComputable (fun x => dropFirstUnary (dropFirstUnary x))
+  exact h
+
+set_option linter.unusedSimpArgs false
+
+-- ---------------------------------------------------------------------------
+-- A concrete DTM for the variable-node constraint encoder
+-- ---------------------------------------------------------------------------
+
+abbrev DVarNodePairState := Fin 28
+
+namespace DVarNodePairState
+
+def start0 : DVarNodePairState := ⟨0, by decide⟩
+def start1 : DVarNodePairState := ⟨1, by decide⟩
+def scan1 : DVarNodePairState := ⟨2, by decide⟩
+def emit1a : DVarNodePairState := ⟨3, by decide⟩
+def emit1b : DVarNodePairState := ⟨4, by decide⟩
+def copy1 : DVarNodePairState := ⟨5, by decide⟩
+def rewind : DVarNodePairState := ⟨6, by decide⟩
+def start2 : DVarNodePairState := ⟨7, by decide⟩
+def scan2 : DVarNodePairState := ⟨8, by decide⟩
+def emit2a : DVarNodePairState := ⟨9, by decide⟩
+def emit2b : DVarNodePairState := ⟨10, by decide⟩
+def emit2c : DVarNodePairState := ⟨11, by decide⟩
+def emit2d : DVarNodePairState := ⟨12, by decide⟩
+def copy2 : DVarNodePairState := ⟨13, by decide⟩
+def done : DVarNodePairState := ⟨14, by decide⟩
+def reject : DVarNodePairState := ⟨15, by decide⟩
+
+def p0 : DVarNodePairState := ⟨16, by decide⟩
+def p1 : DVarNodePairState := ⟨17, by decide⟩
+def p2 : DVarNodePairState := ⟨18, by decide⟩
+def p3 : DVarNodePairState := ⟨19, by decide⟩
+def p4 : DVarNodePairState := ⟨20, by decide⟩
+def p5 : DVarNodePairState := ⟨21, by decide⟩
+def p6 : DVarNodePairState := ⟨22, by decide⟩
+def p7 : DVarNodePairState := ⟨23, by decide⟩
+def q0 : DVarNodePairState := ⟨24, by decide⟩
+def q1 : DVarNodePairState := ⟨25, by decide⟩
+def q2 : DVarNodePairState := ⟨26, by decide⟩
+def q3 : DVarNodePairState := ⟨27, by decide⟩
+
+attribute [simp] DVarNodePairState.p0 DVarNodePairState.p1 DVarNodePairState.p2
+  DVarNodePairState.p3 DVarNodePairState.p4 DVarNodePairState.p5
+  DVarNodePairState.p6 DVarNodePairState.p7 DVarNodePairState.q0
+  DVarNodePairState.q1 DVarNodePairState.q2 DVarNodePairState.q3
+
+end DVarNodePairState
+
+/-- Emit the full Tseitin variable-node constraint: the constant prefixes of
+    both pair encoders, then the two insertions into the input. -/
+def DVarNodePairTM : DTM DVarNodePairState where
+  step := fun q sym work =>
+    if q = DVarNodePairState.start0 then
+      { next := DVarNodePairState.p0, output := some true, inputMove := none
+        workWrite := none, workMove := none }
+    else if q = DVarNodePairState.p0 then
+      { next := DVarNodePairState.p1, output := some false, inputMove := none
+        workWrite := none, workMove := none }
+    else if q = DVarNodePairState.p1 then
+      { next := DVarNodePairState.p2, output := some true, inputMove := none
+        workWrite := none, workMove := none }
+    else if q = DVarNodePairState.p2 then
+      { next := DVarNodePairState.p3, output := some true, inputMove := none
+        workWrite := none, workMove := none }
+    else if q = DVarNodePairState.p3 then
+      { next := DVarNodePairState.p4, output := some false, inputMove := none
+        workWrite := none, workMove := none }
+    else if q = DVarNodePairState.p4 then
+      { next := DVarNodePairState.p5, output := some true, inputMove := none
+        workWrite := none, workMove := none }
+    else if q = DVarNodePairState.p5 then
+      { next := DVarNodePairState.p6, output := some false, inputMove := none
+        workWrite := none, workMove := none }
+    else if q = DVarNodePairState.p6 then
+      { next := DVarNodePairState.p7, output := some false, inputMove := none
+        workWrite := none, workMove := none }
+    else if q = DVarNodePairState.p7 then
+      { next := DVarNodePairState.scan1, output := none, inputMove := some true
+        workWrite := none, workMove := none }
+    else if q = DVarNodePairState.scan1 then
+      match sym with
+      | some true =>
+          { next := DVarNodePairState.scan1, output := some true, inputMove := some true
+            workWrite := none, workMove := none }
+      | some false =>
+          { next := DVarNodePairState.emit1a, output := some false, inputMove := some true
+            workWrite := none, workMove := none }
+      | none =>
+          { next := DVarNodePairState.emit1a, output := none, inputMove := none
+            workWrite := none, workMove := none }
+    else if q = DVarNodePairState.emit1a then
+      { next := DVarNodePairState.emit1b, output := some false, inputMove := none
+        workWrite := none, workMove := none }
+    else if q = DVarNodePairState.emit1b then
+      { next := DVarNodePairState.copy1, output := some false, inputMove := none
+        workWrite := none, workMove := none }
+    else if q = DVarNodePairState.copy1 then
+      match sym with
+      | some b =>
+          { next := DVarNodePairState.copy1, output := some b, inputMove := some true
+            workWrite := none, workMove := none }
+      | none =>
+          { next := DVarNodePairState.rewind, output := none, inputMove := none
+            workWrite := none, workMove := none }
+    else if q = DVarNodePairState.rewind then
+      match sym with
+      | some _ =>
+          { next := DVarNodePairState.rewind, output := none, inputMove := some false
+            workWrite := none, workMove := none }
+      | none =>
+          if work then
+            { next := DVarNodePairState.q0, output := none, inputMove := none
+              workWrite := none, workMove := none }
+          else
+            { next := DVarNodePairState.rewind, output := none, inputMove := some false
+              workWrite := some true, workMove := none }
+    else if q = DVarNodePairState.start2 then
+      { next := DVarNodePairState.scan2, output := none, inputMove := some true
+        workWrite := none, workMove := none }
+    else if q = DVarNodePairState.scan2 then
+      match sym with
+      | some true =>
+          { next := DVarNodePairState.scan2, output := some true, inputMove := some true
+            workWrite := none, workMove := none }
+      | some false =>
+          { next := DVarNodePairState.emit2a, output := some false, inputMove := some true
+            workWrite := none, workMove := none }
+      | none =>
+          { next := DVarNodePairState.emit2a, output := none, inputMove := none
+            workWrite := none, workMove := none }
+    else if q = DVarNodePairState.q0 then
+      { next := DVarNodePairState.q1, output := some true, inputMove := none
+        workWrite := none, workMove := none }
+    else if q = DVarNodePairState.q1 then
+      { next := DVarNodePairState.q2, output := some true, inputMove := none
+        workWrite := none, workMove := none }
+    else if q = DVarNodePairState.q2 then
+      { next := DVarNodePairState.q3, output := some false, inputMove := none
+        workWrite := none, workMove := none }
+    else if q = DVarNodePairState.q3 then
+      { next := DVarNodePairState.scan2, output := some false, inputMove := some true
+        workWrite := none, workMove := none }
+    else if q = DVarNodePairState.emit2a then
+      { next := DVarNodePairState.emit2b, output := some false, inputMove := none
+        workWrite := none, workMove := none }
+    else if q = DVarNodePairState.emit2b then
+      { next := DVarNodePairState.emit2c, output := some true, inputMove := none
+        workWrite := none, workMove := none }
+    else if q = DVarNodePairState.emit2c then
+      { next := DVarNodePairState.emit2d, output := some false, inputMove := none
+        workWrite := none, workMove := none }
+    else if q = DVarNodePairState.emit2d then
+      { next := DVarNodePairState.copy2, output := some false, inputMove := none
+        workWrite := none, workMove := none }
+    else if q = DVarNodePairState.copy2 then
+      match sym with
+      | some b =>
+          { next := DVarNodePairState.copy2, output := some b, inputMove := some true
+            workWrite := none, workMove := none }
+      | none =>
+          { next := DVarNodePairState.done, output := none, inputMove := none
+            workWrite := none, workMove := none }
+    else
+      { next := q, output := none, inputMove := none
+        workWrite := none, workMove := none }
+  start := DVarNodePairState.start0
+  accept := DVarNodePairState.done
+  reject := DVarNodePairState.reject
+
+lemma firstUnaryCode_length_le (x : Word) : (firstUnaryCode x).length ≤ x.length := by
+  induction x with
+  | nil => simp [firstUnaryCode]
+  | cons b bs ih =>
+      cases b <;> simp [firstUnaryCode] <;> omega
+
+theorem dPolyTimeComputable_firstUnaryCode : DPolyTimeComputable firstUnaryCode := by
+  refine ⟨DFirstUnaryCodeState, inferInstance, inferInstance, DFirstUnaryCodeTM,
+    X + C 2, X, ?_, ?_⟩
+  · intro x
+    simpa using DFirstUnaryCodeTM_halts x
+  · intro x
+    constructor
+    · change Dboutput DFirstUnaryCodeTM ((X + C 2).eval x.length) x = firstUnaryCode x
+      simpa using DFirstUnaryCodeTM_output x
+    · simpa using firstUnaryCode_length_le x
+
+
+lemma Drun_DVarNodePairTM_start (z : Word) :
+    Drun DVarNodePairTM 9 (Dinit DVarNodePairTM z) =
+      { state := DVarNodePairState.scan1, input := z, head := 1,
+        output := [true, false, true, true, false, true, false, false],
+        work := fun _ : Nat => false, workHead := 0 } := by
+  simp [Drun, Dhalted, Dinit, Dstep, Dread, DVarNodePairTM, Dmove,
+    DVarNodePairState.start0, DVarNodePairState.start1, DVarNodePairState.scan1,
+    DVarNodePairState.emit1a, DVarNodePairState.emit1b, DVarNodePairState.copy1,
+    DVarNodePairState.rewind, DVarNodePairState.start2, DVarNodePairState.scan2,
+    DVarNodePairState.emit2a, DVarNodePairState.emit2b, DVarNodePairState.emit2c,
+    DVarNodePairState.emit2d, DVarNodePairState.copy2, DVarNodePairState.done,
+    DVarNodePairState.reject]
+
+lemma Drun_DVarNodePairTM_scan1_trues (pre zs out : Word) (i : Nat)
+    (wk : Nat → Bool) (wh : Nat) :
+    Drun DVarNodePairTM (i + 1)
+      { state := DVarNodePairState.scan1,
+        input := pre ++ List.replicate i true ++ false :: zs,
+        head := pre.length + 1, output := out, work := wk, workHead := wh } =
+      { state := DVarNodePairState.emit1a,
+        input := pre ++ List.replicate i true ++ false :: zs,
+        head := pre.length + i + 2,
+        output := out ++ List.replicate i true ++ [false],
+        work := wk, workHead := wh } := by
+  induction i generalizing pre out with
+  | zero =>
+      simp [Drun, Dhalted, Dstep, Dread, DVarNodePairTM, Dmove,
+        DVarNodePairState.start0, DVarNodePairState.start1, DVarNodePairState.scan1,
+        DVarNodePairState.emit1a, DVarNodePairState.emit1b, DVarNodePairState.copy1,
+        DVarNodePairState.rewind, DVarNodePairState.start2, DVarNodePairState.scan2,
+        DVarNodePairState.emit2a, DVarNodePairState.emit2b, DVarNodePairState.emit2c,
+        DVarNodePairState.emit2d, DVarNodePairState.copy2, DVarNodePairState.done,
+        DVarNodePairState.reject]
+  | succ i ih =>
+      rw [show i.succ + 1 = 1 + (i + 1) by omega, Drun_add_eq]
+      let c : DConfig DVarNodePairState :=
+        { state := DVarNodePairState.scan1,
+          input := pre ++ List.replicate i.succ true ++ false :: zs,
+          head := pre.length + 1, output := out, work := wk, workHead := wh }
+      let c' : DConfig DVarNodePairState :=
+        { state := DVarNodePairState.scan1,
+          input := pre ++ List.replicate i.succ true ++ false :: zs,
+          head := pre.length + 2, output := out ++ [true], work := wk, workHead := wh }
+      have hstep : Drun DVarNodePairTM 1 c = c' := by
+        simp [c, c', Drun, Dhalted, Dstep, Dread, DVarNodePairTM, Dmove,
+          List.replicate_succ, DVarNodePairState.start0, DVarNodePairState.start1,
+          DVarNodePairState.scan1, DVarNodePairState.emit1a,
+          DVarNodePairState.emit1b, DVarNodePairState.copy1,
+          DVarNodePairState.rewind, DVarNodePairState.start2,
+          DVarNodePairState.scan2, DVarNodePairState.emit2a,
+          DVarNodePairState.emit2b, DVarNodePairState.emit2c,
+          DVarNodePairState.emit2d, DVarNodePairState.copy2,
+          DVarNodePairState.done, DVarNodePairState.reject]
+      change Drun DVarNodePairTM (i + 1) (Drun DVarNodePairTM 1 c) = _
+      rw [hstep]
+      simpa [c', List.replicate_succ, List.append_assoc, Nat.add_assoc,
+        Nat.add_comm, Nat.add_left_comm] using ih (pre := pre ++ [true]) (out := out ++ [true])
+
+lemma Drun_DVarNodePairTM_scan1_all_true (pre out : Word) (i : Nat)
+    (wk : Nat → Bool) (wh : Nat) :
+    Drun DVarNodePairTM (i + 1)
+      { state := DVarNodePairState.scan1, input := pre ++ List.replicate i true,
+        head := pre.length + 1, output := out, work := wk, workHead := wh } =
+      { state := DVarNodePairState.emit1a,
+        input := pre ++ List.replicate i true,
+        head := pre.length + i + 1, output := out ++ List.replicate i true,
+        work := wk, workHead := wh } := by
+  induction i generalizing pre out with
+  | zero =>
+      simp [Drun, Dhalted, Dstep, Dread, DVarNodePairTM, Dmove,
+        DVarNodePairState.start0, DVarNodePairState.start1, DVarNodePairState.scan1,
+        DVarNodePairState.emit1a, DVarNodePairState.emit1b, DVarNodePairState.copy1,
+        DVarNodePairState.rewind, DVarNodePairState.start2, DVarNodePairState.scan2,
+        DVarNodePairState.emit2a, DVarNodePairState.emit2b, DVarNodePairState.emit2c,
+        DVarNodePairState.emit2d, DVarNodePairState.copy2, DVarNodePairState.done,
+        DVarNodePairState.reject]
+  | succ i ih =>
+      rw [show i.succ + 1 = 1 + (i + 1) by omega, Drun_add_eq]
+      let c : DConfig DVarNodePairState :=
+        { state := DVarNodePairState.scan1,
+          input := pre ++ List.replicate i.succ true,
+          head := pre.length + 1, output := out, work := wk, workHead := wh }
+      let c' : DConfig DVarNodePairState :=
+        { state := DVarNodePairState.scan1,
+          input := pre ++ List.replicate i.succ true,
+          head := pre.length + 2, output := out ++ [true], work := wk, workHead := wh }
+      have hstep : Drun DVarNodePairTM 1 c = c' := by
+        simp [c, c', Drun, Dhalted, Dstep, Dread, DVarNodePairTM, Dmove,
+          List.replicate_succ, DVarNodePairState.start0, DVarNodePairState.start1,
+          DVarNodePairState.scan1, DVarNodePairState.emit1a,
+          DVarNodePairState.emit1b, DVarNodePairState.copy1,
+          DVarNodePairState.rewind, DVarNodePairState.start2,
+          DVarNodePairState.scan2, DVarNodePairState.emit2a,
+          DVarNodePairState.emit2b, DVarNodePairState.emit2c,
+          DVarNodePairState.emit2d, DVarNodePairState.copy2,
+          DVarNodePairState.done, DVarNodePairState.reject]
+      change Drun DVarNodePairTM (i + 1) (Drun DVarNodePairTM 1 c) = _
+      rw [hstep]
+      simpa [c', List.replicate_succ, List.append_assoc, Nat.add_assoc,
+        Nat.add_comm, Nat.add_left_comm] using ih (pre := pre ++ [true]) (out := out ++ [true])
+
+lemma Drun_DVarNodePairTM_scan1_trues' (zs out : Word) (i : Nat)
+    (wk : Nat → Bool) (wh : Nat) :
+    Drun DVarNodePairTM (i + 1)
+      { state := DVarNodePairState.scan1,
+        input := List.replicate i true ++ false :: zs,
+        head := 1, output := out, work := wk, workHead := wh } =
+      { state := DVarNodePairState.emit1a,
+        input := List.replicate i true ++ false :: zs,
+        head := i + 2, output := out ++ List.replicate i true ++ [false],
+        work := wk, workHead := wh } := by
+  simpa using Drun_DVarNodePairTM_scan1_trues
+    (pre := []) (zs := zs) (out := out) (i := i) wk wh
+
+lemma Drun_DVarNodePairTM_scan1_all_true' (out : Word) (i : Nat)
+    (wk : Nat → Bool) (wh : Nat) :
+    Drun DVarNodePairTM (i + 1)
+      { state := DVarNodePairState.scan1,
+        input := List.replicate i true,
+        head := 1, output := out, work := wk, workHead := wh } =
+      { state := DVarNodePairState.emit1a,
+        input := List.replicate i true,
+        head := i + 1, output := out ++ List.replicate i true,
+        work := wk, workHead := wh } := by
+  simpa using Drun_DVarNodePairTM_scan1_all_true
+    (pre := []) (out := out) (i := i) wk wh
+
+lemma Drun_DVarNodePairTM_copy (skipped rest out : Word)
+    (wk : Nat → Bool) (wh : Nat) :
+    Drun DVarNodePairTM (rest.length + 1)
+      { state := DVarNodePairState.copy1, input := skipped ++ rest,
+        head := skipped.length + 1, output := out, work := wk, workHead := wh } =
+      { state := DVarNodePairState.rewind, input := skipped ++ rest,
+        head := skipped.length + rest.length + 1, output := out ++ rest,
+        work := wk, workHead := wh } := by
+  induction rest generalizing skipped out with
+  | nil =>
+      simp [Drun, Dhalted, Dstep, Dread, DVarNodePairTM, Dmove,
+        DVarNodePairState.start0, DVarNodePairState.start1, DVarNodePairState.scan1,
+    DVarNodePairState.emit1a, DVarNodePairState.emit1b, DVarNodePairState.copy1,
+    DVarNodePairState.rewind, DVarNodePairState.start2, DVarNodePairState.scan2,
+    DVarNodePairState.emit2a, DVarNodePairState.emit2b, DVarNodePairState.emit2c,
+    DVarNodePairState.emit2d, DVarNodePairState.copy2, DVarNodePairState.done,
+    DVarNodePairState.reject]
+  | cons b bs ih =>
+      rw [show (b :: bs).length + 1 = 1 + (bs.length + 1) by
+        simp [Nat.add_comm, Nat.add_left_comm], Drun_add_eq]
+      let c : DConfig DVarNodePairState :=
+        { state := DVarNodePairState.copy1, input := skipped ++ b :: bs,
+          head := skipped.length + 1, output := out, work := wk, workHead := wh }
+      let c' : DConfig DVarNodePairState :=
+        { state := DVarNodePairState.copy1, input := skipped ++ b :: bs,
+          head := skipped.length + 2, output := out ++ [b], work := wk, workHead := wh }
+      have hstep : Drun DVarNodePairTM 1 c = c' := by
+        simp [c, c', Drun, Dhalted, Dstep, Dread, DVarNodePairTM, Dmove,
+          DVarNodePairState.start0, DVarNodePairState.start1, DVarNodePairState.scan1,
+    DVarNodePairState.emit1a, DVarNodePairState.emit1b, DVarNodePairState.copy1,
+    DVarNodePairState.rewind, DVarNodePairState.start2, DVarNodePairState.scan2,
+    DVarNodePairState.emit2a, DVarNodePairState.emit2b, DVarNodePairState.emit2c,
+    DVarNodePairState.emit2d, DVarNodePairState.copy2, DVarNodePairState.done,
+    DVarNodePairState.reject]
+      change Drun DVarNodePairTM (bs.length + 1) (Drun DVarNodePairTM 1 c) = _
+      rw [hstep]
+      simpa [c', List.append_assoc, Nat.add_assoc, Nat.add_comm, Nat.add_left_comm]
+        using ih (skipped := skipped ++ [b]) (out := out ++ [b])
+
+lemma Drun_DVarNodePairTM_copy_all_true' (out : Word) (i : Nat)
+    (wk : Nat → Bool) (wh : Nat) :
+    Drun DVarNodePairTM 1
+      { state := DVarNodePairState.copy1, input := List.replicate i true,
+        head := i + 1, output := out, work := wk, workHead := wh } =
+      { state := DVarNodePairState.rewind, input := List.replicate i true,
+        head := i + 1, output := out, work := wk, workHead := wh } := by
+  simpa using Drun_DVarNodePairTM_copy (skipped := List.replicate i true)
+    (rest := []) (out := out) wk wh
+
+lemma Drun_DVarNodePairTM_copy_false' (zs out : Word) (i : Nat)
+    (wk : Nat → Bool) (wh : Nat) :
+    Drun DVarNodePairTM (zs.length + 1)
+      { state := DVarNodePairState.copy1,
+        input := List.replicate i true ++ false :: zs,
+        head := i + 2, output := out, work := wk, workHead := wh } =
+      { state := DVarNodePairState.rewind,
+        input := List.replicate i true ++ false :: zs,
+        head := i + zs.length + 2, output := out ++ zs,
+        work := wk, workHead := wh } := by
+  simpa [List.append_assoc, Nat.add_assoc, Nat.add_comm, Nat.add_left_comm] using
+    Drun_DVarNodePairTM_copy (skipped := List.replicate i true ++ [false])
+      (rest := zs) (out := out) wk wh
+
+lemma Drun_DVarNodePairTM_rewind_at (z out : Word) (f : Nat → Bool) (wh : Nat)
+    (hf : f wh = true) (n : Nat) (hn : n ≤ z.length) :
+    Drun DVarNodePairTM (n + 1)
+      { state := DVarNodePairState.rewind, input := z, head := n,
+        output := out, work := f, workHead := wh } =
+      { state := DVarNodePairState.q0, input := z, head := 0,
+        output := out, work := f, workHead := wh } := by
+  induction n with
+  | zero =>
+      simp [Drun, Dhalted, Dstep, Dread, DVarNodePairTM, Dmove, hf,
+        DVarNodePairState.start0, DVarNodePairState.start1, DVarNodePairState.scan1,
+        DVarNodePairState.emit1a, DVarNodePairState.emit1b, DVarNodePairState.copy1,
+        DVarNodePairState.rewind, DVarNodePairState.q0, DVarNodePairState.scan2,
+        DVarNodePairState.emit2a, DVarNodePairState.emit2b, DVarNodePairState.emit2c,
+        DVarNodePairState.emit2d, DVarNodePairState.copy2, DVarNodePairState.done,
+        DVarNodePairState.reject]
+  | succ n ih =>
+      have hlt : n < z.length := by omega
+      let c : DConfig DVarNodePairState :=
+        { state := DVarNodePairState.rewind, input := z, head := n.succ,
+          output := out, work := f, workHead := wh }
+      let c' : DConfig DVarNodePairState :=
+        { state := DVarNodePairState.rewind, input := z, head := n,
+          output := out, work := f, workHead := wh }
+      have hread : Dread c = some z[n] := by
+        simp [c, Dread, Nat.succ_ne_zero, List.getElem?_eq_getElem hlt]
+      have hstep : Drun DVarNodePairTM 1 c = c' := by
+        simp [c, c', Drun, Dhalted, Dstep, Dread, List.getElem?_eq_getElem hlt,
+          DVarNodePairTM, Dmove,
+          DVarNodePairState.start0, DVarNodePairState.start1, DVarNodePairState.scan1,
+        DVarNodePairState.emit1a, DVarNodePairState.emit1b, DVarNodePairState.copy1,
+        DVarNodePairState.rewind, DVarNodePairState.q0, DVarNodePairState.scan2,
+        DVarNodePairState.emit2a, DVarNodePairState.emit2b, DVarNodePairState.emit2c,
+        DVarNodePairState.emit2d, DVarNodePairState.copy2, DVarNodePairState.done,
+        DVarNodePairState.reject]
+      rw [show n.succ + 1 = 1 + (n + 1) by omega, Drun_add_eq]
+      change Drun DVarNodePairTM (n + 1) (Drun DVarNodePairTM 1 c) = _
+      rw [hstep]
+      simpa [c'] using ih (by omega)
+
+lemma Drun_DVarNodePairTM_rewind (z out : Word) (f : Nat → Bool) (wh : Nat)
+    (hf : f wh = false) :
+    Drun DVarNodePairTM (z.length + 2)
+      { state := DVarNodePairState.rewind, input := z, head := z.length + 1,
+        output := out, work := f, workHead := wh } =
+      { state := DVarNodePairState.q0, input := z, head := 0,
+        output := out, work := DwriteWork f wh (some true), workHead := wh } := by
+  rw [show z.length + 2 = 1 + (z.length + 1) by omega, Drun_add_eq]
+  let c : DConfig DVarNodePairState :=
+    { state := DVarNodePairState.rewind, input := z, head := z.length + 1,
+      output := out, work := f, workHead := wh }
+  let c' : DConfig DVarNodePairState :=
+    { state := DVarNodePairState.rewind, input := z, head := z.length,
+      output := out, work := DwriteWork f wh (some true), workHead := wh }
+  have hstep : Drun DVarNodePairTM 1 c = c' := by
+    simp [c, c', Drun, Dhalted, Dstep, Dread, DVarNodePairTM, Dmove, hf,
+      DVarNodePairState.start0, DVarNodePairState.start1, DVarNodePairState.scan1,
+      DVarNodePairState.emit1a, DVarNodePairState.emit1b, DVarNodePairState.copy1,
+      DVarNodePairState.rewind, DVarNodePairState.q0, DVarNodePairState.scan2,
+      DVarNodePairState.emit2a, DVarNodePairState.emit2b, DVarNodePairState.emit2c,
+      DVarNodePairState.emit2d, DVarNodePairState.copy2, DVarNodePairState.done,
+      DVarNodePairState.reject, DwriteWork]
+  change Drun DVarNodePairTM (z.length + 1) (Drun DVarNodePairTM 1 c) = _
+  rw [hstep]
+  simpa [c'] using Drun_DVarNodePairTM_rewind_at z out
+    (DwriteWork f wh (some true)) wh (by simp [DwriteWork, hf]) z.length le_rfl
+
+lemma Drun_DVarNodePairTM_rewind_all_true' (out : Word) (i : Nat)
+    (f : Nat → Bool) (wh : Nat) (hf : f wh = false) :
+    Drun DVarNodePairTM (i + 2)
+      { state := DVarNodePairState.rewind, input := List.replicate i true,
+        head := i + 1, output := out, work := f, workHead := wh } =
+      { state := DVarNodePairState.q0, input := List.replicate i true,
+        head := 0, output := out, work := DwriteWork f wh (some true),
+        workHead := wh } := by
+  simpa using Drun_DVarNodePairTM_rewind (z := List.replicate i true)
+    (out := out) f wh hf
+
+lemma Drun_DVarNodePairTM_rewind_false' (zs out : Word) (i : Nat)
+    (f : Nat → Bool) (wh : Nat) (hf : f wh = false) :
+    Drun DVarNodePairTM (i + zs.length + 3)
+      { state := DVarNodePairState.rewind,
+        input := List.replicate i true ++ false :: zs,
+        head := i + zs.length + 2, output := out, work := f, workHead := wh } =
+      { state := DVarNodePairState.q0,
+        input := List.replicate i true ++ false :: zs,
+        head := 0, output := out, work := DwriteWork f wh (some true),
+        workHead := wh } := by
+  simpa [Nat.add_assoc, Nat.add_comm, Nat.add_left_comm] using
+    Drun_DVarNodePairTM_rewind (z := List.replicate i true ++ false :: zs)
+      (out := out) f wh hf
+
+lemma Drun_DVarNodePairTM_start2 (z out : Word) (f : Nat → Bool) (wh : Nat) :
+    Drun DVarNodePairTM 1
+      { state := DVarNodePairState.start2, input := z, head := 0,
+        output := out, work := f, workHead := wh } =
+      { state := DVarNodePairState.scan2, input := z, head := 1,
+        output := out, work := f, workHead := wh } := by
+  simp [Drun, Dhalted, Dstep, Dread, DVarNodePairTM, Dmove,
+    DVarNodePairState.start0, DVarNodePairState.start1, DVarNodePairState.scan1,
+    DVarNodePairState.emit1a, DVarNodePairState.emit1b, DVarNodePairState.copy1,
+    DVarNodePairState.rewind, DVarNodePairState.start2, DVarNodePairState.scan2,
+    DVarNodePairState.emit2a, DVarNodePairState.emit2b, DVarNodePairState.emit2c,
+    DVarNodePairState.emit2d, DVarNodePairState.copy2, DVarNodePairState.done,
+    DVarNodePairState.reject]
+
+lemma Drun_DVarNodePairTM_scan2_trues (pre zs out : Word) (i : Nat)
+    (wk : Nat → Bool) (wh : Nat) :
+    Drun DVarNodePairTM (i + 1)
+      { state := DVarNodePairState.scan2,
+        input := pre ++ List.replicate i true ++ false :: zs,
+        head := pre.length + 1, output := out, work := wk, workHead := wh } =
+      { state := DVarNodePairState.emit2a,
+        input := pre ++ List.replicate i true ++ false :: zs,
+        head := pre.length + i + 2,
+        output := out ++ List.replicate i true ++ [false],
+        work := wk, workHead := wh } := by
+  induction i generalizing pre out with
+  | zero =>
+      simp [Drun, Dhalted, Dstep, Dread, DVarNodePairTM, Dmove,
+        DVarNodePairState.start0, DVarNodePairState.start1, DVarNodePairState.scan1,
+    DVarNodePairState.emit1a, DVarNodePairState.emit1b, DVarNodePairState.copy1,
+    DVarNodePairState.rewind, DVarNodePairState.start2, DVarNodePairState.scan2,
+    DVarNodePairState.emit2a, DVarNodePairState.emit2b, DVarNodePairState.emit2c,
+    DVarNodePairState.emit2d, DVarNodePairState.copy2, DVarNodePairState.done,
+    DVarNodePairState.reject]
+  | succ i ih =>
+      rw [show i.succ + 1 = 1 + (i + 1) by omega, Drun_add_eq]
+      let c : DConfig DVarNodePairState :=
+        { state := DVarNodePairState.scan2,
+          input := pre ++ List.replicate i.succ true ++ false :: zs,
+          head := pre.length + 1, output := out, work := wk, workHead := wh }
+      let c' : DConfig DVarNodePairState :=
+        { state := DVarNodePairState.scan2,
+          input := pre ++ List.replicate i.succ true ++ false :: zs,
+          head := pre.length + 2, output := out ++ [true], work := wk, workHead := wh }
+      have hstep : Drun DVarNodePairTM 1 c = c' := by
+        simp [c, c', Drun, Dhalted, Dstep, Dread, DVarNodePairTM, Dmove,
+          List.replicate_succ, DVarNodePairState.start0, DVarNodePairState.start1, DVarNodePairState.scan1,
+    DVarNodePairState.emit1a, DVarNodePairState.emit1b, DVarNodePairState.copy1,
+    DVarNodePairState.rewind, DVarNodePairState.start2, DVarNodePairState.scan2,
+    DVarNodePairState.emit2a, DVarNodePairState.emit2b, DVarNodePairState.emit2c,
+    DVarNodePairState.emit2d, DVarNodePairState.copy2, DVarNodePairState.done,
+    DVarNodePairState.reject]
+      change Drun DVarNodePairTM (i + 1) (Drun DVarNodePairTM 1 c) = _
+      rw [hstep]
+      simpa [c', List.replicate_succ, List.append_assoc, Nat.add_assoc,
+        Nat.add_comm, Nat.add_left_comm] using ih (pre := pre ++ [true]) (out := out ++ [true])
+
+lemma Drun_DVarNodePairTM_scan2_all_true (pre out : Word) (i : Nat)
+    (wk : Nat → Bool) (wh : Nat) :
+    Drun DVarNodePairTM (i + 1)
+      { state := DVarNodePairState.scan2, input := pre ++ List.replicate i true,
+        head := pre.length + 1, output := out, work := wk, workHead := wh } =
+      { state := DVarNodePairState.emit2a,
+        input := pre ++ List.replicate i true,
+        head := pre.length + i + 1, output := out ++ List.replicate i true,
+        work := wk, workHead := wh } := by
+  induction i generalizing pre out with
+  | zero =>
+      simp [Drun, Dhalted, Dstep, Dread, DVarNodePairTM, Dmove,
+        DVarNodePairState.start0, DVarNodePairState.start1, DVarNodePairState.scan1,
+    DVarNodePairState.emit1a, DVarNodePairState.emit1b, DVarNodePairState.copy1,
+    DVarNodePairState.rewind, DVarNodePairState.start2, DVarNodePairState.scan2,
+    DVarNodePairState.emit2a, DVarNodePairState.emit2b, DVarNodePairState.emit2c,
+    DVarNodePairState.emit2d, DVarNodePairState.copy2, DVarNodePairState.done,
+    DVarNodePairState.reject]
+  | succ i ih =>
+      rw [show i.succ + 1 = 1 + (i + 1) by omega, Drun_add_eq]
+      let c : DConfig DVarNodePairState :=
+        { state := DVarNodePairState.scan2,
+          input := pre ++ List.replicate i.succ true,
+          head := pre.length + 1, output := out, work := wk, workHead := wh }
+      let c' : DConfig DVarNodePairState :=
+        { state := DVarNodePairState.scan2,
+          input := pre ++ List.replicate i.succ true,
+          head := pre.length + 2, output := out ++ [true], work := wk, workHead := wh }
+      have hstep : Drun DVarNodePairTM 1 c = c' := by
+        simp [c, c', Drun, Dhalted, Dstep, Dread, DVarNodePairTM, Dmove,
+          List.replicate_succ, DVarNodePairState.start0, DVarNodePairState.start1, DVarNodePairState.scan1,
+    DVarNodePairState.emit1a, DVarNodePairState.emit1b, DVarNodePairState.copy1,
+    DVarNodePairState.rewind, DVarNodePairState.start2, DVarNodePairState.scan2,
+    DVarNodePairState.emit2a, DVarNodePairState.emit2b, DVarNodePairState.emit2c,
+    DVarNodePairState.emit2d, DVarNodePairState.copy2, DVarNodePairState.done,
+    DVarNodePairState.reject]
+      change Drun DVarNodePairTM (i + 1) (Drun DVarNodePairTM 1 c) = _
+      rw [hstep]
+      simpa [c', List.replicate_succ, List.append_assoc, Nat.add_assoc,
+        Nat.add_comm, Nat.add_left_comm] using ih (pre := pre ++ [true]) (out := out ++ [true])
+
+lemma Drun_DVarNodePairTM_scan2_trues' (zs out : Word) (i : Nat)
+    (wk : Nat → Bool) (wh : Nat) :
+    Drun DVarNodePairTM (i + 1)
+      { state := DVarNodePairState.scan2,
+        input := List.replicate i true ++ false :: zs,
+        head := 1, output := out, work := wk, workHead := wh } =
+      { state := DVarNodePairState.emit2a,
+        input := List.replicate i true ++ false :: zs,
+        head := i + 2, output := out ++ List.replicate i true ++ [false],
+        work := wk, workHead := wh } := by
+  simpa using Drun_DVarNodePairTM_scan2_trues
+    (pre := []) (zs := zs) (out := out) (i := i) wk wh
+
+lemma Drun_DVarNodePairTM_scan2_all_true' (out : Word) (i : Nat)
+    (wk : Nat → Bool) (wh : Nat) :
+    Drun DVarNodePairTM (i + 1)
+      { state := DVarNodePairState.scan2,
+        input := List.replicate i true,
+        head := 1, output := out, work := wk, workHead := wh } =
+      { state := DVarNodePairState.emit2a,
+        input := List.replicate i true,
+        head := i + 1, output := out ++ List.replicate i true,
+        work := wk, workHead := wh } := by
+  simpa using Drun_DVarNodePairTM_scan2_all_true
+    (pre := []) (out := out) (i := i) wk wh
+
+lemma Drun_DVarNodePairTM_copy2 (skipped rest out : Word)
+    (wk : Nat → Bool) (wh : Nat) :
+    Drun DVarNodePairTM (rest.length + 1)
+      { state := DVarNodePairState.copy2, input := skipped ++ rest,
+        head := skipped.length + 1, output := out, work := wk, workHead := wh } =
+      { state := DVarNodePairState.done, input := skipped ++ rest,
+        head := skipped.length + rest.length + 1, output := out ++ rest,
+        work := wk, workHead := wh } := by
+  induction rest generalizing skipped out with
+  | nil =>
+      simp [Drun, Dhalted, Dstep, Dread, DVarNodePairTM, Dmove,
+        DVarNodePairState.start0, DVarNodePairState.start1, DVarNodePairState.scan1,
+    DVarNodePairState.emit1a, DVarNodePairState.emit1b, DVarNodePairState.copy1,
+    DVarNodePairState.rewind, DVarNodePairState.start2, DVarNodePairState.scan2,
+    DVarNodePairState.emit2a, DVarNodePairState.emit2b, DVarNodePairState.emit2c,
+    DVarNodePairState.emit2d, DVarNodePairState.copy2, DVarNodePairState.done,
+    DVarNodePairState.reject]
+  | cons b bs ih =>
+      rw [show (b :: bs).length + 1 = 1 + (bs.length + 1) by
+        simp [Nat.add_comm, Nat.add_left_comm], Drun_add_eq]
+      let c : DConfig DVarNodePairState :=
+        { state := DVarNodePairState.copy2, input := skipped ++ b :: bs,
+          head := skipped.length + 1, output := out, work := wk, workHead := wh }
+      let c' : DConfig DVarNodePairState :=
+        { state := DVarNodePairState.copy2, input := skipped ++ b :: bs,
+          head := skipped.length + 2, output := out ++ [b], work := wk, workHead := wh }
+      have hstep : Drun DVarNodePairTM 1 c = c' := by
+        simp [c, c', Drun, Dhalted, Dstep, Dread, DVarNodePairTM, Dmove,
+          DVarNodePairState.start0, DVarNodePairState.start1, DVarNodePairState.scan1,
+    DVarNodePairState.emit1a, DVarNodePairState.emit1b, DVarNodePairState.copy1,
+    DVarNodePairState.rewind, DVarNodePairState.start2, DVarNodePairState.scan2,
+    DVarNodePairState.emit2a, DVarNodePairState.emit2b, DVarNodePairState.emit2c,
+    DVarNodePairState.emit2d, DVarNodePairState.copy2, DVarNodePairState.done,
+    DVarNodePairState.reject]
+      change Drun DVarNodePairTM (bs.length + 1) (Drun DVarNodePairTM 1 c) = _
+      rw [hstep]
+      simpa [c', List.append_assoc, Nat.add_assoc, Nat.add_comm, Nat.add_left_comm]
+        using ih (skipped := skipped ++ [b]) (out := out ++ [b])
+
+lemma Drun_DVarNodePairTM_prefix2 (z out : Word) (h : Nat)
+    (wk : Nat → Bool) (wh : Nat) :
+    Drun DVarNodePairTM 4
+      { state := DVarNodePairState.q0, input := z, head := h,
+        output := out, work := wk, workHead := wh } =
+      { state := DVarNodePairState.scan2, input := z, head := h + 1,
+        output := out ++ [true, true, false, false], work := wk, workHead := wh } := by
+  simp [Drun, Dhalted, Dstep, Dread, DVarNodePairTM, Dmove,
+    DVarNodePairState.start0, DVarNodePairState.start1, DVarNodePairState.scan1,
+    DVarNodePairState.emit1a, DVarNodePairState.emit1b, DVarNodePairState.copy1,
+    DVarNodePairState.rewind, DVarNodePairState.start2, DVarNodePairState.scan2,
+    DVarNodePairState.emit2a, DVarNodePairState.emit2b, DVarNodePairState.emit2c,
+    DVarNodePairState.emit2d, DVarNodePairState.copy2, DVarNodePairState.done,
+    DVarNodePairState.reject]
+
+lemma Drun_DVarNodePairTM_emit1 (z out : Word) (h : Nat)
+    (wk : Nat → Bool) (wh : Nat) :
+    Drun DVarNodePairTM 2
+      { state := DVarNodePairState.emit1a, input := z, head := h,
+        output := out, work := wk, workHead := wh } =
+      { state := DVarNodePairState.copy1, input := z, head := h,
+        output := out ++ [false, false], work := wk, workHead := wh } := by
+  simp [Drun, Dhalted, Dstep, Dread, DVarNodePairTM,
+    DVarNodePairState.start0, DVarNodePairState.start1, DVarNodePairState.scan1,
+    DVarNodePairState.emit1a, DVarNodePairState.emit1b, DVarNodePairState.copy1,
+    DVarNodePairState.rewind, DVarNodePairState.start2, DVarNodePairState.scan2,
+    DVarNodePairState.emit2a, DVarNodePairState.emit2b, DVarNodePairState.emit2c,
+    DVarNodePairState.emit2d, DVarNodePairState.copy2, DVarNodePairState.done,
+    DVarNodePairState.reject]
+
+lemma Drun_DVarNodePairTM_emit2 (z out : Word) (h : Nat)
+    (wk : Nat → Bool) (wh : Nat) :
+    Drun DVarNodePairTM 4
+      { state := DVarNodePairState.emit2a, input := z, head := h,
+        output := out, work := wk, workHead := wh } =
+      { state := DVarNodePairState.copy2, input := z, head := h,
+        output := out ++ [false, true, false, false], work := wk, workHead := wh } := by
+  simp [Drun, Dhalted, Dstep, Dread, DVarNodePairTM,
+    DVarNodePairState.start0, DVarNodePairState.start1, DVarNodePairState.scan1,
+    DVarNodePairState.emit1a, DVarNodePairState.emit1b, DVarNodePairState.copy1,
+    DVarNodePairState.rewind, DVarNodePairState.start2, DVarNodePairState.scan2,
+    DVarNodePairState.emit2a, DVarNodePairState.emit2b, DVarNodePairState.emit2c,
+    DVarNodePairState.emit2d, DVarNodePairState.copy2, DVarNodePairState.done,
+    DVarNodePairState.reject]
+
+lemma Drun_DVarNodePairTM_copy2_all_true' (out : Word) (i : Nat)
+    (wk : Nat → Bool) (wh : Nat) :
+    Drun DVarNodePairTM 1
+      { state := DVarNodePairState.copy2, input := List.replicate i true,
+        head := i + 1, output := out, work := wk, workHead := wh } =
+      { state := DVarNodePairState.done, input := List.replicate i true,
+        head := i + 1, output := out, work := wk, workHead := wh } := by
+  simpa using Drun_DVarNodePairTM_copy2 (skipped := List.replicate i true)
+    (rest := []) (out := out) wk wh
+
+lemma Drun_DVarNodePairTM_copy2_false' (zs out : Word) (i : Nat)
+    (wk : Nat → Bool) (wh : Nat) :
+    Drun DVarNodePairTM (zs.length + 1)
+      { state := DVarNodePairState.copy2,
+        input := List.replicate i true ++ false :: zs,
+        head := i + 2, output := out, work := wk, workHead := wh } =
+      { state := DVarNodePairState.done,
+        input := List.replicate i true ++ false :: zs,
+        head := i + zs.length + 2, output := out ++ zs,
+        work := wk, workHead := wh } := by
+  simpa [List.append_assoc, Nat.add_assoc, Nat.add_comm, Nat.add_left_comm] using
+    Drun_DVarNodePairTM_copy2 (skipped := List.replicate i true ++ [false])
+      (rest := zs) (out := out) wk wh
+
+lemma DVarNodePairTM_full (z : Word) :
+    ∃ s : Nat, s ≤ 3 * z.length + 27 ∧
+      Dhalted DVarNodePairTM (Drun DVarNodePairTM s (Dinit DVarNodePairTM z)) = true ∧
+      (Drun DVarNodePairTM s (Dinit DVarNodePairTM z)).output =
+        varNodeConstraintEncodeFromPair z := by
+  rcases word_eq_replicate_true_append z with ⟨i, y, hzy, hy⟩
+  subst z
+  rcases hy with rfl | ⟨zs, rfl⟩
+  · refine ⟨3 * i + 25, by simp, ?_, ?_⟩
+    all_goals
+      rw [show 3 * i + 25 =
+          9 + ((i + 1) + (2 + (1 + (i + 2 + (4 + ((i + 1) + (4 + 1))))))) by omega]
+      rw [Drun_add_eq]
+      rw [Drun_DVarNodePairTM_start]
+      rw [Drun_add_eq]
+      simp only [List.append_nil]
+      rw [Drun_DVarNodePairTM_scan1_all_true'
+        (out := [true, false, true, true, false, true, false, false]) (i := i)
+        (wk := fun _ : Nat => false) (wh := 0)]
+      rw [Drun_add_eq]
+      rw [Drun_DVarNodePairTM_emit1]
+      rw [Drun_add_eq]
+      rw [Drun_DVarNodePairTM_copy_all_true']
+      rw [Drun_add_eq]
+      rw [Drun_DVarNodePairTM_rewind_all_true'
+        (out := [true, false, true, true, false, true, false, false] ++
+          List.replicate i true ++ [false, false]) (i := i)
+        (f := fun _ : Nat => false) (wh := 0) (by simp)]
+      rw [Drun_add_eq]
+      rw [Drun_DVarNodePairTM_prefix2]
+      rw [Drun_add_eq]
+      rw [Drun_DVarNodePairTM_scan2_all_true']
+      rw [Drun_add_eq]
+      rw [Drun_DVarNodePairTM_emit2]
+      rw [Drun_DVarNodePairTM_copy2_all_true']
+      simp [Dhalted, DVarNodePairTM, DVarNodePairState.done,
+        varNodeConstraintEncodeFromPair, Formula.pairOrNotVarVarEncode,
+        Formula.pairVarNotVarEncode, insertVarTagTotal, insertNotVarTagTotal,
+        insertVarTagTotal_replicate_true, insertNotVarTagTotal_replicate_true,
+        insertVarTagTotal_replicate_true_false, insertNotVarTagTotal_replicate_true_false,
+        List.append_assoc]
+  · refine ⟨3 * (i + zs.length) + 26, by
+      simp [Nat.mul_add, Nat.add_assoc, Nat.add_comm, Nat.add_left_comm]
+      omega, ?_, ?_⟩
+    all_goals
+      rw [show 3 * (i + zs.length) + 26 =
+          9 + ((i + 1) + (2 + ((zs.length + 1) + ((i + zs.length + 3) +
+            (4 + ((i + 1) + (4 + (zs.length + 1)))))))) by omega]
+      rw [Drun_add_eq]
+      rw [Drun_DVarNodePairTM_start]
+      rw [Drun_add_eq]
+      rw [Drun_DVarNodePairTM_scan1_trues'
+        (zs := zs) (out := [true, false, true, true, false, true, false, false]) (i := i)
+        (wk := fun _ : Nat => false) (wh := 0)]
+      rw [Drun_add_eq]
+      rw [Drun_DVarNodePairTM_emit1]
+      rw [Drun_add_eq]
+      rw [Drun_DVarNodePairTM_copy_false']
+      rw [Drun_add_eq]
+      rw [Drun_DVarNodePairTM_rewind_false'
+        (zs := zs)
+        (out := [true, false, true, true, false, true, false, false] ++
+          List.replicate i true ++ [false] ++ [false, false] ++ zs) (i := i)
+        (f := fun _ : Nat => false) (wh := 0) (by simp)]
+      rw [Drun_add_eq]
+      rw [Drun_DVarNodePairTM_prefix2]
+      rw [Drun_add_eq]
+      rw [Drun_DVarNodePairTM_scan2_trues']
+      rw [Drun_add_eq]
+      rw [Drun_DVarNodePairTM_emit2]
+      rw [Drun_DVarNodePairTM_copy2_false']
+      simp [Dhalted, DVarNodePairTM, DVarNodePairState.done,
+        varNodeConstraintEncodeFromPair, Formula.pairOrNotVarVarEncode,
+        Formula.pairVarNotVarEncode, insertVarTagTotal, insertNotVarTagTotal,
+        insertVarTagTotal_replicate_true, insertNotVarTagTotal_replicate_true,
+        insertVarTagTotal_replicate_true_false, insertNotVarTagTotal_replicate_true_false,
+        List.append_assoc]
+
+set_option maxHeartbeats 0 in
+theorem dPolyTimeComputable_varNodeConstraintEncodeFromPair :
+    DPolyTimeComputable varNodeConstraintEncodeFromPair := by
+  refine ⟨DVarNodePairState, inferInstance, inferInstance, DVarNodePairTM,
+    (C 27 + 3 * X : TimeBound), (C 18 + 2 * X : TimeBound), ?_, ?_⟩
+  · intro z
+    rcases DVarNodePairTM_full z with ⟨s, hs, hh, hout⟩
+    simp only [Polynomial.eval_add, Polynomial.eval_mul, Polynomial.eval_X, Polynomial.eval_C]
+    rw [Drun_eq_of_halted_within DVarNodePairTM (Dinit DVarNodePairTM z)
+      (by simpa [Nat.mul_comm, Nat.add_comm, Nat.add_left_comm] using hs) hh]
+    exact hh
+  · intro z
+    rcases DVarNodePairTM_full z with ⟨s, hs, hh, hout⟩
+    constructor
+    · simp only [Polynomial.eval_add, Polynomial.eval_mul, Polynomial.eval_X, Polynomial.eval_C]
+      dsimp [Dboutput]
+      rw [Drun_eq_of_halted_within DVarNodePairTM (Dinit DVarNodePairTM z)
+        (by simpa [Nat.mul_comm, Nat.add_comm, Nat.add_left_comm] using hs) hh]
+      exact hout
+    · simp [varNodeConstraintEncodeFromPair, Formula.pairOrNotVarVarEncode,
+        Formula.pairVarNotVarEncode, insertVarTagTotal_length,
+        insertNotVarTagTotal_length, Nat.mul_comm, Nat.add_comm, Nat.add_left_comm]
+      omega
+
+set_option linter.unusedSimpArgs true
+
+theorem varNodeConstraintDTMObligation_proved : varNodeConstraintDTMObligation :=
+  dPolyTimeComputable_varNodeConstraintEncodeFromPair
+
+-- ---------------------------------------------------------------------------
+-- A concrete DTM for the negation-node constraint encoder
+-- ---------------------------------------------------------------------------
+
+abbrev DNotNodePairState := Fin 30
+
+namespace DNotNodePairState
+
+def start0 : DNotNodePairState := ⟨0, by decide⟩
+def start1 : DNotNodePairState := ⟨1, by decide⟩
+def scan1 : DNotNodePairState := ⟨2, by decide⟩
+def emit1a : DNotNodePairState := ⟨3, by decide⟩
+def emit1b : DNotNodePairState := ⟨4, by decide⟩
+def copy1 : DNotNodePairState := ⟨5, by decide⟩
+def rewind : DNotNodePairState := ⟨6, by decide⟩
+def start2 : DNotNodePairState := ⟨7, by decide⟩
+def scan2 : DNotNodePairState := ⟨8, by decide⟩
+def emit2a : DNotNodePairState := ⟨9, by decide⟩
+def emit2b : DNotNodePairState := ⟨10, by decide⟩
+def emit2c : DNotNodePairState := ⟨11, by decide⟩
+def emit2d : DNotNodePairState := ⟨12, by decide⟩
+def copy2 : DNotNodePairState := ⟨13, by decide⟩
+def done : DNotNodePairState := ⟨14, by decide⟩
+def reject : DNotNodePairState := ⟨15, by decide⟩
+
+def p0 : DNotNodePairState := ⟨16, by decide⟩
+def p1 : DNotNodePairState := ⟨17, by decide⟩
+def p2 : DNotNodePairState := ⟨18, by decide⟩
+def p3 : DNotNodePairState := ⟨19, by decide⟩
+def p4 : DNotNodePairState := ⟨20, by decide⟩
+def p5 : DNotNodePairState := ⟨21, by decide⟩
+def p6 : DNotNodePairState := ⟨22, by decide⟩
+def p7 : DNotNodePairState := ⟨23, by decide⟩
+def q0 : DNotNodePairState := ⟨24, by decide⟩
+def q1 : DNotNodePairState := ⟨25, by decide⟩
+def q2 : DNotNodePairState := ⟨26, by decide⟩
+def q3 : DNotNodePairState := ⟨27, by decide⟩
+def r0 : DNotNodePairState := ⟨28, by decide⟩
+def r1 : DNotNodePairState := ⟨29, by decide⟩
+
+attribute [simp] DNotNodePairState.p0 DNotNodePairState.p1 DNotNodePairState.p2
+  DNotNodePairState.p3 DNotNodePairState.p4 DNotNodePairState.p5
+  DNotNodePairState.p6 DNotNodePairState.p7 DNotNodePairState.q0
+  DNotNodePairState.q1 DNotNodePairState.q2 DNotNodePairState.q3
+  DNotNodePairState.r0 DNotNodePairState.r1
+
+end DNotNodePairState
+
+/-- Emit the full Tseitin negation-node constraint: the constant prefixes of
+    both pair encoders, then the two insertions into the input. -/
+def DNotNodePairTM : DTM DNotNodePairState where
+  step := fun q sym work =>
+    if q = DNotNodePairState.start0 then
+      { next := DNotNodePairState.p0, output := some true, inputMove := none
+        workWrite := none, workMove := none }
+    else if q = DNotNodePairState.p0 then
+      { next := DNotNodePairState.p1, output := some false, inputMove := none
+        workWrite := none, workMove := none }
+    else if q = DNotNodePairState.p1 then
+      { next := DNotNodePairState.p2, output := some true, inputMove := none
+        workWrite := none, workMove := none }
+    else if q = DNotNodePairState.p2 then
+      { next := DNotNodePairState.p3, output := some true, inputMove := none
+        workWrite := none, workMove := none }
+    else if q = DNotNodePairState.p3 then
+      { next := DNotNodePairState.p4, output := some false, inputMove := none
+        workWrite := none, workMove := none }
+    else if q = DNotNodePairState.p4 then
+      { next := DNotNodePairState.p5, output := some true, inputMove := none
+        workWrite := none, workMove := none }
+    else if q = DNotNodePairState.p5 then
+      { next := DNotNodePairState.p6, output := some false, inputMove := none
+        workWrite := none, workMove := none }
+    else if q = DNotNodePairState.p6 then
+      { next := DNotNodePairState.p7, output := some false, inputMove := none
+        workWrite := none, workMove := none }
+    else if q = DNotNodePairState.p7 then
+      { next := DNotNodePairState.scan1, output := none, inputMove := some true
+        workWrite := none, workMove := none }
+    else if q = DNotNodePairState.scan1 then
+      match sym with
+      | some true =>
+          { next := DNotNodePairState.scan1, output := some true, inputMove := some true
+            workWrite := none, workMove := none }
+      | some false =>
+          { next := DNotNodePairState.emit1a, output := some false, inputMove := some true
+            workWrite := none, workMove := none }
+      | none =>
+          { next := DNotNodePairState.emit1a, output := none, inputMove := none
+            workWrite := none, workMove := none }
+    else if q = DNotNodePairState.emit1a then
+      { next := DNotNodePairState.emit1b, output := some false, inputMove := none
+        workWrite := none, workMove := none }
+    else if q = DNotNodePairState.emit1b then
+      { next := DNotNodePairState.r0, output := some true, inputMove := none
+        workWrite := none, workMove := none }
+    else if q = DNotNodePairState.r0 then
+      { next := DNotNodePairState.r1, output := some false, inputMove := none
+        workWrite := none, workMove := none }
+    else if q = DNotNodePairState.r1 then
+      { next := DNotNodePairState.copy1, output := some false, inputMove := none
+        workWrite := none, workMove := none }
+    else if q = DNotNodePairState.copy1 then
+      match sym with
+      | some b =>
+          { next := DNotNodePairState.copy1, output := some b, inputMove := some true
+            workWrite := none, workMove := none }
+      | none =>
+          { next := DNotNodePairState.rewind, output := none, inputMove := none
+            workWrite := none, workMove := none }
+    else if q = DNotNodePairState.rewind then
+      match sym with
+      | some _ =>
+          { next := DNotNodePairState.rewind, output := none, inputMove := some false
+            workWrite := none, workMove := none }
+      | none =>
+          if work then
+            { next := DNotNodePairState.q0, output := none, inputMove := none
+              workWrite := none, workMove := none }
+          else
+            { next := DNotNodePairState.rewind, output := none, inputMove := some false
+              workWrite := some true, workMove := none }
+    else if q = DNotNodePairState.start2 then
+      { next := DNotNodePairState.scan2, output := none, inputMove := some true
+        workWrite := none, workMove := none }
+    else if q = DNotNodePairState.scan2 then
+      match sym with
+      | some true =>
+          { next := DNotNodePairState.scan2, output := some true, inputMove := some true
+            workWrite := none, workMove := none }
+      | some false =>
+          { next := DNotNodePairState.emit2a, output := some false, inputMove := some true
+            workWrite := none, workMove := none }
+      | none =>
+          { next := DNotNodePairState.emit2a, output := none, inputMove := none
+            workWrite := none, workMove := none }
+    else if q = DNotNodePairState.q0 then
+      { next := DNotNodePairState.q1, output := some true, inputMove := none
+        workWrite := none, workMove := none }
+    else if q = DNotNodePairState.q1 then
+      { next := DNotNodePairState.q2, output := some true, inputMove := none
+        workWrite := none, workMove := none }
+    else if q = DNotNodePairState.q2 then
+      { next := DNotNodePairState.q3, output := some false, inputMove := none
+        workWrite := none, workMove := none }
+    else if q = DNotNodePairState.q3 then
+      { next := DNotNodePairState.scan2, output := some false, inputMove := some true
+        workWrite := none, workMove := none }
+    else if q = DNotNodePairState.emit2a then
+      { next := DNotNodePairState.emit2b, output := some false, inputMove := none
+        workWrite := none, workMove := none }
+    else if q = DNotNodePairState.emit2b then
+      { next := DNotNodePairState.copy2, output := some false, inputMove := none
+        workWrite := none, workMove := none }
+    else if q = DNotNodePairState.emit2c then
+      { next := DNotNodePairState.emit2d, output := some false, inputMove := none
+        workWrite := none, workMove := none }
+    else if q = DNotNodePairState.emit2d then
+      { next := DNotNodePairState.copy2, output := some false, inputMove := none
+        workWrite := none, workMove := none }
+    else if q = DNotNodePairState.copy2 then
+      match sym with
+      | some b =>
+          { next := DNotNodePairState.copy2, output := some b, inputMove := some true
+            workWrite := none, workMove := none }
+      | none =>
+          { next := DNotNodePairState.done, output := none, inputMove := none
+            workWrite := none, workMove := none }
+    else
+      { next := q, output := none, inputMove := none
+        workWrite := none, workMove := none }
+  start := DNotNodePairState.start0
+  accept := DNotNodePairState.done
+  reject := DNotNodePairState.reject
+
+lemma Drun_DNotNodePairTM_start (z : Word) :
+    Drun DNotNodePairTM 9 (Dinit DNotNodePairTM z) =
+      { state := DNotNodePairState.scan1, input := z, head := 1,
+        output := [true, false, true, true, false, true, false, false],
+        work := fun _ : Nat => false, workHead := 0 } := by
+  simp [Drun, Dhalted, Dinit, Dstep, Dread, DNotNodePairTM, Dmove,
+    DNotNodePairState.start0, DNotNodePairState.start1, DNotNodePairState.scan1,
+    DNotNodePairState.emit1a, DNotNodePairState.emit1b, DNotNodePairState.copy1,
+    DNotNodePairState.rewind, DNotNodePairState.start2, DNotNodePairState.scan2,
+    DNotNodePairState.emit2a, DNotNodePairState.emit2b, DNotNodePairState.emit2c,
+    DNotNodePairState.emit2d, DNotNodePairState.copy2, DNotNodePairState.done,
+    DNotNodePairState.reject]
+
+lemma Drun_DNotNodePairTM_scan1_trues (pre zs out : Word) (i : Nat)
+    (wk : Nat → Bool) (wh : Nat) :
+    Drun DNotNodePairTM (i + 1)
+      { state := DNotNodePairState.scan1,
+        input := pre ++ List.replicate i true ++ false :: zs,
+        head := pre.length + 1, output := out, work := wk, workHead := wh } =
+      { state := DNotNodePairState.emit1a,
+        input := pre ++ List.replicate i true ++ false :: zs,
+        head := pre.length + i + 2,
+        output := out ++ List.replicate i true ++ [false],
+        work := wk, workHead := wh } := by
+  induction i generalizing pre out with
+  | zero =>
+      simp [Drun, Dhalted, Dstep, Dread, DNotNodePairTM, Dmove,
+        DNotNodePairState.start0, DNotNodePairState.start1, DNotNodePairState.scan1,
+        DNotNodePairState.emit1a, DNotNodePairState.emit1b, DNotNodePairState.copy1,
+        DNotNodePairState.rewind, DNotNodePairState.start2, DNotNodePairState.scan2,
+        DNotNodePairState.emit2a, DNotNodePairState.emit2b, DNotNodePairState.emit2c,
+        DNotNodePairState.emit2d, DNotNodePairState.copy2, DNotNodePairState.done,
+        DNotNodePairState.reject]
+  | succ i ih =>
+      rw [show i.succ + 1 = 1 + (i + 1) by omega, Drun_add_eq]
+      let c : DConfig DNotNodePairState :=
+        { state := DNotNodePairState.scan1,
+          input := pre ++ List.replicate i.succ true ++ false :: zs,
+          head := pre.length + 1, output := out, work := wk, workHead := wh }
+      let c' : DConfig DNotNodePairState :=
+        { state := DNotNodePairState.scan1,
+          input := pre ++ List.replicate i.succ true ++ false :: zs,
+          head := pre.length + 2, output := out ++ [true], work := wk, workHead := wh }
+      have hstep : Drun DNotNodePairTM 1 c = c' := by
+        simp [c, c', Drun, Dhalted, Dstep, Dread, DNotNodePairTM, Dmove,
+          List.replicate_succ, DNotNodePairState.start0, DNotNodePairState.start1,
+          DNotNodePairState.scan1, DNotNodePairState.emit1a,
+          DNotNodePairState.emit1b, DNotNodePairState.copy1,
+          DNotNodePairState.rewind, DNotNodePairState.start2,
+          DNotNodePairState.scan2, DNotNodePairState.emit2a,
+          DNotNodePairState.emit2b, DNotNodePairState.emit2c,
+          DNotNodePairState.emit2d, DNotNodePairState.copy2,
+          DNotNodePairState.done, DNotNodePairState.reject]
+      change Drun DNotNodePairTM (i + 1) (Drun DNotNodePairTM 1 c) = _
+      rw [hstep]
+      simpa [c', List.replicate_succ, List.append_assoc, Nat.add_assoc,
+        Nat.add_comm, Nat.add_left_comm] using ih (pre := pre ++ [true]) (out := out ++ [true])
+
+lemma Drun_DNotNodePairTM_scan1_all_true (pre out : Word) (i : Nat)
+    (wk : Nat → Bool) (wh : Nat) :
+    Drun DNotNodePairTM (i + 1)
+      { state := DNotNodePairState.scan1, input := pre ++ List.replicate i true,
+        head := pre.length + 1, output := out, work := wk, workHead := wh } =
+      { state := DNotNodePairState.emit1a,
+        input := pre ++ List.replicate i true,
+        head := pre.length + i + 1, output := out ++ List.replicate i true,
+        work := wk, workHead := wh } := by
+  induction i generalizing pre out with
+  | zero =>
+      simp [Drun, Dhalted, Dstep, Dread, DNotNodePairTM, Dmove,
+        DNotNodePairState.start0, DNotNodePairState.start1, DNotNodePairState.scan1,
+        DNotNodePairState.emit1a, DNotNodePairState.emit1b, DNotNodePairState.copy1,
+        DNotNodePairState.rewind, DNotNodePairState.start2, DNotNodePairState.scan2,
+        DNotNodePairState.emit2a, DNotNodePairState.emit2b, DNotNodePairState.emit2c,
+        DNotNodePairState.emit2d, DNotNodePairState.copy2, DNotNodePairState.done,
+        DNotNodePairState.reject]
+  | succ i ih =>
+      rw [show i.succ + 1 = 1 + (i + 1) by omega, Drun_add_eq]
+      let c : DConfig DNotNodePairState :=
+        { state := DNotNodePairState.scan1,
+          input := pre ++ List.replicate i.succ true,
+          head := pre.length + 1, output := out, work := wk, workHead := wh }
+      let c' : DConfig DNotNodePairState :=
+        { state := DNotNodePairState.scan1,
+          input := pre ++ List.replicate i.succ true,
+          head := pre.length + 2, output := out ++ [true], work := wk, workHead := wh }
+      have hstep : Drun DNotNodePairTM 1 c = c' := by
+        simp [c, c', Drun, Dhalted, Dstep, Dread, DNotNodePairTM, Dmove,
+          List.replicate_succ, DNotNodePairState.start0, DNotNodePairState.start1,
+          DNotNodePairState.scan1, DNotNodePairState.emit1a,
+          DNotNodePairState.emit1b, DNotNodePairState.copy1,
+          DNotNodePairState.rewind, DNotNodePairState.start2,
+          DNotNodePairState.scan2, DNotNodePairState.emit2a,
+          DNotNodePairState.emit2b, DNotNodePairState.emit2c,
+          DNotNodePairState.emit2d, DNotNodePairState.copy2,
+          DNotNodePairState.done, DNotNodePairState.reject]
+      change Drun DNotNodePairTM (i + 1) (Drun DNotNodePairTM 1 c) = _
+      rw [hstep]
+      simpa [c', List.replicate_succ, List.append_assoc, Nat.add_assoc,
+        Nat.add_comm, Nat.add_left_comm] using ih (pre := pre ++ [true]) (out := out ++ [true])
+
+lemma Drun_DNotNodePairTM_scan1_trues' (zs out : Word) (i : Nat)
+    (wk : Nat → Bool) (wh : Nat) :
+    Drun DNotNodePairTM (i + 1)
+      { state := DNotNodePairState.scan1,
+        input := List.replicate i true ++ false :: zs,
+        head := 1, output := out, work := wk, workHead := wh } =
+      { state := DNotNodePairState.emit1a,
+        input := List.replicate i true ++ false :: zs,
+        head := i + 2, output := out ++ List.replicate i true ++ [false],
+        work := wk, workHead := wh } := by
+  simpa using Drun_DNotNodePairTM_scan1_trues
+    (pre := []) (zs := zs) (out := out) (i := i) wk wh
+
+lemma Drun_DNotNodePairTM_scan1_all_true' (out : Word) (i : Nat)
+    (wk : Nat → Bool) (wh : Nat) :
+    Drun DNotNodePairTM (i + 1)
+      { state := DNotNodePairState.scan1,
+        input := List.replicate i true,
+        head := 1, output := out, work := wk, workHead := wh } =
+      { state := DNotNodePairState.emit1a,
+        input := List.replicate i true,
+        head := i + 1, output := out ++ List.replicate i true,
+        work := wk, workHead := wh } := by
+  simpa using Drun_DNotNodePairTM_scan1_all_true
+    (pre := []) (out := out) (i := i) wk wh
+
+lemma Drun_DNotNodePairTM_copy (skipped rest out : Word)
+    (wk : Nat → Bool) (wh : Nat) :
+    Drun DNotNodePairTM (rest.length + 1)
+      { state := DNotNodePairState.copy1, input := skipped ++ rest,
+        head := skipped.length + 1, output := out, work := wk, workHead := wh } =
+      { state := DNotNodePairState.rewind, input := skipped ++ rest,
+        head := skipped.length + rest.length + 1, output := out ++ rest,
+        work := wk, workHead := wh } := by
+  induction rest generalizing skipped out with
+  | nil =>
+      simp [Drun, Dhalted, Dstep, Dread, DNotNodePairTM, Dmove,
+        DNotNodePairState.start0, DNotNodePairState.start1, DNotNodePairState.scan1,
+    DNotNodePairState.emit1a, DNotNodePairState.emit1b, DNotNodePairState.copy1,
+    DNotNodePairState.rewind, DNotNodePairState.start2, DNotNodePairState.scan2,
+    DNotNodePairState.emit2a, DNotNodePairState.emit2b, DNotNodePairState.emit2c,
+    DNotNodePairState.emit2d, DNotNodePairState.copy2, DNotNodePairState.done,
+    DNotNodePairState.reject]
+  | cons b bs ih =>
+      rw [show (b :: bs).length + 1 = 1 + (bs.length + 1) by
+        simp [Nat.add_comm, Nat.add_left_comm], Drun_add_eq]
+      let c : DConfig DNotNodePairState :=
+        { state := DNotNodePairState.copy1, input := skipped ++ b :: bs,
+          head := skipped.length + 1, output := out, work := wk, workHead := wh }
+      let c' : DConfig DNotNodePairState :=
+        { state := DNotNodePairState.copy1, input := skipped ++ b :: bs,
+          head := skipped.length + 2, output := out ++ [b], work := wk, workHead := wh }
+      have hstep : Drun DNotNodePairTM 1 c = c' := by
+        simp [c, c', Drun, Dhalted, Dstep, Dread, DNotNodePairTM, Dmove,
+          DNotNodePairState.start0, DNotNodePairState.start1, DNotNodePairState.scan1,
+    DNotNodePairState.emit1a, DNotNodePairState.emit1b, DNotNodePairState.copy1,
+    DNotNodePairState.rewind, DNotNodePairState.start2, DNotNodePairState.scan2,
+    DNotNodePairState.emit2a, DNotNodePairState.emit2b, DNotNodePairState.emit2c,
+    DNotNodePairState.emit2d, DNotNodePairState.copy2, DNotNodePairState.done,
+    DNotNodePairState.reject]
+      change Drun DNotNodePairTM (bs.length + 1) (Drun DNotNodePairTM 1 c) = _
+      rw [hstep]
+      simpa [c', List.append_assoc, Nat.add_assoc, Nat.add_comm, Nat.add_left_comm]
+        using ih (skipped := skipped ++ [b]) (out := out ++ [b])
+
+lemma Drun_DNotNodePairTM_copy_all_true' (out : Word) (i : Nat)
+    (wk : Nat → Bool) (wh : Nat) :
+    Drun DNotNodePairTM 1
+      { state := DNotNodePairState.copy1, input := List.replicate i true,
+        head := i + 1, output := out, work := wk, workHead := wh } =
+      { state := DNotNodePairState.rewind, input := List.replicate i true,
+        head := i + 1, output := out, work := wk, workHead := wh } := by
+  simpa using Drun_DNotNodePairTM_copy (skipped := List.replicate i true)
+    (rest := []) (out := out) wk wh
+
+lemma Drun_DNotNodePairTM_copy_false' (zs out : Word) (i : Nat)
+    (wk : Nat → Bool) (wh : Nat) :
+    Drun DNotNodePairTM (zs.length + 1)
+      { state := DNotNodePairState.copy1,
+        input := List.replicate i true ++ false :: zs,
+        head := i + 2, output := out, work := wk, workHead := wh } =
+      { state := DNotNodePairState.rewind,
+        input := List.replicate i true ++ false :: zs,
+        head := i + zs.length + 2, output := out ++ zs,
+        work := wk, workHead := wh } := by
+  simpa [List.append_assoc, Nat.add_assoc, Nat.add_comm, Nat.add_left_comm] using
+    Drun_DNotNodePairTM_copy (skipped := List.replicate i true ++ [false])
+      (rest := zs) (out := out) wk wh
+
+lemma Drun_DNotNodePairTM_rewind_at (z out : Word) (f : Nat → Bool) (wh : Nat)
+    (hf : f wh = true) (n : Nat) (hn : n ≤ z.length) :
+    Drun DNotNodePairTM (n + 1)
+      { state := DNotNodePairState.rewind, input := z, head := n,
+        output := out, work := f, workHead := wh } =
+      { state := DNotNodePairState.q0, input := z, head := 0,
+        output := out, work := f, workHead := wh } := by
+  induction n with
+  | zero =>
+      simp [Drun, Dhalted, Dstep, Dread, DNotNodePairTM, Dmove, hf,
+        DNotNodePairState.start0, DNotNodePairState.start1, DNotNodePairState.scan1,
+        DNotNodePairState.emit1a, DNotNodePairState.emit1b, DNotNodePairState.copy1,
+        DNotNodePairState.rewind, DNotNodePairState.q0, DNotNodePairState.scan2,
+        DNotNodePairState.emit2a, DNotNodePairState.emit2b, DNotNodePairState.emit2c,
+        DNotNodePairState.emit2d, DNotNodePairState.copy2, DNotNodePairState.done,
+        DNotNodePairState.reject]
+  | succ n ih =>
+      have hlt : n < z.length := by omega
+      let c : DConfig DNotNodePairState :=
+        { state := DNotNodePairState.rewind, input := z, head := n.succ,
+          output := out, work := f, workHead := wh }
+      let c' : DConfig DNotNodePairState :=
+        { state := DNotNodePairState.rewind, input := z, head := n,
+          output := out, work := f, workHead := wh }
+      have hread : Dread c = some z[n] := by
+        simp [c, Dread, Nat.succ_ne_zero, List.getElem?_eq_getElem hlt]
+      have hstep : Drun DNotNodePairTM 1 c = c' := by
+        simp [c, c', Drun, Dhalted, Dstep, Dread, List.getElem?_eq_getElem hlt,
+          DNotNodePairTM, Dmove,
+          DNotNodePairState.start0, DNotNodePairState.start1, DNotNodePairState.scan1,
+        DNotNodePairState.emit1a, DNotNodePairState.emit1b, DNotNodePairState.copy1,
+        DNotNodePairState.rewind, DNotNodePairState.q0, DNotNodePairState.scan2,
+        DNotNodePairState.emit2a, DNotNodePairState.emit2b, DNotNodePairState.emit2c,
+        DNotNodePairState.emit2d, DNotNodePairState.copy2, DNotNodePairState.done,
+        DNotNodePairState.reject]
+      rw [show n.succ + 1 = 1 + (n + 1) by omega, Drun_add_eq]
+      change Drun DNotNodePairTM (n + 1) (Drun DNotNodePairTM 1 c) = _
+      rw [hstep]
+      simpa [c'] using ih (by omega)
+
+lemma Drun_DNotNodePairTM_rewind (z out : Word) (f : Nat → Bool) (wh : Nat)
+    (hf : f wh = false) :
+    Drun DNotNodePairTM (z.length + 2)
+      { state := DNotNodePairState.rewind, input := z, head := z.length + 1,
+        output := out, work := f, workHead := wh } =
+      { state := DNotNodePairState.q0, input := z, head := 0,
+        output := out, work := DwriteWork f wh (some true), workHead := wh } := by
+  rw [show z.length + 2 = 1 + (z.length + 1) by omega, Drun_add_eq]
+  let c : DConfig DNotNodePairState :=
+    { state := DNotNodePairState.rewind, input := z, head := z.length + 1,
+      output := out, work := f, workHead := wh }
+  let c' : DConfig DNotNodePairState :=
+    { state := DNotNodePairState.rewind, input := z, head := z.length,
+      output := out, work := DwriteWork f wh (some true), workHead := wh }
+  have hstep : Drun DNotNodePairTM 1 c = c' := by
+    simp [c, c', Drun, Dhalted, Dstep, Dread, DNotNodePairTM, Dmove, hf,
+      DNotNodePairState.start0, DNotNodePairState.start1, DNotNodePairState.scan1,
+      DNotNodePairState.emit1a, DNotNodePairState.emit1b, DNotNodePairState.copy1,
+      DNotNodePairState.rewind, DNotNodePairState.q0, DNotNodePairState.scan2,
+      DNotNodePairState.emit2a, DNotNodePairState.emit2b, DNotNodePairState.emit2c,
+      DNotNodePairState.emit2d, DNotNodePairState.copy2, DNotNodePairState.done,
+      DNotNodePairState.reject, DwriteWork]
+  change Drun DNotNodePairTM (z.length + 1) (Drun DNotNodePairTM 1 c) = _
+  rw [hstep]
+  simpa [c'] using Drun_DNotNodePairTM_rewind_at z out
+    (DwriteWork f wh (some true)) wh (by simp [DwriteWork, hf]) z.length le_rfl
+
+lemma Drun_DNotNodePairTM_rewind_all_true' (out : Word) (i : Nat)
+    (f : Nat → Bool) (wh : Nat) (hf : f wh = false) :
+    Drun DNotNodePairTM (i + 2)
+      { state := DNotNodePairState.rewind, input := List.replicate i true,
+        head := i + 1, output := out, work := f, workHead := wh } =
+      { state := DNotNodePairState.q0, input := List.replicate i true,
+        head := 0, output := out, work := DwriteWork f wh (some true),
+        workHead := wh } := by
+  simpa using Drun_DNotNodePairTM_rewind (z := List.replicate i true)
+    (out := out) f wh hf
+
+lemma Drun_DNotNodePairTM_rewind_false' (zs out : Word) (i : Nat)
+    (f : Nat → Bool) (wh : Nat) (hf : f wh = false) :
+    Drun DNotNodePairTM (i + zs.length + 3)
+      { state := DNotNodePairState.rewind,
+        input := List.replicate i true ++ false :: zs,
+        head := i + zs.length + 2, output := out, work := f, workHead := wh } =
+      { state := DNotNodePairState.q0,
+        input := List.replicate i true ++ false :: zs,
+        head := 0, output := out, work := DwriteWork f wh (some true),
+        workHead := wh } := by
+  simpa [Nat.add_assoc, Nat.add_comm, Nat.add_left_comm] using
+    Drun_DNotNodePairTM_rewind (z := List.replicate i true ++ false :: zs)
+      (out := out) f wh hf
+
+lemma Drun_DNotNodePairTM_start2 (z out : Word) (f : Nat → Bool) (wh : Nat) :
+    Drun DNotNodePairTM 1
+      { state := DNotNodePairState.start2, input := z, head := 0,
+        output := out, work := f, workHead := wh } =
+      { state := DNotNodePairState.scan2, input := z, head := 1,
+        output := out, work := f, workHead := wh } := by
+  simp [Drun, Dhalted, Dstep, Dread, DNotNodePairTM, Dmove,
+    DNotNodePairState.start0, DNotNodePairState.start1, DNotNodePairState.scan1,
+    DNotNodePairState.emit1a, DNotNodePairState.emit1b, DNotNodePairState.copy1,
+    DNotNodePairState.rewind, DNotNodePairState.start2, DNotNodePairState.scan2,
+    DNotNodePairState.emit2a, DNotNodePairState.emit2b, DNotNodePairState.emit2c,
+    DNotNodePairState.emit2d, DNotNodePairState.copy2, DNotNodePairState.done,
+    DNotNodePairState.reject]
+
+lemma Drun_DNotNodePairTM_scan2_trues (pre zs out : Word) (i : Nat)
+    (wk : Nat → Bool) (wh : Nat) :
+    Drun DNotNodePairTM (i + 1)
+      { state := DNotNodePairState.scan2,
+        input := pre ++ List.replicate i true ++ false :: zs,
+        head := pre.length + 1, output := out, work := wk, workHead := wh } =
+      { state := DNotNodePairState.emit2a,
+        input := pre ++ List.replicate i true ++ false :: zs,
+        head := pre.length + i + 2,
+        output := out ++ List.replicate i true ++ [false],
+        work := wk, workHead := wh } := by
+  induction i generalizing pre out with
+  | zero =>
+      simp [Drun, Dhalted, Dstep, Dread, DNotNodePairTM, Dmove,
+        DNotNodePairState.start0, DNotNodePairState.start1, DNotNodePairState.scan1,
+    DNotNodePairState.emit1a, DNotNodePairState.emit1b, DNotNodePairState.copy1,
+    DNotNodePairState.rewind, DNotNodePairState.start2, DNotNodePairState.scan2,
+    DNotNodePairState.emit2a, DNotNodePairState.emit2b, DNotNodePairState.emit2c,
+    DNotNodePairState.emit2d, DNotNodePairState.copy2, DNotNodePairState.done,
+    DNotNodePairState.reject]
+  | succ i ih =>
+      rw [show i.succ + 1 = 1 + (i + 1) by omega, Drun_add_eq]
+      let c : DConfig DNotNodePairState :=
+        { state := DNotNodePairState.scan2,
+          input := pre ++ List.replicate i.succ true ++ false :: zs,
+          head := pre.length + 1, output := out, work := wk, workHead := wh }
+      let c' : DConfig DNotNodePairState :=
+        { state := DNotNodePairState.scan2,
+          input := pre ++ List.replicate i.succ true ++ false :: zs,
+          head := pre.length + 2, output := out ++ [true], work := wk, workHead := wh }
+      have hstep : Drun DNotNodePairTM 1 c = c' := by
+        simp [c, c', Drun, Dhalted, Dstep, Dread, DNotNodePairTM, Dmove,
+          List.replicate_succ, DNotNodePairState.start0, DNotNodePairState.start1, DNotNodePairState.scan1,
+    DNotNodePairState.emit1a, DNotNodePairState.emit1b, DNotNodePairState.copy1,
+    DNotNodePairState.rewind, DNotNodePairState.start2, DNotNodePairState.scan2,
+    DNotNodePairState.emit2a, DNotNodePairState.emit2b, DNotNodePairState.emit2c,
+    DNotNodePairState.emit2d, DNotNodePairState.copy2, DNotNodePairState.done,
+    DNotNodePairState.reject]
+      change Drun DNotNodePairTM (i + 1) (Drun DNotNodePairTM 1 c) = _
+      rw [hstep]
+      simpa [c', List.replicate_succ, List.append_assoc, Nat.add_assoc,
+        Nat.add_comm, Nat.add_left_comm] using ih (pre := pre ++ [true]) (out := out ++ [true])
+
+lemma Drun_DNotNodePairTM_scan2_all_true (pre out : Word) (i : Nat)
+    (wk : Nat → Bool) (wh : Nat) :
+    Drun DNotNodePairTM (i + 1)
+      { state := DNotNodePairState.scan2, input := pre ++ List.replicate i true,
+        head := pre.length + 1, output := out, work := wk, workHead := wh } =
+      { state := DNotNodePairState.emit2a,
+        input := pre ++ List.replicate i true,
+        head := pre.length + i + 1, output := out ++ List.replicate i true,
+        work := wk, workHead := wh } := by
+  induction i generalizing pre out with
+  | zero =>
+      simp [Drun, Dhalted, Dstep, Dread, DNotNodePairTM, Dmove,
+        DNotNodePairState.start0, DNotNodePairState.start1, DNotNodePairState.scan1,
+    DNotNodePairState.emit1a, DNotNodePairState.emit1b, DNotNodePairState.copy1,
+    DNotNodePairState.rewind, DNotNodePairState.start2, DNotNodePairState.scan2,
+    DNotNodePairState.emit2a, DNotNodePairState.emit2b, DNotNodePairState.emit2c,
+    DNotNodePairState.emit2d, DNotNodePairState.copy2, DNotNodePairState.done,
+    DNotNodePairState.reject]
+  | succ i ih =>
+      rw [show i.succ + 1 = 1 + (i + 1) by omega, Drun_add_eq]
+      let c : DConfig DNotNodePairState :=
+        { state := DNotNodePairState.scan2,
+          input := pre ++ List.replicate i.succ true,
+          head := pre.length + 1, output := out, work := wk, workHead := wh }
+      let c' : DConfig DNotNodePairState :=
+        { state := DNotNodePairState.scan2,
+          input := pre ++ List.replicate i.succ true,
+          head := pre.length + 2, output := out ++ [true], work := wk, workHead := wh }
+      have hstep : Drun DNotNodePairTM 1 c = c' := by
+        simp [c, c', Drun, Dhalted, Dstep, Dread, DNotNodePairTM, Dmove,
+          List.replicate_succ, DNotNodePairState.start0, DNotNodePairState.start1, DNotNodePairState.scan1,
+    DNotNodePairState.emit1a, DNotNodePairState.emit1b, DNotNodePairState.copy1,
+    DNotNodePairState.rewind, DNotNodePairState.start2, DNotNodePairState.scan2,
+    DNotNodePairState.emit2a, DNotNodePairState.emit2b, DNotNodePairState.emit2c,
+    DNotNodePairState.emit2d, DNotNodePairState.copy2, DNotNodePairState.done,
+    DNotNodePairState.reject]
+      change Drun DNotNodePairTM (i + 1) (Drun DNotNodePairTM 1 c) = _
+      rw [hstep]
+      simpa [c', List.replicate_succ, List.append_assoc, Nat.add_assoc,
+        Nat.add_comm, Nat.add_left_comm] using ih (pre := pre ++ [true]) (out := out ++ [true])
+
+lemma Drun_DNotNodePairTM_scan2_trues' (zs out : Word) (i : Nat)
+    (wk : Nat → Bool) (wh : Nat) :
+    Drun DNotNodePairTM (i + 1)
+      { state := DNotNodePairState.scan2,
+        input := List.replicate i true ++ false :: zs,
+        head := 1, output := out, work := wk, workHead := wh } =
+      { state := DNotNodePairState.emit2a,
+        input := List.replicate i true ++ false :: zs,
+        head := i + 2, output := out ++ List.replicate i true ++ [false],
+        work := wk, workHead := wh } := by
+  simpa using Drun_DNotNodePairTM_scan2_trues
+    (pre := []) (zs := zs) (out := out) (i := i) wk wh
+
+lemma Drun_DNotNodePairTM_scan2_all_true' (out : Word) (i : Nat)
+    (wk : Nat → Bool) (wh : Nat) :
+    Drun DNotNodePairTM (i + 1)
+      { state := DNotNodePairState.scan2,
+        input := List.replicate i true,
+        head := 1, output := out, work := wk, workHead := wh } =
+      { state := DNotNodePairState.emit2a,
+        input := List.replicate i true,
+        head := i + 1, output := out ++ List.replicate i true,
+        work := wk, workHead := wh } := by
+  simpa using Drun_DNotNodePairTM_scan2_all_true
+    (pre := []) (out := out) (i := i) wk wh
+
+lemma Drun_DNotNodePairTM_copy2 (skipped rest out : Word)
+    (wk : Nat → Bool) (wh : Nat) :
+    Drun DNotNodePairTM (rest.length + 1)
+      { state := DNotNodePairState.copy2, input := skipped ++ rest,
+        head := skipped.length + 1, output := out, work := wk, workHead := wh } =
+      { state := DNotNodePairState.done, input := skipped ++ rest,
+        head := skipped.length + rest.length + 1, output := out ++ rest,
+        work := wk, workHead := wh } := by
+  induction rest generalizing skipped out with
+  | nil =>
+      simp [Drun, Dhalted, Dstep, Dread, DNotNodePairTM, Dmove,
+        DNotNodePairState.start0, DNotNodePairState.start1, DNotNodePairState.scan1,
+    DNotNodePairState.emit1a, DNotNodePairState.emit1b, DNotNodePairState.copy1,
+    DNotNodePairState.rewind, DNotNodePairState.start2, DNotNodePairState.scan2,
+    DNotNodePairState.emit2a, DNotNodePairState.emit2b, DNotNodePairState.emit2c,
+    DNotNodePairState.emit2d, DNotNodePairState.copy2, DNotNodePairState.done,
+    DNotNodePairState.reject]
+  | cons b bs ih =>
+      rw [show (b :: bs).length + 1 = 1 + (bs.length + 1) by
+        simp [Nat.add_comm, Nat.add_left_comm], Drun_add_eq]
+      let c : DConfig DNotNodePairState :=
+        { state := DNotNodePairState.copy2, input := skipped ++ b :: bs,
+          head := skipped.length + 1, output := out, work := wk, workHead := wh }
+      let c' : DConfig DNotNodePairState :=
+        { state := DNotNodePairState.copy2, input := skipped ++ b :: bs,
+          head := skipped.length + 2, output := out ++ [b], work := wk, workHead := wh }
+      have hstep : Drun DNotNodePairTM 1 c = c' := by
+        simp [c, c', Drun, Dhalted, Dstep, Dread, DNotNodePairTM, Dmove,
+          DNotNodePairState.start0, DNotNodePairState.start1, DNotNodePairState.scan1,
+    DNotNodePairState.emit1a, DNotNodePairState.emit1b, DNotNodePairState.copy1,
+    DNotNodePairState.rewind, DNotNodePairState.start2, DNotNodePairState.scan2,
+    DNotNodePairState.emit2a, DNotNodePairState.emit2b, DNotNodePairState.emit2c,
+    DNotNodePairState.emit2d, DNotNodePairState.copy2, DNotNodePairState.done,
+    DNotNodePairState.reject]
+      change Drun DNotNodePairTM (bs.length + 1) (Drun DNotNodePairTM 1 c) = _
+      rw [hstep]
+      simpa [c', List.append_assoc, Nat.add_assoc, Nat.add_comm, Nat.add_left_comm]
+        using ih (skipped := skipped ++ [b]) (out := out ++ [b])
+
+lemma Drun_DNotNodePairTM_prefix2 (z out : Word) (h : Nat)
+    (wk : Nat → Bool) (wh : Nat) :
+    Drun DNotNodePairTM 4
+      { state := DNotNodePairState.q0, input := z, head := h,
+        output := out, work := wk, workHead := wh } =
+      { state := DNotNodePairState.scan2, input := z, head := h + 1,
+        output := out ++ [true, true, false, false], work := wk, workHead := wh } := by
+  simp [Drun, Dhalted, Dstep, Dread, DNotNodePairTM, Dmove,
+    DNotNodePairState.start0, DNotNodePairState.start1, DNotNodePairState.scan1,
+    DNotNodePairState.emit1a, DNotNodePairState.emit1b, DNotNodePairState.copy1,
+    DNotNodePairState.rewind, DNotNodePairState.start2, DNotNodePairState.scan2,
+    DNotNodePairState.emit2a, DNotNodePairState.emit2b, DNotNodePairState.emit2c,
+    DNotNodePairState.emit2d, DNotNodePairState.copy2, DNotNodePairState.done,
+    DNotNodePairState.reject]
+
+lemma Drun_DNotNodePairTM_emit1 (z out : Word) (h : Nat)
+    (wk : Nat → Bool) (wh : Nat) :
+    Drun DNotNodePairTM 4
+      { state := DNotNodePairState.emit1a, input := z, head := h,
+        output := out, work := wk, workHead := wh } =
+      { state := DNotNodePairState.copy1, input := z, head := h,
+        output := out ++ [false, true, false, false], work := wk, workHead := wh } := by
+  simp [Drun, Dhalted, Dstep, Dread, DNotNodePairTM,
+    DNotNodePairState.start0, DNotNodePairState.start1, DNotNodePairState.scan1,
+    DNotNodePairState.emit1a, DNotNodePairState.emit1b, DNotNodePairState.copy1,
+    DNotNodePairState.rewind, DNotNodePairState.start2, DNotNodePairState.scan2,
+    DNotNodePairState.emit2a, DNotNodePairState.emit2b, DNotNodePairState.emit2c,
+    DNotNodePairState.emit2d, DNotNodePairState.copy2, DNotNodePairState.done,
+    DNotNodePairState.reject]
+
+lemma Drun_DNotNodePairTM_emit2 (z out : Word) (h : Nat)
+    (wk : Nat → Bool) (wh : Nat) :
+    Drun DNotNodePairTM 2
+      { state := DNotNodePairState.emit2a, input := z, head := h,
+        output := out, work := wk, workHead := wh } =
+      { state := DNotNodePairState.copy2, input := z, head := h,
+        output := out ++ [false, false], work := wk, workHead := wh } := by
+  simp [Drun, Dhalted, Dstep, Dread, DNotNodePairTM,
+    DNotNodePairState.start0, DNotNodePairState.start1, DNotNodePairState.scan1,
+    DNotNodePairState.emit1a, DNotNodePairState.emit1b, DNotNodePairState.copy1,
+    DNotNodePairState.rewind, DNotNodePairState.start2, DNotNodePairState.scan2,
+    DNotNodePairState.emit2a, DNotNodePairState.emit2b, DNotNodePairState.emit2c,
+    DNotNodePairState.emit2d, DNotNodePairState.copy2, DNotNodePairState.done,
+    DNotNodePairState.reject]
+
+lemma Drun_DNotNodePairTM_copy2_all_true' (out : Word) (i : Nat)
+    (wk : Nat → Bool) (wh : Nat) :
+    Drun DNotNodePairTM 1
+      { state := DNotNodePairState.copy2, input := List.replicate i true,
+        head := i + 1, output := out, work := wk, workHead := wh } =
+      { state := DNotNodePairState.done, input := List.replicate i true,
+        head := i + 1, output := out, work := wk, workHead := wh } := by
+  simpa using Drun_DNotNodePairTM_copy2 (skipped := List.replicate i true)
+    (rest := []) (out := out) wk wh
+
+lemma Drun_DNotNodePairTM_copy2_false' (zs out : Word) (i : Nat)
+    (wk : Nat → Bool) (wh : Nat) :
+    Drun DNotNodePairTM (zs.length + 1)
+      { state := DNotNodePairState.copy2,
+        input := List.replicate i true ++ false :: zs,
+        head := i + 2, output := out, work := wk, workHead := wh } =
+      { state := DNotNodePairState.done,
+        input := List.replicate i true ++ false :: zs,
+        head := i + zs.length + 2, output := out ++ zs,
+        work := wk, workHead := wh } := by
+  simpa [List.append_assoc, Nat.add_assoc, Nat.add_comm, Nat.add_left_comm] using
+    Drun_DNotNodePairTM_copy2 (skipped := List.replicate i true ++ [false])
+      (rest := zs) (out := out) wk wh
+
+lemma DNotNodePairTM_full (z : Word) :
+    ∃ s : Nat, s ≤ 3 * z.length + 27 ∧
+      Dhalted DNotNodePairTM (Drun DNotNodePairTM s (Dinit DNotNodePairTM z)) = true ∧
+      (Drun DNotNodePairTM s (Dinit DNotNodePairTM z)).output =
+        notNodeConstraintEncodeFromPair z := by
+  rcases word_eq_replicate_true_append z with ⟨i, y, hzy, hy⟩
+  subst z
+  rcases hy with rfl | ⟨zs, rfl⟩
+  · refine ⟨3 * i + 25, by simp, ?_, ?_⟩
+    all_goals
+      rw [show 3 * i + 25 =
+          9 + ((i + 1) + (4 + (1 + (i + 2 + (4 + ((i + 1) + (2 + 1))))))) by omega]
+      rw [Drun_add_eq]
+      rw [Drun_DNotNodePairTM_start]
+      rw [Drun_add_eq]
+      simp only [List.append_nil]
+      rw [Drun_DNotNodePairTM_scan1_all_true'
+        (out := [true, false, true, true, false, true, false, false]) (i := i)
+        (wk := fun _ : Nat => false) (wh := 0)]
+      rw [Drun_add_eq]
+      rw [Drun_DNotNodePairTM_emit1]
+      rw [Drun_add_eq]
+      rw [Drun_DNotNodePairTM_copy_all_true']
+      rw [Drun_add_eq]
+      rw [Drun_DNotNodePairTM_rewind_all_true'
+        (out := [true, false, true, true, false, true, false, false] ++
+          List.replicate i true ++ [false, true, false, false]) (i := i)
+        (f := fun _ : Nat => false) (wh := 0) (by simp)]
+      rw [Drun_add_eq]
+      rw [Drun_DNotNodePairTM_prefix2]
+      rw [Drun_add_eq]
+      rw [Drun_DNotNodePairTM_scan2_all_true']
+      rw [Drun_add_eq]
+      rw [Drun_DNotNodePairTM_emit2]
+      rw [Drun_DNotNodePairTM_copy2_all_true']
+      simp [Dhalted, DNotNodePairTM, DNotNodePairState.done,
+        notNodeConstraintEncodeFromPair, Formula.pairNotVarNotVarEncode,
+        Formula.pairVarVarEncode, insertNotVarTagTotal, insertVarTagTotal,
+        insertNotVarTagTotal_replicate_true, insertVarTagTotal_replicate_true,
+        insertNotVarTagTotal_replicate_true_false, insertVarTagTotal_replicate_true_false,
+        List.append_assoc]
+  · refine ⟨3 * (i + zs.length) + 26, by
+      simp [Nat.mul_add, Nat.add_assoc, Nat.add_comm, Nat.add_left_comm]
+      omega, ?_, ?_⟩
+    all_goals
+      rw [show 3 * (i + zs.length) + 26 =
+          9 + ((i + 1) + (4 + ((zs.length + 1) + ((i + zs.length + 3) +
+            (4 + ((i + 1) + (2 + (zs.length + 1)))))))) by omega]
+      rw [Drun_add_eq]
+      rw [Drun_DNotNodePairTM_start]
+      rw [Drun_add_eq]
+      rw [Drun_DNotNodePairTM_scan1_trues'
+        (zs := zs) (out := [true, false, true, true, false, true, false, false]) (i := i)
+        (wk := fun _ : Nat => false) (wh := 0)]
+      rw [Drun_add_eq]
+      rw [Drun_DNotNodePairTM_emit1]
+      rw [Drun_add_eq]
+      rw [Drun_DNotNodePairTM_copy_false']
+      rw [Drun_add_eq]
+      rw [Drun_DNotNodePairTM_rewind_false'
+        (zs := zs)
+        (out := [true, false, true, true, false, true, false, false] ++
+          List.replicate i true ++ [false] ++ [false, true, false, false] ++ zs) (i := i)
+        (f := fun _ : Nat => false) (wh := 0) (by simp)]
+      rw [Drun_add_eq]
+      rw [Drun_DNotNodePairTM_prefix2]
+      rw [Drun_add_eq]
+      rw [Drun_DNotNodePairTM_scan2_trues']
+      rw [Drun_add_eq]
+      rw [Drun_DNotNodePairTM_emit2]
+      rw [Drun_DNotNodePairTM_copy2_false']
+      simp [Dhalted, DNotNodePairTM, DNotNodePairState.done,
+        notNodeConstraintEncodeFromPair, Formula.pairNotVarNotVarEncode,
+        Formula.pairVarVarEncode, insertNotVarTagTotal, insertVarTagTotal,
+        insertNotVarTagTotal_replicate_true, insertVarTagTotal_replicate_true,
+        insertNotVarTagTotal_replicate_true_false, insertVarTagTotal_replicate_true_false,
+        List.append_assoc]
+
+set_option maxHeartbeats 0 in
+theorem dPolyTimeComputable_notNodeConstraintEncodeFromPair :
+    DPolyTimeComputable notNodeConstraintEncodeFromPair := by
+  refine ⟨DNotNodePairState, inferInstance, inferInstance, DNotNodePairTM,
+    (C 27 + 3 * X : TimeBound), (C 18 + 2 * X : TimeBound), ?_, ?_⟩
+  · intro z
+    rcases DNotNodePairTM_full z with ⟨s, hs, hh, hout⟩
+    simp only [Polynomial.eval_add, Polynomial.eval_mul, Polynomial.eval_X, Polynomial.eval_C]
+    rw [Drun_eq_of_halted_within DNotNodePairTM (Dinit DNotNodePairTM z)
+      (by simpa [Nat.mul_comm, Nat.add_comm, Nat.add_left_comm] using hs) hh]
+    exact hh
+  · intro z
+    rcases DNotNodePairTM_full z with ⟨s, hs, hh, hout⟩
+    constructor
+    · simp only [Polynomial.eval_add, Polynomial.eval_mul, Polynomial.eval_X, Polynomial.eval_C]
+      dsimp [Dboutput]
+      rw [Drun_eq_of_halted_within DNotNodePairTM (Dinit DNotNodePairTM z)
+        (by simpa [Nat.mul_comm, Nat.add_comm, Nat.add_left_comm] using hs) hh]
+      exact hout
+    · simp [notNodeConstraintEncodeFromPair, Formula.pairNotVarNotVarEncode,
+        Formula.pairVarVarEncode, insertNotVarTagTotal_length,
+        insertVarTagTotal_length, Nat.mul_comm, Nat.add_comm, Nat.add_left_comm]
+      omega
+
+set_option linter.unusedSimpArgs true
+
+theorem notNodeConstraintDTMObligation_proved : notNodeConstraintDTMObligation :=
+  dPolyTimeComputable_notNodeConstraintEncodeFromPair
+
+/-- Construct a clean witness from a concrete machine. -/
+theorem DPolyTimeComputableClean.of_machine {σ : Type} [Fintype σ] [DecidableEq σ]
+    (M : DTM σ) (p r : TimeBound) (f : Word → Word)
+    (hno : ∀ q : σ, M.handoff q = false)
+    (hwork : DNoWork M)
+    (hhalt : ∀ x : Word, Dhalted M (Drun M (p.eval x.length) (Dinit M x)) = true)
+    (hout : ∀ x : Word,
+      Dboutput M (p.eval x.length) x = f x ∧ (f x).length ≤ r.eval x.length) :
+    DPolyTimeComputableClean f :=
+  ⟨σ, inferInstance, inferInstance, M, p, r, hno, hwork, hhalt, hout⟩
+
+lemma DConstTM_noWork (y : Word) : DNoWork (DConstTM y) := by
+  intro q _ _
+  by_cases hq : q.val < y.length <;> simp [DNoWork, DConstTM, hq]
+
+lemma DInsertVarTagTM_noWork : DNoWork DInsertVarTagTM := by
+  intro q sym wsym
+  have hq : q.val = 0 ∨ q.val = 1 ∨ q.val = 2 ∨ q.val = 3 ∨ q.val = 4 ∨ q.val = 5 ∨ q.val = 6 := by omega
+  rcases hq with h0 | h1 | h2 | h3 | h4 | h5 | h6
+  · have hq' : q = ⟨0, by decide⟩ := by ext; assumption
+    subst q
+    cases sym with
+    | none => cases wsym <;> simp [DInsertVarTagTM, DInsertVarTagState.start, DInsertVarTagState.scanFirst, DInsertVarTagState.emit0, DInsertVarTagState.emit1, DInsertVarTagState.copyRest, DInsertVarTagState.done, DInsertVarTagState.reject]
+    | some b => cases b <;> cases wsym <;> simp [DInsertVarTagTM, DInsertVarTagState.start, DInsertVarTagState.scanFirst, DInsertVarTagState.emit0, DInsertVarTagState.emit1, DInsertVarTagState.copyRest, DInsertVarTagState.done, DInsertVarTagState.reject]
+  · have hq' : q = ⟨1, by decide⟩ := by ext; assumption
+    subst q
+    cases sym with
+    | none => cases wsym <;> simp [DInsertVarTagTM, DInsertVarTagState.start, DInsertVarTagState.scanFirst, DInsertVarTagState.emit0, DInsertVarTagState.emit1, DInsertVarTagState.copyRest, DInsertVarTagState.done, DInsertVarTagState.reject]
+    | some b => cases b <;> cases wsym <;> simp [DInsertVarTagTM, DInsertVarTagState.start, DInsertVarTagState.scanFirst, DInsertVarTagState.emit0, DInsertVarTagState.emit1, DInsertVarTagState.copyRest, DInsertVarTagState.done, DInsertVarTagState.reject]
+  · have hq' : q = ⟨2, by decide⟩ := by ext; assumption
+    subst q
+    cases sym with
+    | none => cases wsym <;> simp [DInsertVarTagTM, DInsertVarTagState.start, DInsertVarTagState.scanFirst, DInsertVarTagState.emit0, DInsertVarTagState.emit1, DInsertVarTagState.copyRest, DInsertVarTagState.done, DInsertVarTagState.reject]
+    | some b => cases b <;> cases wsym <;> simp [DInsertVarTagTM, DInsertVarTagState.start, DInsertVarTagState.scanFirst, DInsertVarTagState.emit0, DInsertVarTagState.emit1, DInsertVarTagState.copyRest, DInsertVarTagState.done, DInsertVarTagState.reject]
+  · have hq' : q = ⟨3, by decide⟩ := by ext; assumption
+    subst q
+    cases sym with
+    | none => cases wsym <;> simp [DInsertVarTagTM, DInsertVarTagState.start, DInsertVarTagState.scanFirst, DInsertVarTagState.emit0, DInsertVarTagState.emit1, DInsertVarTagState.copyRest, DInsertVarTagState.done, DInsertVarTagState.reject]
+    | some b => cases b <;> cases wsym <;> simp [DInsertVarTagTM, DInsertVarTagState.start, DInsertVarTagState.scanFirst, DInsertVarTagState.emit0, DInsertVarTagState.emit1, DInsertVarTagState.copyRest, DInsertVarTagState.done, DInsertVarTagState.reject]
+  · have hq' : q = ⟨4, by decide⟩ := by ext; assumption
+    subst q
+    cases sym with
+    | none => cases wsym <;> simp [DInsertVarTagTM, DInsertVarTagState.start, DInsertVarTagState.scanFirst, DInsertVarTagState.emit0, DInsertVarTagState.emit1, DInsertVarTagState.copyRest, DInsertVarTagState.done, DInsertVarTagState.reject]
+    | some b => cases b <;> cases wsym <;> simp [DInsertVarTagTM, DInsertVarTagState.start, DInsertVarTagState.scanFirst, DInsertVarTagState.emit0, DInsertVarTagState.emit1, DInsertVarTagState.copyRest, DInsertVarTagState.done, DInsertVarTagState.reject]
+  · have hq' : q = ⟨5, by decide⟩ := by ext; assumption
+    subst q
+    cases sym with
+    | none => cases wsym <;> simp [DInsertVarTagTM, DInsertVarTagState.start, DInsertVarTagState.scanFirst, DInsertVarTagState.emit0, DInsertVarTagState.emit1, DInsertVarTagState.copyRest, DInsertVarTagState.done, DInsertVarTagState.reject]
+    | some b => cases b <;> cases wsym <;> simp [DInsertVarTagTM, DInsertVarTagState.start, DInsertVarTagState.scanFirst, DInsertVarTagState.emit0, DInsertVarTagState.emit1, DInsertVarTagState.copyRest, DInsertVarTagState.done, DInsertVarTagState.reject]
+  · have hq' : q = ⟨6, by decide⟩ := by ext; assumption
+    subst q
+    cases sym with
+    | none => cases wsym <;> simp [DInsertVarTagTM, DInsertVarTagState.start, DInsertVarTagState.scanFirst, DInsertVarTagState.emit0, DInsertVarTagState.emit1, DInsertVarTagState.copyRest, DInsertVarTagState.done, DInsertVarTagState.reject]
+    | some b => cases b <;> cases wsym <;> simp [DInsertVarTagTM, DInsertVarTagState.start, DInsertVarTagState.scanFirst, DInsertVarTagState.emit0, DInsertVarTagState.emit1, DInsertVarTagState.copyRest, DInsertVarTagState.done, DInsertVarTagState.reject]
+
+lemma DInsertNotVarTagTM_noWork : DNoWork DInsertNotVarTagTM := by
+  intro q sym wsym
+  have hq : q.val = 0 ∨ q.val = 1 ∨ q.val = 2 ∨ q.val = 3 ∨ q.val = 4 ∨ q.val = 5 ∨ q.val = 6 ∨ q.val = 7 ∨ q.val = 8 := by omega
+  rcases hq with h0 | h1 | h2 | h3 | h4 | h5 | h6 | h7 | h8
+  · have hq' : q = ⟨0, by decide⟩ := by ext; assumption
+    subst q
+    cases sym with
+    | none => cases wsym <;> simp [DInsertNotVarTagTM, DInsertNotVarTagState.start, DInsertNotVarTagState.scanFirst, DInsertNotVarTagState.emit0, DInsertNotVarTagState.emit1, DInsertNotVarTagState.emit2, DInsertNotVarTagState.emit3, DInsertNotVarTagState.copyRest, DInsertNotVarTagState.done, DInsertNotVarTagState.reject]
+    | some b => cases b <;> cases wsym <;> simp [DInsertNotVarTagTM, DInsertNotVarTagState.start, DInsertNotVarTagState.scanFirst, DInsertNotVarTagState.emit0, DInsertNotVarTagState.emit1, DInsertNotVarTagState.emit2, DInsertNotVarTagState.emit3, DInsertNotVarTagState.copyRest, DInsertNotVarTagState.done, DInsertNotVarTagState.reject]
+  · have hq' : q = ⟨1, by decide⟩ := by ext; assumption
+    subst q
+    cases sym with
+    | none => cases wsym <;> simp [DInsertNotVarTagTM, DInsertNotVarTagState.start, DInsertNotVarTagState.scanFirst, DInsertNotVarTagState.emit0, DInsertNotVarTagState.emit1, DInsertNotVarTagState.emit2, DInsertNotVarTagState.emit3, DInsertNotVarTagState.copyRest, DInsertNotVarTagState.done, DInsertNotVarTagState.reject]
+    | some b => cases b <;> cases wsym <;> simp [DInsertNotVarTagTM, DInsertNotVarTagState.start, DInsertNotVarTagState.scanFirst, DInsertNotVarTagState.emit0, DInsertNotVarTagState.emit1, DInsertNotVarTagState.emit2, DInsertNotVarTagState.emit3, DInsertNotVarTagState.copyRest, DInsertNotVarTagState.done, DInsertNotVarTagState.reject]
+  · have hq' : q = ⟨2, by decide⟩ := by ext; assumption
+    subst q
+    cases sym with
+    | none => cases wsym <;> simp [DInsertNotVarTagTM, DInsertNotVarTagState.start, DInsertNotVarTagState.scanFirst, DInsertNotVarTagState.emit0, DInsertNotVarTagState.emit1, DInsertNotVarTagState.emit2, DInsertNotVarTagState.emit3, DInsertNotVarTagState.copyRest, DInsertNotVarTagState.done, DInsertNotVarTagState.reject]
+    | some b => cases b <;> cases wsym <;> simp [DInsertNotVarTagTM, DInsertNotVarTagState.start, DInsertNotVarTagState.scanFirst, DInsertNotVarTagState.emit0, DInsertNotVarTagState.emit1, DInsertNotVarTagState.emit2, DInsertNotVarTagState.emit3, DInsertNotVarTagState.copyRest, DInsertNotVarTagState.done, DInsertNotVarTagState.reject]
+  · have hq' : q = ⟨3, by decide⟩ := by ext; assumption
+    subst q
+    cases sym with
+    | none => cases wsym <;> simp [DInsertNotVarTagTM, DInsertNotVarTagState.start, DInsertNotVarTagState.scanFirst, DInsertNotVarTagState.emit0, DInsertNotVarTagState.emit1, DInsertNotVarTagState.emit2, DInsertNotVarTagState.emit3, DInsertNotVarTagState.copyRest, DInsertNotVarTagState.done, DInsertNotVarTagState.reject]
+    | some b => cases b <;> cases wsym <;> simp [DInsertNotVarTagTM, DInsertNotVarTagState.start, DInsertNotVarTagState.scanFirst, DInsertNotVarTagState.emit0, DInsertNotVarTagState.emit1, DInsertNotVarTagState.emit2, DInsertNotVarTagState.emit3, DInsertNotVarTagState.copyRest, DInsertNotVarTagState.done, DInsertNotVarTagState.reject]
+  · have hq' : q = ⟨4, by decide⟩ := by ext; assumption
+    subst q
+    cases sym with
+    | none => cases wsym <;> simp [DInsertNotVarTagTM, DInsertNotVarTagState.start, DInsertNotVarTagState.scanFirst, DInsertNotVarTagState.emit0, DInsertNotVarTagState.emit1, DInsertNotVarTagState.emit2, DInsertNotVarTagState.emit3, DInsertNotVarTagState.copyRest, DInsertNotVarTagState.done, DInsertNotVarTagState.reject]
+    | some b => cases b <;> cases wsym <;> simp [DInsertNotVarTagTM, DInsertNotVarTagState.start, DInsertNotVarTagState.scanFirst, DInsertNotVarTagState.emit0, DInsertNotVarTagState.emit1, DInsertNotVarTagState.emit2, DInsertNotVarTagState.emit3, DInsertNotVarTagState.copyRest, DInsertNotVarTagState.done, DInsertNotVarTagState.reject]
+  · have hq' : q = ⟨5, by decide⟩ := by ext; assumption
+    subst q
+    cases sym with
+    | none => cases wsym <;> simp [DInsertNotVarTagTM, DInsertNotVarTagState.start, DInsertNotVarTagState.scanFirst, DInsertNotVarTagState.emit0, DInsertNotVarTagState.emit1, DInsertNotVarTagState.emit2, DInsertNotVarTagState.emit3, DInsertNotVarTagState.copyRest, DInsertNotVarTagState.done, DInsertNotVarTagState.reject]
+    | some b => cases b <;> cases wsym <;> simp [DInsertNotVarTagTM, DInsertNotVarTagState.start, DInsertNotVarTagState.scanFirst, DInsertNotVarTagState.emit0, DInsertNotVarTagState.emit1, DInsertNotVarTagState.emit2, DInsertNotVarTagState.emit3, DInsertNotVarTagState.copyRest, DInsertNotVarTagState.done, DInsertNotVarTagState.reject]
+  · have hq' : q = ⟨6, by decide⟩ := by ext; assumption
+    subst q
+    cases sym with
+    | none => cases wsym <;> simp [DInsertNotVarTagTM, DInsertNotVarTagState.start, DInsertNotVarTagState.scanFirst, DInsertNotVarTagState.emit0, DInsertNotVarTagState.emit1, DInsertNotVarTagState.emit2, DInsertNotVarTagState.emit3, DInsertNotVarTagState.copyRest, DInsertNotVarTagState.done, DInsertNotVarTagState.reject]
+    | some b => cases b <;> cases wsym <;> simp [DInsertNotVarTagTM, DInsertNotVarTagState.start, DInsertNotVarTagState.scanFirst, DInsertNotVarTagState.emit0, DInsertNotVarTagState.emit1, DInsertNotVarTagState.emit2, DInsertNotVarTagState.emit3, DInsertNotVarTagState.copyRest, DInsertNotVarTagState.done, DInsertNotVarTagState.reject]
+  · have hq' : q = ⟨7, by decide⟩ := by ext; assumption
+    subst q
+    cases sym with
+    | none => cases wsym <;> simp [DInsertNotVarTagTM, DInsertNotVarTagState.start, DInsertNotVarTagState.scanFirst, DInsertNotVarTagState.emit0, DInsertNotVarTagState.emit1, DInsertNotVarTagState.emit2, DInsertNotVarTagState.emit3, DInsertNotVarTagState.copyRest, DInsertNotVarTagState.done, DInsertNotVarTagState.reject]
+    | some b => cases b <;> cases wsym <;> simp [DInsertNotVarTagTM, DInsertNotVarTagState.start, DInsertNotVarTagState.scanFirst, DInsertNotVarTagState.emit0, DInsertNotVarTagState.emit1, DInsertNotVarTagState.emit2, DInsertNotVarTagState.emit3, DInsertNotVarTagState.copyRest, DInsertNotVarTagState.done, DInsertNotVarTagState.reject]
+  · have hq' : q = ⟨8, by decide⟩ := by ext; assumption
+    subst q
+    cases sym with
+    | none => cases wsym <;> simp [DInsertNotVarTagTM, DInsertNotVarTagState.start, DInsertNotVarTagState.scanFirst, DInsertNotVarTagState.emit0, DInsertNotVarTagState.emit1, DInsertNotVarTagState.emit2, DInsertNotVarTagState.emit3, DInsertNotVarTagState.copyRest, DInsertNotVarTagState.done, DInsertNotVarTagState.reject]
+    | some b => cases b <;> cases wsym <;> simp [DInsertNotVarTagTM, DInsertNotVarTagState.start, DInsertNotVarTagState.scanFirst, DInsertNotVarTagState.emit0, DInsertNotVarTagState.emit1, DInsertNotVarTagState.emit2, DInsertNotVarTagState.emit3, DInsertNotVarTagState.copyRest, DInsertNotVarTagState.done, DInsertNotVarTagState.reject]
+
+lemma DFirstTwoCodesTM_noWork : DNoWork DFirstTwoCodesTM := by
+  intro q sym wsym
+  have hq : q.val = 0 ∨ q.val = 1 ∨ q.val = 2 ∨ q.val = 3 ∨ q.val = 4 ∨ q.val = 5 ∨ q.val = 6 := by omega
+  rcases hq with h0 | h1 | h2 | h3 | h4 | h5 | h6
+  · have hq' : q = ⟨0, by decide⟩ := by ext; assumption
+    subst q
+    cases sym with
+    | none => cases wsym <;> simp [DFirstTwoCodesTM, DFirstTwoCodesState.start, DFirstTwoCodesState.scanFirst, DFirstTwoCodesState.scanSecond, DFirstTwoCodesState.done, DFirstTwoCodesState.reject]
+    | some b => cases b <;> cases wsym <;> simp [DFirstTwoCodesTM, DFirstTwoCodesState.start, DFirstTwoCodesState.scanFirst, DFirstTwoCodesState.scanSecond, DFirstTwoCodesState.done, DFirstTwoCodesState.reject]
+  · have hq' : q = ⟨1, by decide⟩ := by ext; assumption
+    subst q
+    cases sym with
+    | none => cases wsym <;> simp [DFirstTwoCodesTM, DFirstTwoCodesState.start, DFirstTwoCodesState.scanFirst, DFirstTwoCodesState.scanSecond, DFirstTwoCodesState.done, DFirstTwoCodesState.reject]
+    | some b => cases b <;> cases wsym <;> simp [DFirstTwoCodesTM, DFirstTwoCodesState.start, DFirstTwoCodesState.scanFirst, DFirstTwoCodesState.scanSecond, DFirstTwoCodesState.done, DFirstTwoCodesState.reject]
+  · have hq' : q = ⟨2, by decide⟩ := by ext; assumption
+    subst q
+    cases sym with
+    | none => cases wsym <;> simp [DFirstTwoCodesTM, DFirstTwoCodesState.start, DFirstTwoCodesState.scanFirst, DFirstTwoCodesState.scanSecond, DFirstTwoCodesState.done, DFirstTwoCodesState.reject]
+    | some b => cases b <;> cases wsym <;> simp [DFirstTwoCodesTM, DFirstTwoCodesState.start, DFirstTwoCodesState.scanFirst, DFirstTwoCodesState.scanSecond, DFirstTwoCodesState.done, DFirstTwoCodesState.reject]
+  · have hq' : q = ⟨3, by decide⟩ := by ext; assumption
+    subst q
+    cases sym with
+    | none => cases wsym <;> simp [DFirstTwoCodesTM, DFirstTwoCodesState.start, DFirstTwoCodesState.scanFirst, DFirstTwoCodesState.scanSecond, DFirstTwoCodesState.done, DFirstTwoCodesState.reject]
+    | some b => cases b <;> cases wsym <;> simp [DFirstTwoCodesTM, DFirstTwoCodesState.start, DFirstTwoCodesState.scanFirst, DFirstTwoCodesState.scanSecond, DFirstTwoCodesState.done, DFirstTwoCodesState.reject]
+  · have hq' : q = ⟨4, by decide⟩ := by ext; assumption
+    subst q
+    cases sym with
+    | none => cases wsym <;> simp [DFirstTwoCodesTM, DFirstTwoCodesState.start, DFirstTwoCodesState.scanFirst, DFirstTwoCodesState.scanSecond, DFirstTwoCodesState.done, DFirstTwoCodesState.reject]
+    | some b => cases b <;> cases wsym <;> simp [DFirstTwoCodesTM, DFirstTwoCodesState.start, DFirstTwoCodesState.scanFirst, DFirstTwoCodesState.scanSecond, DFirstTwoCodesState.done, DFirstTwoCodesState.reject]
+  · have hq' : q = ⟨5, by decide⟩ := by ext; assumption
+    subst q
+    cases sym with
+    | none => cases wsym <;> simp [DFirstTwoCodesTM, DFirstTwoCodesState.start, DFirstTwoCodesState.scanFirst, DFirstTwoCodesState.scanSecond, DFirstTwoCodesState.done, DFirstTwoCodesState.reject]
+    | some b => cases b <;> cases wsym <;> simp [DFirstTwoCodesTM, DFirstTwoCodesState.start, DFirstTwoCodesState.scanFirst, DFirstTwoCodesState.scanSecond, DFirstTwoCodesState.done, DFirstTwoCodesState.reject]
+  · have hq' : q = ⟨6, by decide⟩ := by ext; assumption
+    subst q
+    cases sym with
+    | none => cases wsym <;> simp [DFirstTwoCodesTM, DFirstTwoCodesState.start, DFirstTwoCodesState.scanFirst, DFirstTwoCodesState.scanSecond, DFirstTwoCodesState.done, DFirstTwoCodesState.reject]
+    | some b => cases b <;> cases wsym <;> simp [DFirstTwoCodesTM, DFirstTwoCodesState.start, DFirstTwoCodesState.scanFirst, DFirstTwoCodesState.scanSecond, DFirstTwoCodesState.done, DFirstTwoCodesState.reject]
+
+lemma DFirstThirdCodesTM_noWork : DNoWork DFirstThirdCodesTM := by
+  intro q sym wsym
+  have hq : q.val = 0 ∨ q.val = 1 ∨ q.val = 2 ∨ q.val = 3 ∨ q.val = 4 ∨ q.val = 5 ∨ q.val = 6 := by omega
+  rcases hq with h0 | h1 | h2 | h3 | h4 | h5 | h6
+  · have hq' : q = ⟨0, by decide⟩ := by ext; assumption
+    subst q
+    cases sym with
+    | none => cases wsym <;> simp [DFirstThirdCodesTM, DFirstThirdCodesState.start, DFirstThirdCodesState.scanFirst, DFirstThirdCodesState.skipSecond, DFirstThirdCodesState.copyRest, DFirstThirdCodesState.done, DFirstThirdCodesState.reject]
+    | some b => cases b <;> cases wsym <;> simp [DFirstThirdCodesTM, DFirstThirdCodesState.start, DFirstThirdCodesState.scanFirst, DFirstThirdCodesState.skipSecond, DFirstThirdCodesState.copyRest, DFirstThirdCodesState.done, DFirstThirdCodesState.reject]
+  · have hq' : q = ⟨1, by decide⟩ := by ext; assumption
+    subst q
+    cases sym with
+    | none => cases wsym <;> simp [DFirstThirdCodesTM, DFirstThirdCodesState.start, DFirstThirdCodesState.scanFirst, DFirstThirdCodesState.skipSecond, DFirstThirdCodesState.copyRest, DFirstThirdCodesState.done, DFirstThirdCodesState.reject]
+    | some b => cases b <;> cases wsym <;> simp [DFirstThirdCodesTM, DFirstThirdCodesState.start, DFirstThirdCodesState.scanFirst, DFirstThirdCodesState.skipSecond, DFirstThirdCodesState.copyRest, DFirstThirdCodesState.done, DFirstThirdCodesState.reject]
+  · have hq' : q = ⟨2, by decide⟩ := by ext; assumption
+    subst q
+    cases sym with
+    | none => cases wsym <;> simp [DFirstThirdCodesTM, DFirstThirdCodesState.start, DFirstThirdCodesState.scanFirst, DFirstThirdCodesState.skipSecond, DFirstThirdCodesState.copyRest, DFirstThirdCodesState.done, DFirstThirdCodesState.reject]
+    | some b => cases b <;> cases wsym <;> simp [DFirstThirdCodesTM, DFirstThirdCodesState.start, DFirstThirdCodesState.scanFirst, DFirstThirdCodesState.skipSecond, DFirstThirdCodesState.copyRest, DFirstThirdCodesState.done, DFirstThirdCodesState.reject]
+  · have hq' : q = ⟨3, by decide⟩ := by ext; assumption
+    subst q
+    cases sym with
+    | none => cases wsym <;> simp [DFirstThirdCodesTM, DFirstThirdCodesState.start, DFirstThirdCodesState.scanFirst, DFirstThirdCodesState.skipSecond, DFirstThirdCodesState.copyRest, DFirstThirdCodesState.done, DFirstThirdCodesState.reject]
+    | some b => cases b <;> cases wsym <;> simp [DFirstThirdCodesTM, DFirstThirdCodesState.start, DFirstThirdCodesState.scanFirst, DFirstThirdCodesState.skipSecond, DFirstThirdCodesState.copyRest, DFirstThirdCodesState.done, DFirstThirdCodesState.reject]
+  · have hq' : q = ⟨4, by decide⟩ := by ext; assumption
+    subst q
+    cases sym with
+    | none => cases wsym <;> simp [DFirstThirdCodesTM, DFirstThirdCodesState.start, DFirstThirdCodesState.scanFirst, DFirstThirdCodesState.skipSecond, DFirstThirdCodesState.copyRest, DFirstThirdCodesState.done, DFirstThirdCodesState.reject]
+    | some b => cases b <;> cases wsym <;> simp [DFirstThirdCodesTM, DFirstThirdCodesState.start, DFirstThirdCodesState.scanFirst, DFirstThirdCodesState.skipSecond, DFirstThirdCodesState.copyRest, DFirstThirdCodesState.done, DFirstThirdCodesState.reject]
+  · have hq' : q = ⟨5, by decide⟩ := by ext; assumption
+    subst q
+    cases sym with
+    | none => cases wsym <;> simp [DFirstThirdCodesTM, DFirstThirdCodesState.start, DFirstThirdCodesState.scanFirst, DFirstThirdCodesState.skipSecond, DFirstThirdCodesState.copyRest, DFirstThirdCodesState.done, DFirstThirdCodesState.reject]
+    | some b => cases b <;> cases wsym <;> simp [DFirstThirdCodesTM, DFirstThirdCodesState.start, DFirstThirdCodesState.scanFirst, DFirstThirdCodesState.skipSecond, DFirstThirdCodesState.copyRest, DFirstThirdCodesState.done, DFirstThirdCodesState.reject]
+  · have hq' : q = ⟨6, by decide⟩ := by ext; assumption
+    subst q
+    cases sym with
+    | none => cases wsym <;> simp [DFirstThirdCodesTM, DFirstThirdCodesState.start, DFirstThirdCodesState.scanFirst, DFirstThirdCodesState.skipSecond, DFirstThirdCodesState.copyRest, DFirstThirdCodesState.done, DFirstThirdCodesState.reject]
+    | some b => cases b <;> cases wsym <;> simp [DFirstThirdCodesTM, DFirstThirdCodesState.start, DFirstThirdCodesState.scanFirst, DFirstThirdCodesState.skipSecond, DFirstThirdCodesState.copyRest, DFirstThirdCodesState.done, DFirstThirdCodesState.reject]
+
+theorem dPolyTimeComputableClean_const (y : Word) :
+    DPolyTimeComputableClean (fun _ : Word => y) := by
+  refine DPolyTimeComputableClean.of_machine (DConstTM y) (C y.length) (C y.length)
+    (fun _ : Word => y) ?_ ?_ ?_ ?_
+  · intro q
+    rfl
+  · exact DConstTM_noWork y
+  · intro x
+    have hem : Drun (DConstTM y) y.length
+        { state := DConstState.start y, input := x, head := 0, output := [],
+          work := fun _ : Nat => false, workHead := 0 } =
+        { state := DConstState.done y, input := x, head := 0, output := y,
+          work := fun _ : Nat => false, workHead := 0 } := by
+      simpa [DConstState.start, DConstState.done] using
+        (Drun_DConstTM_emit_prefix y [] y rfl x [] 0 (fun _ : Nat => false) 0)
+    simp only [Polynomial.eval_C]
+    change Dhalted (DConstTM y)
+      (Drun (DConstTM y) y.length
+        { state := DConstState.start y, input := x, head := 0, output := [],
+          work := fun _ : Nat => false, workHead := 0 }) = true
+    rw [hem]
+    simp [Dhalted, DConstTM, DConstState.done]
+  · intro x
+    have hem : Drun (DConstTM y) y.length
+        { state := DConstState.start y, input := x, head := 0, output := [],
+          work := fun _ : Nat => false, workHead := 0 } =
+        { state := DConstState.done y, input := x, head := 0, output := y,
+          work := fun _ : Nat => false, workHead := 0 } := by
+      simpa [DConstState.start, DConstState.done] using
+        (Drun_DConstTM_emit_prefix y [] y rfl x [] 0 (fun _ : Nat => false) 0)
+    constructor
+    · simp only [Polynomial.eval_C]
+      dsimp [Dboutput, Dinit]
+      change (Drun (DConstTM y) y.length
+        { state := DConstState.start y, input := x, head := 0, output := [],
+          work := fun _ : Nat => false, workHead := 0 }).output = y
+      rw [hem]
+    · simp
+
+set_option maxHeartbeats 0 in
+theorem dPolyTimeComputableClean_insertVarTagTotal :
+    DPolyTimeComputableClean insertVarTagTotal := by
+  refine DPolyTimeComputableClean.of_machine DInsertVarTagTM (X + C 5) (X + C 2)
+    insertVarTagTotal ?_ ?_ ?_ ?_
+  · intro q
+    rfl
+  · exact DInsertVarTagTM_noWork
+  · intro z
+    rcases Drun_DInsertVarTagTM_full z with ⟨s, hs, hh, hout⟩
+    simp only [Polynomial.eval_add, Polynomial.eval_X, Polynomial.eval_C]
+    rw [Drun_eq_of_halted_within DInsertVarTagTM (Dinit DInsertVarTagTM z)
+      (by simpa using hs) hh]
+    exact hh
+  · intro z
+    rcases Drun_DInsertVarTagTM_full z with ⟨s, hs, hh, hout⟩
+    constructor
+    · simp only [Polynomial.eval_add, Polynomial.eval_X, Polynomial.eval_C]
+      dsimp [Dboutput]
+      rw [Drun_eq_of_halted_within DInsertVarTagTM (Dinit DInsertVarTagTM z)
+        (by simpa using hs) hh]
+      exact hout
+    · simp [insertVarTagTotal_length]
+
+set_option maxHeartbeats 0 in
+theorem dPolyTimeComputableClean_insertNotVarTagTotal :
+    DPolyTimeComputableClean insertNotVarTagTotal := by
+  refine DPolyTimeComputableClean.of_machine DInsertNotVarTagTM (X + C 7) (X + C 4)
+    insertNotVarTagTotal ?_ ?_ ?_ ?_
+  · intro q
+    rfl
+  · exact DInsertNotVarTagTM_noWork
+  · intro z
+    rcases Drun_DInsertNotVarTagTM_full z with ⟨s, hs, hh, hout⟩
+    simp only [Polynomial.eval_add, Polynomial.eval_X, Polynomial.eval_C]
+    rw [Drun_eq_of_halted_within DInsertNotVarTagTM (Dinit DInsertNotVarTagTM z)
+      (by simpa using hs) hh]
+    exact hh
+  · intro z
+    rcases Drun_DInsertNotVarTagTM_full z with ⟨s, hs, hh, hout⟩
+    constructor
+    · simp only [Polynomial.eval_add, Polynomial.eval_X, Polynomial.eval_C]
+      dsimp [Dboutput]
+      rw [Drun_eq_of_halted_within DInsertNotVarTagTM (Dinit DInsertNotVarTagTM z)
+        (by simpa using hs) hh]
+      exact hout
+    · simp [insertNotVarTagTotal_length]
+
+theorem dPolyTimeComputableClean_firstTwoCodes :
+    DPolyTimeComputableClean firstTwoCodes := by
+  refine DPolyTimeComputableClean.of_machine DFirstTwoCodesTM (X + C 3) X
+    firstTwoCodes ?_ ?_ ?_ ?_
+  · intro q
+    rfl
+  · exact DFirstTwoCodesTM_noWork
+  · intro x
+    simpa using DFirstTwoCodesTM_halts x
+  · intro x
+    constructor
+    · change Dboutput DFirstTwoCodesTM ((X + C 3).eval x.length) x = firstTwoCodes x
+      simpa using DFirstTwoCodesTM_output x
+    · simpa using firstTwoCodes_length_le x
+
+theorem dPolyTimeComputableClean_firstThirdCodes :
+    DPolyTimeComputableClean firstThirdCodes := by
+  refine DPolyTimeComputableClean.of_machine DFirstThirdCodesTM (X + C 3) X
+    firstThirdCodes ?_ ?_ ?_ ?_
+  · intro q
+    rfl
+  · exact DFirstThirdCodesTM_noWork
+  · intro x
+    simpa using DFirstThirdCodesTM_halts x
+  · intro x
+    constructor
+    · change Dboutput DFirstThirdCodesTM ((X + C 3).eval x.length) x = firstThirdCodes x
+      simpa using DFirstThirdCodesTM_output x
+    · simpa using firstThirdCodes_length_le x
+
+-- ---------------------------------------------------------------------------
+-- A clean transducer that skips two unary codes and copies the rest
+-- ---------------------------------------------------------------------------
+
+abbrev DThirdCodeState := Fin 6
+
+namespace DThirdCodeState
+
+def start : DThirdCodeState := ⟨0, by decide⟩
+def scanFirst : DThirdCodeState := ⟨1, by decide⟩
+def scanSecond : DThirdCodeState := ⟨2, by decide⟩
+def copy : DThirdCodeState := ⟨3, by decide⟩
+def done : DThirdCodeState := ⟨4, by decide⟩
+def reject : DThirdCodeState := ⟨5, by decide⟩
+
+end DThirdCodeState
+
+/-- Skip two leading unary codes and emit the remaining word. -/
+def DThirdCodeTM : DTM DThirdCodeState where
+  step := fun q sym _ =>
+    if q = DThirdCodeState.start then
+      { next := DThirdCodeState.scanFirst, output := none, inputMove := some true
+        workWrite := none, workMove := none }
+    else if q = DThirdCodeState.scanFirst then
+      match sym with
+      | some true =>
+          { next := DThirdCodeState.scanFirst, output := none, inputMove := some true
+            workWrite := none, workMove := none }
+      | some false =>
+          { next := DThirdCodeState.scanSecond, output := none, inputMove := some true
+            workWrite := none, workMove := none }
+      | none =>
+          { next := DThirdCodeState.done, output := none, inputMove := none
+            workWrite := none, workMove := none }
+    else if q = DThirdCodeState.scanSecond then
+      match sym with
+      | some true =>
+          { next := DThirdCodeState.scanSecond, output := none, inputMove := some true
+            workWrite := none, workMove := none }
+      | some false =>
+          { next := DThirdCodeState.copy, output := none, inputMove := some true
+            workWrite := none, workMove := none }
+      | none =>
+          { next := DThirdCodeState.done, output := none, inputMove := none
+            workWrite := none, workMove := none }
+    else if q = DThirdCodeState.copy then
+      match sym with
+      | some b =>
+          { next := DThirdCodeState.copy, output := some b, inputMove := some true
+            workWrite := none, workMove := none }
+      | none =>
+          { next := DThirdCodeState.done, output := none, inputMove := none
+            workWrite := none, workMove := none }
+    else
+      { next := q, output := none, inputMove := none
+        workWrite := none, workMove := none }
+  start := DThirdCodeState.start
+  accept := DThirdCodeState.done
+  reject := DThirdCodeState.reject
+
+lemma Drun_DThirdCodeTM_start (z : Word) :
+    Drun DThirdCodeTM 1 (Dinit DThirdCodeTM z) =
+      { state := DThirdCodeState.scanFirst, input := z, head := 1, output := [],
+        work := fun _ : Nat => false, workHead := 0 } := by
+  simp [Drun, Dhalted, Dinit, Dstep, Dread, DThirdCodeTM, Dmove,
+    DThirdCodeState.start, DThirdCodeState.scanFirst,
+    DThirdCodeState.copy, DThirdCodeState.done,
+    DThirdCodeState.reject]
+
+
+lemma Drun_DThirdCodeTM_copy (skipped rest out : Word)
+    (wk : Nat → Bool) (wh : Nat) :
+    Drun DThirdCodeTM (rest.length + 1)
+      { state := DThirdCodeState.copy, input := skipped ++ rest,
+        head := skipped.length + 1, output := out, work := wk, workHead := wh } =
+      { state := DThirdCodeState.done, input := skipped ++ rest,
+        head := skipped.length + rest.length + 1, output := out ++ rest,
+        work := wk, workHead := wh } := by
+  induction rest generalizing skipped out with
+  | nil =>
+      simp [Drun, Dhalted, Dstep, Dread, DThirdCodeTM,
+        DThirdCodeState.start, DThirdCodeState.scanFirst, DThirdCodeState.scanSecond,
+        DThirdCodeState.copy, DThirdCodeState.done,
+        DThirdCodeState.reject]
+  | cons b bs ih =>
+      rw [show (b :: bs).length + 1 = 1 + (bs.length + 1) by
+        simp [Nat.add_comm, Nat.add_left_comm], Drun_add_eq]
+      let c : DConfig DThirdCodeState :=
+        { state := DThirdCodeState.copy, input := skipped ++ b :: bs,
+          head := skipped.length + 1, output := out, work := wk, workHead := wh }
+      let c' : DConfig DThirdCodeState :=
+        { state := DThirdCodeState.copy, input := skipped ++ b :: bs,
+          head := skipped.length + 2, output := out ++ [b], work := wk, workHead := wh }
+      have hstep : Drun DThirdCodeTM 1 c = c' := by
+        simp [c, c', Drun, Dhalted, Dstep, Dread, DThirdCodeTM, Dmove,
+          DThirdCodeState.start, DThirdCodeState.scanFirst, DThirdCodeState.scanSecond,
+          DThirdCodeState.copy, DThirdCodeState.done,
+          DThirdCodeState.reject]
+      change Drun DThirdCodeTM (bs.length + 1) (Drun DThirdCodeTM 1 c) = _
+      rw [hstep]
+      simpa [c', List.append_assoc, Nat.add_assoc, Nat.add_comm, Nat.add_left_comm]
+        using ih (skipped := skipped ++ [b]) (out := out ++ [b])
+
+
+lemma Drun_DThirdCodeTM_scanSecond (pre z out : Word)
+    (wk : Nat → Bool) (wh : Nat) :
+    Drun DThirdCodeTM (z.length + 1)
+      { state := DThirdCodeState.scanSecond, input := pre ++ z,
+        head := pre.length + 1, output := out, work := wk, workHead := wh } =
+      { state := DThirdCodeState.done, input := pre ++ z,
+        head := pre.length + z.length + 1, output := out ++ dropFirstUnary z,
+        work := wk, workHead := wh } := by
+  induction z generalizing pre out with
+  | nil =>
+      simp [Drun, Dhalted, Dstep, Dread, DThirdCodeTM,
+        DThirdCodeState.start, DThirdCodeState.scanFirst, DThirdCodeState.scanSecond,
+        DThirdCodeState.copy, DThirdCodeState.done,
+        DThirdCodeState.reject, dropFirstUnary]
+  | cons b bs ih =>
+      rw [show (b :: bs).length + 1 = 1 + (bs.length + 1) by
+        simp [Nat.add_comm, Nat.add_left_comm], Drun_add_eq]
+      let c : DConfig DThirdCodeState :=
+        { state := DThirdCodeState.scanSecond, input := pre ++ b :: bs,
+          head := pre.length + 1, output := out, work := wk, workHead := wh }
+      have hstep : Drun DThirdCodeTM 1 c =
+          { state := if b then DThirdCodeState.scanSecond else DThirdCodeState.copy,
+            input := pre ++ b :: bs, head := pre.length + 2, output := out,
+            work := wk, workHead := wh } := by
+        cases b <;>
+          simp [c, Drun, Dhalted, Dstep, Dread, DThirdCodeTM, Dmove,
+            DThirdCodeState.start, DThirdCodeState.scanFirst, DThirdCodeState.scanSecond,
+            DThirdCodeState.copy, DThirdCodeState.done,
+            DThirdCodeState.reject]
+      cases b with
+      | false =>
+          change Drun DThirdCodeTM (bs.length + 1) (Drun DThirdCodeTM 1 c) = _
+          rw [hstep]
+          simpa [List.append_assoc, Nat.add_assoc, Nat.add_comm, Nat.add_left_comm,
+            dropFirstUnary] using
+            (Drun_DThirdCodeTM_copy (skipped := pre ++ [false]) (rest := bs)
+              (out := out) wk wh)
+      | true =>
+          change Drun DThirdCodeTM (bs.length + 1) (Drun DThirdCodeTM 1 c) = _
+          rw [hstep]
+          simpa [List.append_assoc, Nat.add_assoc, Nat.add_comm, Nat.add_left_comm,
+            dropFirstUnary] using ih (pre := pre ++ [true]) (out := out)
+
+
+lemma Drun_DThirdCodeTM_scanFirst (pre z out : Word)
+    (wk : Nat → Bool) (wh : Nat) :
+    Drun DThirdCodeTM (z.length + 1)
+      { state := DThirdCodeState.scanFirst, input := pre ++ z,
+        head := pre.length + 1, output := out, work := wk, workHead := wh } =
+      { state := DThirdCodeState.done, input := pre ++ z,
+        head := pre.length + z.length + 1, output := out ++ thirdCode z,
+        work := wk, workHead := wh } := by
+  induction z generalizing pre out with
+  | nil =>
+      simp [Drun, Dhalted, Dstep, Dread, DThirdCodeTM,
+        DThirdCodeState.start, DThirdCodeState.scanFirst,
+        DThirdCodeState.scanSecond, DThirdCodeState.copy,
+        DThirdCodeState.done, DThirdCodeState.reject, thirdCode, dropFirstUnary]
+  | cons b bs ih =>
+      rw [show (b :: bs).length + 1 = 1 + (bs.length + 1) by
+        simp [Nat.add_comm, Nat.add_left_comm], Drun_add_eq]
+      let c : DConfig DThirdCodeState :=
+        { state := DThirdCodeState.scanFirst, input := pre ++ b :: bs,
+          head := pre.length + 1, output := out, work := wk, workHead := wh }
+      have hstep : Drun DThirdCodeTM 1 c =
+          { state := if b then DThirdCodeState.scanFirst else DThirdCodeState.scanSecond,
+            input := pre ++ b :: bs, head := pre.length + 2, output := out,
+            work := wk, workHead := wh } := by
+        cases b <;>
+          simp [c, Drun, Dhalted, Dstep, Dread, Dmove, DThirdCodeTM,
+            DThirdCodeState.start, DThirdCodeState.scanFirst,
+            DThirdCodeState.scanSecond, DThirdCodeState.copy,
+            DThirdCodeState.done, DThirdCodeState.reject]
+      cases b with
+      | false =>
+          change Drun DThirdCodeTM (bs.length + 1) (Drun DThirdCodeTM 1 c) = _
+          rw [hstep]
+          simpa [List.append_assoc, Nat.add_assoc, Nat.add_comm, Nat.add_left_comm,
+            thirdCode, dropFirstUnary] using
+            (Drun_DThirdCodeTM_scanSecond (pre := pre ++ [false]) (z := bs) (out := out)
+              wk wh)
+      | true =>
+          change Drun DThirdCodeTM (bs.length + 1) (Drun DThirdCodeTM 1 c) = _
+          rw [hstep]
+          simpa [List.append_assoc, Nat.add_assoc, Nat.add_comm, Nat.add_left_comm,
+            thirdCode, dropFirstUnary] using ih (pre := pre ++ [true]) (out := out)
+
+lemma DThirdCodeTM_output (x : Word) :
+    Dboutput DThirdCodeTM (x.length + 2) x = thirdCode x := by
+  dsimp [Dboutput]
+  rw [show x.length + 2 = 1 + (x.length + 1) by omega, Drun_add_eq]
+  rw [Drun_DThirdCodeTM_start x]
+  simpa [List.append_assoc] using congrArg DConfig.output
+    (Drun_DThirdCodeTM_scanFirst (pre := []) (z := x) (out := [])
+      (fun _ : Nat => false) 0)
+
+lemma DThirdCodeTM_halts (x : Word) :
+    Dhalted DThirdCodeTM
+      (Drun DThirdCodeTM (x.length + 2) (Dinit DThirdCodeTM x)) = true := by
+  rw [show x.length + 2 = 1 + (x.length + 1) by omega, Drun_add_eq]
+  rw [Drun_DThirdCodeTM_start x]
+  have hscan := Drun_DThirdCodeTM_scanFirst (pre := []) (z := x) (out := [])
+    (fun _ : Nat => false) 0
+  simp at hscan
+  rw [hscan]
+  simp [Dhalted, DThirdCodeTM, DThirdCodeState.done]
+
+lemma DThirdCodeTM_noWork : DNoWork DThirdCodeTM := by
+  intro q sym wsym
+  have hq : q.val = 0 ∨ q.val = 1 ∨ q.val = 2 ∨ q.val = 3 ∨ q.val = 4 ∨ q.val = 5 := by omega
+  rcases hq with h0 | h1 | h2 | h3 | h4 | h5
+  · have hq' : q = ⟨0, by decide⟩ := by ext; assumption
+    subst q
+    cases sym with
+    | none => cases wsym <;> simp [DThirdCodeTM, DThirdCodeState.start,
+        DThirdCodeState.scanFirst, DThirdCodeState.scanSecond,
+        DThirdCodeState.copy, DThirdCodeState.done, DThirdCodeState.reject]
+    | some b => cases b <;> cases wsym <;> simp [DThirdCodeTM, DThirdCodeState.start,
+        DThirdCodeState.scanFirst, DThirdCodeState.scanSecond,
+        DThirdCodeState.copy, DThirdCodeState.done, DThirdCodeState.reject]
+  · have hq' : q = ⟨1, by decide⟩ := by ext; assumption
+    subst q
+    cases sym with
+    | none => cases wsym <;> simp [DThirdCodeTM, DThirdCodeState.start,
+        DThirdCodeState.scanFirst, DThirdCodeState.scanSecond,
+        DThirdCodeState.copy, DThirdCodeState.done, DThirdCodeState.reject]
+    | some b => cases b <;> cases wsym <;> simp [DThirdCodeTM, DThirdCodeState.start,
+        DThirdCodeState.scanFirst, DThirdCodeState.scanSecond,
+        DThirdCodeState.copy, DThirdCodeState.done, DThirdCodeState.reject]
+  · have hq' : q = ⟨2, by decide⟩ := by ext; assumption
+    subst q
+    cases sym with
+    | none => cases wsym <;> simp [DThirdCodeTM, DThirdCodeState.start,
+        DThirdCodeState.scanFirst, DThirdCodeState.scanSecond,
+        DThirdCodeState.copy, DThirdCodeState.done, DThirdCodeState.reject]
+    | some b => cases b <;> cases wsym <;> simp [DThirdCodeTM, DThirdCodeState.start,
+        DThirdCodeState.scanFirst, DThirdCodeState.scanSecond,
+        DThirdCodeState.copy, DThirdCodeState.done, DThirdCodeState.reject]
+  · have hq' : q = ⟨3, by decide⟩ := by ext; assumption
+    subst q
+    cases sym with
+    | none => cases wsym <;> simp [DThirdCodeTM, DThirdCodeState.start,
+        DThirdCodeState.scanFirst, DThirdCodeState.scanSecond,
+        DThirdCodeState.copy, DThirdCodeState.done, DThirdCodeState.reject]
+    | some b => cases b <;> cases wsym <;> simp [DThirdCodeTM, DThirdCodeState.start,
+        DThirdCodeState.scanFirst, DThirdCodeState.scanSecond,
+        DThirdCodeState.copy, DThirdCodeState.done, DThirdCodeState.reject]
+  · have hq' : q = ⟨4, by decide⟩ := by ext; assumption
+    subst q
+    cases sym with
+    | none => cases wsym <;> simp [DThirdCodeTM, DThirdCodeState.start,
+        DThirdCodeState.scanFirst, DThirdCodeState.scanSecond,
+        DThirdCodeState.copy, DThirdCodeState.done, DThirdCodeState.reject]
+    | some b => cases b <;> cases wsym <;> simp [DThirdCodeTM, DThirdCodeState.start,
+        DThirdCodeState.scanFirst, DThirdCodeState.scanSecond,
+        DThirdCodeState.copy, DThirdCodeState.done, DThirdCodeState.reject]
+  · have hq' : q = ⟨5, by decide⟩ := by ext; assumption
+    subst q
+    cases sym with
+    | none => cases wsym <;> simp [DThirdCodeTM, DThirdCodeState.start,
+        DThirdCodeState.scanFirst, DThirdCodeState.scanSecond,
+        DThirdCodeState.copy, DThirdCodeState.done, DThirdCodeState.reject]
+    | some b => cases b <;> cases wsym <;> simp [DThirdCodeTM, DThirdCodeState.start,
+        DThirdCodeState.scanFirst, DThirdCodeState.scanSecond,
+        DThirdCodeState.copy, DThirdCodeState.done, DThirdCodeState.reject]
+
+theorem dPolyTimeComputableClean_thirdCode : DPolyTimeComputableClean thirdCode := by
+  refine DPolyTimeComputableClean.of_machine DThirdCodeTM (X + C 2) X
+    thirdCode ?_ ?_ ?_ ?_
+  · intro q
+    rfl
+  · exact DThirdCodeTM_noWork
+  · intro x
+    simpa using DThirdCodeTM_halts x
+  · intro x
+    constructor
+    · change Dboutput DThirdCodeTM ((X + C 2).eval x.length) x = thirdCode x
+      simpa using DThirdCodeTM_output x
+    · simpa [thirdCode] using (dropFirstUnary_length_le (dropFirstUnary x)).trans
+        (dropFirstUnary_length_le x)
+
+
+-- ---------------------------------------------------------------------------
+-- A clean transducer that inserts a variable tag and keeps exactly two codes
+-- ---------------------------------------------------------------------------
+
+abbrev DTrunc2VarTagState := Fin 7
+
+namespace DTrunc2VarTagState
+
+def start : DTrunc2VarTagState := ⟨0, by decide⟩
+def scanFirst : DTrunc2VarTagState := ⟨1, by decide⟩
+def emit0 : DTrunc2VarTagState := ⟨2, by decide⟩
+def emit1 : DTrunc2VarTagState := ⟨3, by decide⟩
+def scanSecond : DTrunc2VarTagState := ⟨4, by decide⟩
+def done : DTrunc2VarTagState := ⟨5, by decide⟩
+def reject : DTrunc2VarTagState := ⟨6, by decide⟩
+
+end DTrunc2VarTagState
+
+/-- Insert the second-variable tag after the first unary code, copy the second
+    unary code, and stop before any remaining input. -/
+def DTrunc2VarTagTM : DTM DTrunc2VarTagState where
+  step := fun q sym _ =>
+    if q = DTrunc2VarTagState.start then
+      { next := DTrunc2VarTagState.scanFirst, output := none, inputMove := some true
+        workWrite := none, workMove := none }
+    else if q = DTrunc2VarTagState.scanFirst then
+      match sym with
+      | some b =>
+          if b then
+            { next := DTrunc2VarTagState.scanFirst, output := some b,
+              inputMove := some true, workWrite := none, workMove := none }
+          else
+            { next := DTrunc2VarTagState.emit0, output := some b,
+              inputMove := some true, workWrite := none, workMove := none }
+      | none =>
+          { next := DTrunc2VarTagState.emit0, output := none, inputMove := none,
+            workWrite := none, workMove := none }
+    else if q = DTrunc2VarTagState.emit0 then
+      { next := DTrunc2VarTagState.emit1, output := some false, inputMove := none
+        workWrite := none, workMove := none }
+    else if q = DTrunc2VarTagState.emit1 then
+      { next := DTrunc2VarTagState.scanSecond, output := some false, inputMove := none
+        workWrite := none, workMove := none }
+    else if q = DTrunc2VarTagState.scanSecond then
+      match sym with
+      | some true =>
+          { next := DTrunc2VarTagState.scanSecond, output := some true,
+            inputMove := some true, workWrite := none, workMove := none }
+      | some false =>
+          { next := DTrunc2VarTagState.done, output := some false,
+            inputMove := some true, workWrite := none, workMove := none }
+      | none =>
+          { next := DTrunc2VarTagState.done, output := none, inputMove := none
+            workWrite := none, workMove := none }
+    else
+      { next := q, output := none, inputMove := none
+        workWrite := none, workMove := none }
+  start := DTrunc2VarTagState.start
+  accept := DTrunc2VarTagState.done
+  reject := DTrunc2VarTagState.reject
+
+lemma Drun_DTrunc2VarTagTM_start (z : Word) :
+    Drun DTrunc2VarTagTM 1 (Dinit DTrunc2VarTagTM z) =
+      { state := DTrunc2VarTagState.scanFirst, input := z, head := 1, output := [],
+        work := fun _ : Nat => false, workHead := 0 } := by
+  simp [Drun, Dhalted, Dinit, Dstep, Dread, DTrunc2VarTagTM, Dmove,
+    DTrunc2VarTagState.start, DTrunc2VarTagState.scanFirst,
+    DTrunc2VarTagState.emit0, DTrunc2VarTagState.emit1,
+    DTrunc2VarTagState.scanSecond, DTrunc2VarTagState.done,
+    DTrunc2VarTagState.reject]
+
+lemma Drun_DTrunc2VarTagTM_scan_all_true (pre : Word) (k : Nat)
+    (wk : Nat → Bool) (wh : Nat) :
+    Drun DTrunc2VarTagTM (k + 1)
+      { state := DTrunc2VarTagState.scanFirst,
+        input := pre ++ List.replicate k true, head := pre.length + 1,
+        output := pre, work := wk, workHead := wh } =
+      { state := DTrunc2VarTagState.emit0,
+        input := pre ++ List.replicate k true, head := pre.length + k + 1,
+        output := pre ++ List.replicate k true, work := wk, workHead := wh } := by
+  induction k generalizing pre with
+  | zero =>
+      simp [Drun, Dhalted, Dstep, Dread, Dmove, DTrunc2VarTagTM,
+        DTrunc2VarTagState.start, DTrunc2VarTagState.scanFirst,
+        DTrunc2VarTagState.emit0, DTrunc2VarTagState.emit1,
+        DTrunc2VarTagState.scanSecond, DTrunc2VarTagState.done,
+        DTrunc2VarTagState.reject]
+  | succ k ih =>
+      rw [show k.succ + 1 = 1 + (k + 1) by omega, Drun_add_eq]
+      let c : DConfig DTrunc2VarTagState :=
+        { state := DTrunc2VarTagState.scanFirst,
+          input := pre ++ List.replicate k.succ true, head := pre.length + 1,
+          output := pre, work := wk, workHead := wh }
+      let c' : DConfig DTrunc2VarTagState :=
+        { state := DTrunc2VarTagState.scanFirst,
+          input := pre ++ List.replicate k.succ true, head := pre.length + 2,
+          output := pre ++ [true], work := wk, workHead := wh }
+      have hstep : Drun DTrunc2VarTagTM 1 c = c' := by
+        simp [c, c', Drun, Dhalted, Dstep, Dread, DTrunc2VarTagTM, Dmove,
+          List.replicate_succ, DTrunc2VarTagState.start,
+          DTrunc2VarTagState.scanFirst, DTrunc2VarTagState.emit0,
+          DTrunc2VarTagState.emit1, DTrunc2VarTagState.scanSecond,
+          DTrunc2VarTagState.done, DTrunc2VarTagState.reject]
+      change Drun DTrunc2VarTagTM (k + 1) (Drun DTrunc2VarTagTM 1 c) = _
+      rw [hstep]
+      simpa [c', List.replicate_succ, List.append_assoc,
+        Nat.add_assoc, Nat.add_comm, Nat.add_left_comm] using ih (pre := pre ++ [true])
+
+lemma Drun_DTrunc2VarTagTM_scan_trues (pre z : Word) (k : Nat)
+    (wk : Nat → Bool) (wh : Nat) :
+    Drun DTrunc2VarTagTM (k + 1)
+      { state := DTrunc2VarTagState.scanFirst,
+        input := pre ++ List.replicate k true ++ false :: z,
+        head := pre.length + 1, output := pre, work := wk, workHead := wh } =
+      { state := DTrunc2VarTagState.emit0,
+        input := pre ++ List.replicate k true ++ false :: z,
+        head := pre.length + k + 2,
+        output := pre ++ List.replicate k true ++ [false],
+        work := wk, workHead := wh } := by
+  induction k generalizing pre with
+  | zero =>
+      simp [Drun, Dhalted, Dstep, Dread, DTrunc2VarTagTM, Dmove,
+        DTrunc2VarTagState.start, DTrunc2VarTagState.scanFirst,
+        DTrunc2VarTagState.emit0, DTrunc2VarTagState.emit1,
+        DTrunc2VarTagState.scanSecond, DTrunc2VarTagState.done,
+        DTrunc2VarTagState.reject]
+  | succ k ih =>
+      rw [show k.succ + 1 = 1 + (k + 1) by omega, Drun_add_eq]
+      let c : DConfig DTrunc2VarTagState :=
+        { state := DTrunc2VarTagState.scanFirst,
+          input := pre ++ List.replicate k.succ true ++ false :: z,
+          head := pre.length + 1, output := pre, work := wk, workHead := wh }
+      let c' : DConfig DTrunc2VarTagState :=
+        { state := DTrunc2VarTagState.scanFirst,
+          input := pre ++ List.replicate k.succ true ++ false :: z,
+          head := pre.length + 2, output := pre ++ [true],
+          work := wk, workHead := wh }
+      have hstep : Drun DTrunc2VarTagTM 1 c = c' := by
+        simp [c, c', Drun, Dhalted, Dstep, Dread, DTrunc2VarTagTM, Dmove,
+          List.replicate_succ, DTrunc2VarTagState.start,
+          DTrunc2VarTagState.scanFirst, DTrunc2VarTagState.emit0,
+          DTrunc2VarTagState.emit1, DTrunc2VarTagState.scanSecond,
+          DTrunc2VarTagState.done, DTrunc2VarTagState.reject]
+      change Drun DTrunc2VarTagTM (k + 1) (Drun DTrunc2VarTagTM 1 c) = _
+      rw [hstep]
+      simpa [c', List.replicate_succ, List.append_assoc,
+        Nat.add_assoc, Nat.add_comm, Nat.add_left_comm] using ih (pre := pre ++ [true])
+
+lemma Drun_DTrunc2VarTagTM_emit (inp out : Word) (h : Nat)
+    (wk : Nat → Bool) (wh : Nat) :
+    Drun DTrunc2VarTagTM 2
+      { state := DTrunc2VarTagState.emit0, input := inp, head := h,
+        output := out, work := wk, workHead := wh } =
+      { state := DTrunc2VarTagState.scanSecond, input := inp, head := h,
+        output := out ++ [false, false], work := wk, workHead := wh } := by
+  simp [Drun, Dhalted, Dstep, DTrunc2VarTagTM,
+    DTrunc2VarTagState.start, DTrunc2VarTagState.scanFirst,
+    DTrunc2VarTagState.emit0, DTrunc2VarTagState.emit1,
+    DTrunc2VarTagState.scanSecond, DTrunc2VarTagState.done,
+    DTrunc2VarTagState.reject, List.append_assoc]
+
+lemma Drun_DTrunc2VarTagTM_scanSecond (pre z out : Word)
+    (wk : Nat → Bool) (wh : Nat) :
+    Drun DTrunc2VarTagTM (z.length + 1)
+      { state := DTrunc2VarTagState.scanSecond, input := pre ++ z,
+        head := pre.length + 1, output := out, work := wk, workHead := wh } =
+      { state := DTrunc2VarTagState.done, input := pre ++ z,
+        head := pre.length + (firstUnaryCode z).length + 1,
+        output := out ++ firstUnaryCode z, work := wk, workHead := wh } := by
+  induction z generalizing pre out with
+  | nil =>
+      simp [Drun, Dhalted, Dstep, Dread, DTrunc2VarTagTM,
+        DTrunc2VarTagState.start, DTrunc2VarTagState.scanFirst,
+        DTrunc2VarTagState.emit0, DTrunc2VarTagState.emit1,
+        DTrunc2VarTagState.scanSecond, DTrunc2VarTagState.done,
+        DTrunc2VarTagState.reject, firstUnaryCode]
+  | cons b bs ih =>
+      rw [show (b :: bs).length + 1 = 1 + (bs.length + 1) by
+        simp [Nat.add_comm, Nat.add_left_comm], Drun_add_eq]
+      let c : DConfig DTrunc2VarTagState :=
+        { state := DTrunc2VarTagState.scanSecond, input := pre ++ b :: bs,
+          head := pre.length + 1, output := out, work := wk, workHead := wh }
+      cases b with
+      | true =>
+          let c' : DConfig DTrunc2VarTagState :=
+            { state := DTrunc2VarTagState.scanSecond, input := pre ++ true :: bs,
+              head := pre.length + 2, output := out ++ [true], work := wk, workHead := wh }
+          have hstep : Drun DTrunc2VarTagTM 1 c = c' := by
+            simp [c, c', Drun, Dhalted, Dstep, Dread, DTrunc2VarTagTM, Dmove,
+              DTrunc2VarTagState.start, DTrunc2VarTagState.scanFirst,
+              DTrunc2VarTagState.emit0, DTrunc2VarTagState.emit1,
+              DTrunc2VarTagState.scanSecond, DTrunc2VarTagState.done,
+              DTrunc2VarTagState.reject]
+          change Drun DTrunc2VarTagTM (bs.length + 1) (Drun DTrunc2VarTagTM 1 c) = _
+          rw [hstep]
+          simpa [c', List.append_assoc, Nat.add_assoc, Nat.add_comm, Nat.add_left_comm,
+            firstUnaryCode] using ih (pre := pre ++ [true]) (out := out ++ [true])
+      | false =>
+          let c' : DConfig DTrunc2VarTagState :=
+            { state := DTrunc2VarTagState.done, input := pre ++ false :: bs,
+              head := pre.length + 2, output := out ++ [false], work := wk, workHead := wh }
+          have hstep : Drun DTrunc2VarTagTM 1 c = c' := by
+            simp [c, c', Drun, Dhalted, Dstep, Dread, DTrunc2VarTagTM, Dmove,
+              DTrunc2VarTagState.start, DTrunc2VarTagState.scanFirst,
+              DTrunc2VarTagState.emit0, DTrunc2VarTagState.emit1,
+              DTrunc2VarTagState.scanSecond, DTrunc2VarTagState.done,
+              DTrunc2VarTagState.reject]
+          have hhalt : Dhalted DTrunc2VarTagTM c' = true := by
+            simp [c', Dhalted, DTrunc2VarTagTM, DTrunc2VarTagState.done]
+          change Drun DTrunc2VarTagTM (bs.length + 1) (Drun DTrunc2VarTagTM 1 c) = _
+          rw [hstep]
+          rw [Drun_halted DTrunc2VarTagTM c' (bs.length + 1) hhalt]
+          simp [c', firstUnaryCode]
+
+lemma Drun_DTrunc2VarTagTM_all_true_run (i : Nat) :
+    Drun DTrunc2VarTagTM (i + 5) (Dinit DTrunc2VarTagTM (List.replicate i true)) =
+      { state := DTrunc2VarTagState.done, input := List.replicate i true,
+        head := i + 1, output := List.replicate i true ++ [false, false],
+        work := fun _ : Nat => false, workHead := 0 } := by
+  have hstart := Drun_DTrunc2VarTagTM_start (List.replicate i true)
+  have hscan : Drun DTrunc2VarTagTM (i + 1)
+      { state := DTrunc2VarTagState.scanFirst,
+        input := List.replicate i true, head := 1, output := [],
+        work := fun _ : Nat => false, workHead := 0 } =
+      { state := DTrunc2VarTagState.emit0,
+        input := List.replicate i true, head := i + 1,
+        output := List.replicate i true,
+        work := fun _ : Nat => false, workHead := 0 } := by
+    simpa using (Drun_DTrunc2VarTagTM_scan_all_true [] i (fun _ : Nat => false) 0)
+  have hemit := Drun_DTrunc2VarTagTM_emit (List.replicate i true)
+    (List.replicate i true) (i + 1) (fun _ : Nat => false) 0
+  have hsecond : Drun DTrunc2VarTagTM 1
+      { state := DTrunc2VarTagState.scanSecond, input := List.replicate i true,
+        head := i + 1, output := List.replicate i true ++ [false, false],
+        work := fun _ : Nat => false, workHead := 0 } =
+      { state := DTrunc2VarTagState.done, input := List.replicate i true,
+        head := i + 1, output := List.replicate i true ++ [false, false],
+        work := fun _ : Nat => false, workHead := 0 } := by
+    simpa [firstUnaryCode] using
+      (Drun_DTrunc2VarTagTM_scanSecond (List.replicate i true) ([] : Word)
+        (List.replicate i true ++ [false, false]) (fun _ : Nat => false) 0)
+  rw [show i + 5 = 1 + ((i + 1) + (2 + 1)) by omega, Drun_add_eq, hstart]
+  rw [Drun_add_eq, hscan]
+  rw [Drun_add_eq, hemit]
+  rw [hsecond]
+
+lemma Drun_DTrunc2VarTagTM_false_run (i : Nat) (zs : Word) :
+    Drun DTrunc2VarTagTM (i + zs.length + 5)
+      (Dinit DTrunc2VarTagTM (List.replicate i true ++ false :: zs)) =
+      { state := DTrunc2VarTagState.done,
+        input := List.replicate i true ++ false :: zs,
+        head := i + 1 + (firstUnaryCode zs).length + 1,
+        output := List.replicate i true ++ [false] ++ [false, false] ++
+          firstUnaryCode zs,
+        work := fun _ : Nat => false, workHead := 0 } := by
+  let x : Word := List.replicate i true ++ false :: zs
+  have hstart := Drun_DTrunc2VarTagTM_start x
+  have hscan : Drun DTrunc2VarTagTM (i + 1)
+      { state := DTrunc2VarTagState.scanFirst, input := x, head := 1,
+        output := [], work := fun _ : Nat => false, workHead := 0 } =
+      { state := DTrunc2VarTagState.emit0, input := x, head := i + 2,
+        output := List.replicate i true ++ [false],
+        work := fun _ : Nat => false, workHead := 0 } := by
+    simpa [x] using (Drun_DTrunc2VarTagTM_scan_trues [] zs i (fun _ : Nat => false) 0)
+  have hemit : Drun DTrunc2VarTagTM 2
+      { state := DTrunc2VarTagState.emit0, input := x, head := i + 2,
+        output := List.replicate i true ++ [false],
+        work := fun _ : Nat => false, workHead := 0 } =
+      { state := DTrunc2VarTagState.scanSecond, input := x, head := i + 2,
+        output := List.replicate i true ++ [false] ++ [false, false],
+        work := fun _ : Nat => false, workHead := 0 } := by
+    simpa using (Drun_DTrunc2VarTagTM_emit x (List.replicate i true ++ [false])
+      (i + 2) (fun _ : Nat => false) 0)
+  have hsecond : Drun DTrunc2VarTagTM (zs.length + 1)
+      { state := DTrunc2VarTagState.scanSecond, input := x, head := i + 2,
+        output := List.replicate i true ++ [false] ++ [false, false],
+        work := fun _ : Nat => false, workHead := 0 } =
+      { state := DTrunc2VarTagState.done, input := x,
+        head := i + 1 + (firstUnaryCode zs).length + 1,
+        output := List.replicate i true ++ [false] ++ [false, false] ++
+          firstUnaryCode zs,
+        work := fun _ : Nat => false, workHead := 0 } := by
+    simpa [x, List.append_assoc] using
+      (Drun_DTrunc2VarTagTM_scanSecond
+        (List.replicate i true ++ [false]) zs
+        (List.replicate i true ++ [false] ++ [false, false])
+        (fun _ : Nat => false) 0)
+  rw [show i + zs.length + 5 = 1 + ((i + 1) + (2 + (zs.length + 1))) by omega]
+  rw [Drun_add_eq, hstart]
+  rw [Drun_add_eq, hscan]
+  rw [Drun_add_eq, hemit]
+  rw [hsecond]
+
+lemma Drun_DTrunc2VarTagTM_full (z : Word) :
+    ∃ s : Nat, s ≤ z.length + 5 ∧
+      Dhalted DTrunc2VarTagTM (Drun DTrunc2VarTagTM s (Dinit DTrunc2VarTagTM z)) = true ∧
+      (Drun DTrunc2VarTagTM s (Dinit DTrunc2VarTagTM z)).output =
+        insertVarTagTotal (firstTwoCodes z) := by
+  rcases word_eq_replicate_true_append z with ⟨i, y, hzy, hy⟩
+  subst z
+  rcases hy with rfl | ⟨zs, rfl⟩
+  · refine ⟨i + 5, by simp, ?_, ?_⟩
+    · simp only [List.append_nil]
+      rw [Drun_DTrunc2VarTagTM_all_true_run i]
+      simp [Dhalted, DTrunc2VarTagTM, DTrunc2VarTagState.done]
+    · simp only [List.append_nil]
+      rw [Drun_DTrunc2VarTagTM_all_true_run i]
+      simp [firstTwoCodes_all_true, insertVarTagTotal_replicate_true]
+  · refine ⟨i + zs.length + 5, by simp, ?_, ?_⟩
+    · rw [Drun_DTrunc2VarTagTM_false_run i zs]
+      simp [Dhalted, DTrunc2VarTagTM, DTrunc2VarTagState.done]
+    · rw [Drun_DTrunc2VarTagTM_false_run i zs]
+      simp [firstTwoCodes_true_false, insertVarTagTotal_replicate_true_false,
+        List.append_assoc]
+
+lemma DTrunc2VarTagTM_noWork : DNoWork DTrunc2VarTagTM := by
+  intro q sym wsym
+  have hq : q.val = 0 ∨ q.val = 1 ∨ q.val = 2 ∨ q.val = 3 ∨ q.val = 4 ∨ q.val = 5 ∨ q.val = 6 := by omega
+  rcases hq with h0 | h1 | h2 | h3 | h4 | h5 | h6
+  · have hq' : q = ⟨0, by decide⟩ := by ext; assumption
+    subst q
+    cases sym with
+    | none => cases wsym <;> simp [DTrunc2VarTagTM, DTrunc2VarTagState.start,
+        DTrunc2VarTagState.scanFirst, DTrunc2VarTagState.emit0,
+        DTrunc2VarTagState.emit1, DTrunc2VarTagState.scanSecond,
+        DTrunc2VarTagState.done, DTrunc2VarTagState.reject]
+    | some b => cases b <;> cases wsym <;> simp [DTrunc2VarTagTM, DTrunc2VarTagState.start,
+        DTrunc2VarTagState.scanFirst, DTrunc2VarTagState.emit0,
+        DTrunc2VarTagState.emit1, DTrunc2VarTagState.scanSecond,
+        DTrunc2VarTagState.done, DTrunc2VarTagState.reject]
+  · have hq' : q = ⟨1, by decide⟩ := by ext; assumption
+    subst q
+    cases sym with
+    | none => cases wsym <;> simp [DTrunc2VarTagTM, DTrunc2VarTagState.start,
+        DTrunc2VarTagState.scanFirst, DTrunc2VarTagState.emit0,
+        DTrunc2VarTagState.emit1, DTrunc2VarTagState.scanSecond,
+        DTrunc2VarTagState.done, DTrunc2VarTagState.reject]
+    | some b => cases b <;> cases wsym <;> simp [DTrunc2VarTagTM, DTrunc2VarTagState.start,
+        DTrunc2VarTagState.scanFirst, DTrunc2VarTagState.emit0,
+        DTrunc2VarTagState.emit1, DTrunc2VarTagState.scanSecond,
+        DTrunc2VarTagState.done, DTrunc2VarTagState.reject]
+  · have hq' : q = ⟨2, by decide⟩ := by ext; assumption
+    subst q
+    cases sym with
+    | none => cases wsym <;> simp [DTrunc2VarTagTM, DTrunc2VarTagState.start,
+        DTrunc2VarTagState.scanFirst, DTrunc2VarTagState.emit0,
+        DTrunc2VarTagState.emit1, DTrunc2VarTagState.scanSecond,
+        DTrunc2VarTagState.done, DTrunc2VarTagState.reject]
+    | some b => cases b <;> cases wsym <;> simp [DTrunc2VarTagTM, DTrunc2VarTagState.start,
+        DTrunc2VarTagState.scanFirst, DTrunc2VarTagState.emit0,
+        DTrunc2VarTagState.emit1, DTrunc2VarTagState.scanSecond,
+        DTrunc2VarTagState.done, DTrunc2VarTagState.reject]
+  · have hq' : q = ⟨3, by decide⟩ := by ext; assumption
+    subst q
+    cases sym with
+    | none => cases wsym <;> simp [DTrunc2VarTagTM, DTrunc2VarTagState.start,
+        DTrunc2VarTagState.scanFirst, DTrunc2VarTagState.emit0,
+        DTrunc2VarTagState.emit1, DTrunc2VarTagState.scanSecond,
+        DTrunc2VarTagState.done, DTrunc2VarTagState.reject]
+    | some b => cases b <;> cases wsym <;> simp [DTrunc2VarTagTM, DTrunc2VarTagState.start,
+        DTrunc2VarTagState.scanFirst, DTrunc2VarTagState.emit0,
+        DTrunc2VarTagState.emit1, DTrunc2VarTagState.scanSecond,
+        DTrunc2VarTagState.done, DTrunc2VarTagState.reject]
+  · have hq' : q = ⟨4, by decide⟩ := by ext; assumption
+    subst q
+    cases sym with
+    | none => cases wsym <;> simp [DTrunc2VarTagTM, DTrunc2VarTagState.start,
+        DTrunc2VarTagState.scanFirst, DTrunc2VarTagState.emit0,
+        DTrunc2VarTagState.emit1, DTrunc2VarTagState.scanSecond,
+        DTrunc2VarTagState.done, DTrunc2VarTagState.reject]
+    | some b => cases b <;> cases wsym <;> simp [DTrunc2VarTagTM, DTrunc2VarTagState.start,
+        DTrunc2VarTagState.scanFirst, DTrunc2VarTagState.emit0,
+        DTrunc2VarTagState.emit1, DTrunc2VarTagState.scanSecond,
+        DTrunc2VarTagState.done, DTrunc2VarTagState.reject]
+  · have hq' : q = ⟨5, by decide⟩ := by ext; assumption
+    subst q
+    cases sym with
+    | none => cases wsym <;> simp [DTrunc2VarTagTM, DTrunc2VarTagState.start,
+        DTrunc2VarTagState.scanFirst, DTrunc2VarTagState.emit0,
+        DTrunc2VarTagState.emit1, DTrunc2VarTagState.scanSecond,
+        DTrunc2VarTagState.done, DTrunc2VarTagState.reject]
+    | some b => cases b <;> cases wsym <;> simp [DTrunc2VarTagTM, DTrunc2VarTagState.start,
+        DTrunc2VarTagState.scanFirst, DTrunc2VarTagState.emit0,
+        DTrunc2VarTagState.emit1, DTrunc2VarTagState.scanSecond,
+        DTrunc2VarTagState.done, DTrunc2VarTagState.reject]
+  · have hq' : q = ⟨6, by decide⟩ := by ext; assumption
+    subst q
+    cases sym with
+    | none => cases wsym <;> simp [DTrunc2VarTagTM, DTrunc2VarTagState.start,
+        DTrunc2VarTagState.scanFirst, DTrunc2VarTagState.emit0,
+        DTrunc2VarTagState.emit1, DTrunc2VarTagState.scanSecond,
+        DTrunc2VarTagState.done, DTrunc2VarTagState.reject]
+    | some b => cases b <;> cases wsym <;> simp [DTrunc2VarTagTM, DTrunc2VarTagState.start,
+        DTrunc2VarTagState.scanFirst, DTrunc2VarTagState.emit0,
+        DTrunc2VarTagState.emit1, DTrunc2VarTagState.scanSecond,
+        DTrunc2VarTagState.done, DTrunc2VarTagState.reject]
+
+theorem dPolyTimeComputableClean_trunc2VarTag :
+    DPolyTimeComputableClean (fun z => insertVarTagTotal (firstTwoCodes z)) := by
+  refine DPolyTimeComputableClean.of_machine DTrunc2VarTagTM (X + C 5) (X + C 2)
+    (fun z => insertVarTagTotal (firstTwoCodes z)) ?_ ?_ ?_ ?_
+  · intro q
+    rfl
+  · exact DTrunc2VarTagTM_noWork
+  · intro z
+    rcases Drun_DTrunc2VarTagTM_full z with ⟨s, hs, hh, hout⟩
+    rw [Drun_eq_of_halted_within DTrunc2VarTagTM (Dinit DTrunc2VarTagTM z)
+      (by simpa using hs) hh]
+    exact hh
+  · intro z
+    rcases Drun_DTrunc2VarTagTM_full z with ⟨s, hs, hh, hout⟩
+    constructor
+    · simp only [Polynomial.eval_add, Polynomial.eval_X, Polynomial.eval_C]
+      dsimp [Dboutput]
+      rw [Drun_eq_of_halted_within DTrunc2VarTagTM (Dinit DTrunc2VarTagTM z)
+        (by simpa using hs) hh]
+      exact hout
+    · simp [insertVarTagTotal_length, firstTwoCodes_length_le]
+
+
+theorem DPolyTimeComputableClean_prepend (y : Word) {f : Word → Word}
+    (hf : DPolyTimeComputableClean f) : DPolyTimeComputableClean (fun x => y ++ f x) := by
+  simpa using DPolyTimeComputableCleanAppend (fun _ : Word => y) f
+    (dPolyTimeComputableClean_const y) hf
+
+theorem DPolyTimeComputableClean_appendFixed {f : Word → Word}
+    (hf : DPolyTimeComputableClean f) (y : Word) :
+    DPolyTimeComputableClean (fun x => f x ++ y) := by
+  simpa using DPolyTimeComputableCleanAppend f (fun _ : Word => y)
+    hf (dPolyTimeComputableClean_const y)
+
+theorem dPolyTimeComputableClean_pairOrNotVarVarEncode :
+    DPolyTimeComputableClean Formula.pairOrNotVarVarEncode := by
+  change DPolyTimeComputableClean
+    (fun x => ([true, true, false, true, false, false] : Word) ++ insertVarTagTotal x)
+  exact DPolyTimeComputableClean_prepend [true, true, false, true, false, false]
+    dPolyTimeComputableClean_insertVarTagTotal
+
+theorem dPolyTimeComputableClean_pairVarNotVarEncode :
+    DPolyTimeComputableClean Formula.pairVarNotVarEncode := by
+  change DPolyTimeComputableClean
+    (fun x => ([true, true, false, false] : Word) ++ insertNotVarTagTotal x)
+  exact DPolyTimeComputableClean_prepend [true, true, false, false]
+    dPolyTimeComputableClean_insertNotVarTagTotal
+
+theorem dPolyTimeComputableClean_pairOrNotVarVarEncode_firstTwoCodes :
+    DPolyTimeComputableClean (fun z => Formula.pairOrNotVarVarEncode (firstTwoCodes z)) := by
+  change DPolyTimeComputableClean
+    (fun z => ([true, true, false, true, false, false] : Word) ++
+      insertVarTagTotal (firstTwoCodes z))
+  exact DPolyTimeComputableClean_prepend [true, true, false, true, false, false]
+    dPolyTimeComputableClean_trunc2VarTag
+
+
+abbrev DTrunc2NotVarTagState := Fin 9
+
+namespace DTrunc2NotVarTagState
+
+def start : DTrunc2NotVarTagState := ⟨0, by decide⟩
+def scanFirst : DTrunc2NotVarTagState := ⟨1, by decide⟩
+def emit0 : DTrunc2NotVarTagState := ⟨2, by decide⟩
+def emit1 : DTrunc2NotVarTagState := ⟨3, by decide⟩
+def emit2 : DTrunc2NotVarTagState := ⟨4, by decide⟩
+def emit3 : DTrunc2NotVarTagState := ⟨5, by decide⟩
+def scanSecond : DTrunc2NotVarTagState := ⟨6, by decide⟩
+def done : DTrunc2NotVarTagState := ⟨7, by decide⟩
+def reject : DTrunc2NotVarTagState := ⟨8, by decide⟩
+
+end DTrunc2NotVarTagState
+
+/-- Insert the second-variable tag after the first unary code, copy the second
+    unary code, and stop before any remaining input. -/
+def DTrunc2NotVarTagTM : DTM DTrunc2NotVarTagState where
+  step := fun q sym _ =>
+    if q = DTrunc2NotVarTagState.start then
+      { next := DTrunc2NotVarTagState.scanFirst, output := none, inputMove := some true
+        workWrite := none, workMove := none }
+    else if q = DTrunc2NotVarTagState.scanFirst then
+      match sym with
+      | some b =>
+          if b then
+            { next := DTrunc2NotVarTagState.scanFirst, output := some b,
+              inputMove := some true, workWrite := none, workMove := none }
+          else
+            { next := DTrunc2NotVarTagState.emit0, output := some b,
+              inputMove := some true, workWrite := none, workMove := none }
+      | none =>
+          { next := DTrunc2NotVarTagState.emit0, output := none, inputMove := none,
+            workWrite := none, workMove := none }
+    else if q.val = 2 then
+      { next := DTrunc2NotVarTagState.emit1, output := some false, inputMove := none
+        workWrite := none, workMove := none }
+    else if q.val = 3 then
+      { next := DTrunc2NotVarTagState.emit2, output := some true, inputMove := none
+        workWrite := none, workMove := none }
+    else if q.val = 4 then
+      { next := DTrunc2NotVarTagState.emit3, output := some false, inputMove := none
+        workWrite := none, workMove := none }
+    else if q.val = 5 then
+      { next := DTrunc2NotVarTagState.scanSecond, output := some false, inputMove := none
+        workWrite := none, workMove := none }
+    else if q = DTrunc2NotVarTagState.scanSecond then
+      match sym with
+      | some true =>
+          { next := DTrunc2NotVarTagState.scanSecond, output := some true,
+            inputMove := some true, workWrite := none, workMove := none }
+      | some false =>
+          { next := DTrunc2NotVarTagState.done, output := some false,
+            inputMove := some true, workWrite := none, workMove := none }
+      | none =>
+          { next := DTrunc2NotVarTagState.done, output := none, inputMove := none
+            workWrite := none, workMove := none }
+    else
+      { next := q, output := none, inputMove := none
+        workWrite := none, workMove := none }
+  start := DTrunc2NotVarTagState.start
+  accept := DTrunc2NotVarTagState.done
+  reject := DTrunc2NotVarTagState.reject
+
+lemma Drun_DTrunc2NotVarTagTM_start (z : Word) :
+    Drun DTrunc2NotVarTagTM 1 (Dinit DTrunc2NotVarTagTM z) =
+      { state := DTrunc2NotVarTagState.scanFirst, input := z, head := 1, output := [],
+        work := fun _ : Nat => false, workHead := 0 } := by
+  simp [Drun, Dhalted, Dinit, Dstep, Dread, DTrunc2NotVarTagTM, Dmove,
+    DTrunc2NotVarTagState.start, DTrunc2NotVarTagState.scanFirst,
+    DTrunc2NotVarTagState.emit0, DTrunc2NotVarTagState.emit1,
+    DTrunc2NotVarTagState.emit2, DTrunc2NotVarTagState.emit3,
+    DTrunc2NotVarTagState.scanSecond, DTrunc2NotVarTagState.done,
+    DTrunc2NotVarTagState.reject]
+
+lemma Drun_DTrunc2NotVarTagTM_scan_all_true (pre : Word) (k : Nat)
+    (wk : Nat → Bool) (wh : Nat) :
+    Drun DTrunc2NotVarTagTM (k + 1)
+      { state := DTrunc2NotVarTagState.scanFirst,
+        input := pre ++ List.replicate k true, head := pre.length + 1,
+        output := pre, work := wk, workHead := wh } =
+      { state := DTrunc2NotVarTagState.emit0,
+        input := pre ++ List.replicate k true, head := pre.length + k + 1,
+        output := pre ++ List.replicate k true, work := wk, workHead := wh } := by
+  induction k generalizing pre with
+  | zero =>
+      simp [Drun, Dhalted, Dstep, Dread, Dmove, DTrunc2NotVarTagTM,
+        DTrunc2NotVarTagState.start, DTrunc2NotVarTagState.scanFirst,
+        DTrunc2NotVarTagState.emit0, DTrunc2NotVarTagState.emit1,
+        DTrunc2NotVarTagState.emit2, DTrunc2NotVarTagState.emit3,
+        DTrunc2NotVarTagState.scanSecond, DTrunc2NotVarTagState.done,
+        DTrunc2NotVarTagState.reject]
+  | succ k ih =>
+      rw [show k.succ + 1 = 1 + (k + 1) by omega, Drun_add_eq]
+      let c : DConfig DTrunc2NotVarTagState :=
+        { state := DTrunc2NotVarTagState.scanFirst,
+          input := pre ++ List.replicate k.succ true, head := pre.length + 1,
+          output := pre, work := wk, workHead := wh }
+      let c' : DConfig DTrunc2NotVarTagState :=
+        { state := DTrunc2NotVarTagState.scanFirst,
+          input := pre ++ List.replicate k.succ true, head := pre.length + 2,
+          output := pre ++ [true], work := wk, workHead := wh }
+      have hstep : Drun DTrunc2NotVarTagTM 1 c = c' := by
+        simp [c, c', Drun, Dhalted, Dstep, Dread, DTrunc2NotVarTagTM, Dmove,
+          List.replicate_succ, DTrunc2NotVarTagState.start,
+          DTrunc2NotVarTagState.scanFirst, DTrunc2NotVarTagState.emit0,
+          DTrunc2NotVarTagState.emit1, DTrunc2NotVarTagState.scanSecond,
+          DTrunc2NotVarTagState.done, DTrunc2NotVarTagState.reject]
+      change Drun DTrunc2NotVarTagTM (k + 1) (Drun DTrunc2NotVarTagTM 1 c) = _
+      rw [hstep]
+      simpa [c', List.replicate_succ, List.append_assoc,
+        Nat.add_assoc, Nat.add_comm, Nat.add_left_comm] using ih (pre := pre ++ [true])
+
+lemma Drun_DTrunc2NotVarTagTM_scan_trues (pre z : Word) (k : Nat)
+    (wk : Nat → Bool) (wh : Nat) :
+    Drun DTrunc2NotVarTagTM (k + 1)
+      { state := DTrunc2NotVarTagState.scanFirst,
+        input := pre ++ List.replicate k true ++ false :: z,
+        head := pre.length + 1, output := pre, work := wk, workHead := wh } =
+      { state := DTrunc2NotVarTagState.emit0,
+        input := pre ++ List.replicate k true ++ false :: z,
+        head := pre.length + k + 2,
+        output := pre ++ List.replicate k true ++ [false],
+        work := wk, workHead := wh } := by
+  induction k generalizing pre with
+  | zero =>
+      simp [Drun, Dhalted, Dstep, Dread, DTrunc2NotVarTagTM, Dmove,
+        DTrunc2NotVarTagState.start, DTrunc2NotVarTagState.scanFirst,
+        DTrunc2NotVarTagState.emit0, DTrunc2NotVarTagState.emit1,
+        DTrunc2NotVarTagState.emit2, DTrunc2NotVarTagState.emit3,
+        DTrunc2NotVarTagState.scanSecond, DTrunc2NotVarTagState.done,
+        DTrunc2NotVarTagState.reject]
+  | succ k ih =>
+      rw [show k.succ + 1 = 1 + (k + 1) by omega, Drun_add_eq]
+      let c : DConfig DTrunc2NotVarTagState :=
+        { state := DTrunc2NotVarTagState.scanFirst,
+          input := pre ++ List.replicate k.succ true ++ false :: z,
+          head := pre.length + 1, output := pre, work := wk, workHead := wh }
+      let c' : DConfig DTrunc2NotVarTagState :=
+        { state := DTrunc2NotVarTagState.scanFirst,
+          input := pre ++ List.replicate k.succ true ++ false :: z,
+          head := pre.length + 2, output := pre ++ [true],
+          work := wk, workHead := wh }
+      have hstep : Drun DTrunc2NotVarTagTM 1 c = c' := by
+        simp [c, c', Drun, Dhalted, Dstep, Dread, DTrunc2NotVarTagTM, Dmove,
+          List.replicate_succ, DTrunc2NotVarTagState.start,
+          DTrunc2NotVarTagState.scanFirst, DTrunc2NotVarTagState.emit0,
+          DTrunc2NotVarTagState.emit1, DTrunc2NotVarTagState.scanSecond,
+          DTrunc2NotVarTagState.done, DTrunc2NotVarTagState.reject]
+      change Drun DTrunc2NotVarTagTM (k + 1) (Drun DTrunc2NotVarTagTM 1 c) = _
+      rw [hstep]
+      simpa [c', List.replicate_succ, List.append_assoc,
+        Nat.add_assoc, Nat.add_comm, Nat.add_left_comm] using ih (pre := pre ++ [true])
+
+lemma Drun_DTrunc2NotVarTagTM_emit (inp out : Word) (h : Nat)
+    (wk : Nat → Bool) (wh : Nat) :
+    Drun DTrunc2NotVarTagTM 4
+      { state := DTrunc2NotVarTagState.emit0, input := inp, head := h,
+        output := out, work := wk, workHead := wh } =
+      { state := DTrunc2NotVarTagState.scanSecond, input := inp, head := h,
+        output := out ++ [false, true, false, false], work := wk, workHead := wh } := by
+  let c0 : DConfig DTrunc2NotVarTagState :=
+    { state := DTrunc2NotVarTagState.emit0, input := inp, head := h,
+      output := out, work := wk, workHead := wh }
+  let c1 : DConfig DTrunc2NotVarTagState :=
+    { state := DTrunc2NotVarTagState.emit1, input := inp, head := h,
+      output := out ++ [false], work := wk, workHead := wh }
+  let c2 : DConfig DTrunc2NotVarTagState :=
+    { state := DTrunc2NotVarTagState.emit2, input := inp, head := h,
+      output := out ++ [false, true], work := wk, workHead := wh }
+  let c3 : DConfig DTrunc2NotVarTagState :=
+    { state := DTrunc2NotVarTagState.emit3, input := inp, head := h,
+      output := out ++ [false, true, false], work := wk, workHead := wh }
+  let c4 : DConfig DTrunc2NotVarTagState :=
+    { state := DTrunc2NotVarTagState.scanSecond, input := inp, head := h,
+      output := out ++ [false, true, false, false], work := wk, workHead := wh }
+  have h1 : Drun DTrunc2NotVarTagTM 1 c0 = c1 := by
+    simp [c0, c1, Drun, Dhalted, Dstep, Dread, Dmove, DTrunc2NotVarTagTM,
+      DTrunc2NotVarTagState.start, DTrunc2NotVarTagState.scanFirst,
+      DTrunc2NotVarTagState.emit0, DTrunc2NotVarTagState.emit1,
+      DTrunc2NotVarTagState.emit2, DTrunc2NotVarTagState.emit3,
+      DTrunc2NotVarTagState.scanSecond, DTrunc2NotVarTagState.done,
+      DTrunc2NotVarTagState.reject, List.append_assoc]
+  have h2 : Drun DTrunc2NotVarTagTM 1 c1 = c2 := by
+    simp [c1, c2, Drun, Dhalted, Dstep, Dread, Dmove, DTrunc2NotVarTagTM,
+      DTrunc2NotVarTagState.start, DTrunc2NotVarTagState.scanFirst,
+      DTrunc2NotVarTagState.emit0, DTrunc2NotVarTagState.emit1,
+      DTrunc2NotVarTagState.emit2, DTrunc2NotVarTagState.emit3,
+      DTrunc2NotVarTagState.scanSecond, DTrunc2NotVarTagState.done,
+      DTrunc2NotVarTagState.reject, List.append_assoc]
+  have h3 : Drun DTrunc2NotVarTagTM 1 c2 = c3 := by
+    simp [c2, c3, Drun, Dhalted, Dstep, Dread, Dmove, DTrunc2NotVarTagTM,
+      DTrunc2NotVarTagState.start, DTrunc2NotVarTagState.scanFirst,
+      DTrunc2NotVarTagState.emit0, DTrunc2NotVarTagState.emit1,
+      DTrunc2NotVarTagState.emit2, DTrunc2NotVarTagState.emit3,
+      DTrunc2NotVarTagState.scanSecond, DTrunc2NotVarTagState.done,
+      DTrunc2NotVarTagState.reject, List.append_assoc]
+  have h4 : Drun DTrunc2NotVarTagTM 1 c3 = c4 := by
+    simp [c3, c4, Drun, Dhalted, Dstep, Dread, Dmove, DTrunc2NotVarTagTM,
+      DTrunc2NotVarTagState.start, DTrunc2NotVarTagState.scanFirst,
+      DTrunc2NotVarTagState.emit0, DTrunc2NotVarTagState.emit1,
+      DTrunc2NotVarTagState.emit2, DTrunc2NotVarTagState.emit3,
+      DTrunc2NotVarTagState.scanSecond, DTrunc2NotVarTagState.done,
+      DTrunc2NotVarTagState.reject, List.append_assoc]
+  change Drun DTrunc2NotVarTagTM 4 c0 = c4
+  rw [show 4 = 1 + 3 by omega, Drun_add_eq, h1]
+  rw [show 3 = 1 + 2 by omega, Drun_add_eq, h2]
+  rw [show 2 = 1 + 1 by omega, Drun_add_eq, h3]
+  rw [h4]
+
+lemma Drun_DTrunc2NotVarTagTM_scanSecond (pre z out : Word)
+    (wk : Nat → Bool) (wh : Nat) :
+    Drun DTrunc2NotVarTagTM (z.length + 1)
+      { state := DTrunc2NotVarTagState.scanSecond, input := pre ++ z,
+        head := pre.length + 1, output := out, work := wk, workHead := wh } =
+      { state := DTrunc2NotVarTagState.done, input := pre ++ z,
+        head := pre.length + (firstUnaryCode z).length + 1,
+        output := out ++ firstUnaryCode z, work := wk, workHead := wh } := by
+  induction z generalizing pre out with
+  | nil =>
+      simp [Drun, Dhalted, Dstep, Dread, DTrunc2NotVarTagTM,
+        DTrunc2NotVarTagState.start, DTrunc2NotVarTagState.scanFirst,
+        DTrunc2NotVarTagState.emit0, DTrunc2NotVarTagState.emit1,
+        DTrunc2NotVarTagState.emit2, DTrunc2NotVarTagState.emit3,
+        DTrunc2NotVarTagState.scanSecond, DTrunc2NotVarTagState.done,
+        DTrunc2NotVarTagState.reject, firstUnaryCode]
+  | cons b bs ih =>
+      rw [show (b :: bs).length + 1 = 1 + (bs.length + 1) by
+        simp [Nat.add_comm, Nat.add_left_comm], Drun_add_eq]
+      let c : DConfig DTrunc2NotVarTagState :=
+        { state := DTrunc2NotVarTagState.scanSecond, input := pre ++ b :: bs,
+          head := pre.length + 1, output := out, work := wk, workHead := wh }
+      cases b with
+      | true =>
+          let c' : DConfig DTrunc2NotVarTagState :=
+            { state := DTrunc2NotVarTagState.scanSecond, input := pre ++ true :: bs,
+              head := pre.length + 2, output := out ++ [true], work := wk, workHead := wh }
+          have hstep : Drun DTrunc2NotVarTagTM 1 c = c' := by
+            simp [c, c', Drun, Dhalted, Dstep, Dread, DTrunc2NotVarTagTM, Dmove,
+              DTrunc2NotVarTagState.start, DTrunc2NotVarTagState.scanFirst,
+              DTrunc2NotVarTagState.emit0, DTrunc2NotVarTagState.emit1,
+              DTrunc2NotVarTagState.emit2, DTrunc2NotVarTagState.emit3,
+              DTrunc2NotVarTagState.scanSecond, DTrunc2NotVarTagState.done,
+              DTrunc2NotVarTagState.reject]
+          change Drun DTrunc2NotVarTagTM (bs.length + 1) (Drun DTrunc2NotVarTagTM 1 c) = _
+          rw [hstep]
+          simpa [c', List.append_assoc, Nat.add_assoc, Nat.add_comm, Nat.add_left_comm,
+            firstUnaryCode] using ih (pre := pre ++ [true]) (out := out ++ [true])
+      | false =>
+          let c' : DConfig DTrunc2NotVarTagState :=
+            { state := DTrunc2NotVarTagState.done, input := pre ++ false :: bs,
+              head := pre.length + 2, output := out ++ [false], work := wk, workHead := wh }
+          have hstep : Drun DTrunc2NotVarTagTM 1 c = c' := by
+            simp [c, c', Drun, Dhalted, Dstep, Dread, DTrunc2NotVarTagTM, Dmove,
+              DTrunc2NotVarTagState.start, DTrunc2NotVarTagState.scanFirst,
+              DTrunc2NotVarTagState.emit0, DTrunc2NotVarTagState.emit1,
+              DTrunc2NotVarTagState.emit2, DTrunc2NotVarTagState.emit3,
+              DTrunc2NotVarTagState.scanSecond, DTrunc2NotVarTagState.done,
+              DTrunc2NotVarTagState.reject]
+          have hhalt : Dhalted DTrunc2NotVarTagTM c' = true := by
+            simp [c', Dhalted, DTrunc2NotVarTagTM, DTrunc2NotVarTagState.done]
+          change Drun DTrunc2NotVarTagTM (bs.length + 1) (Drun DTrunc2NotVarTagTM 1 c) = _
+          rw [hstep]
+          rw [Drun_halted DTrunc2NotVarTagTM c' (bs.length + 1) hhalt]
+          simp [c', firstUnaryCode]
+
+lemma Drun_DTrunc2NotVarTagTM_all_true_run (i : Nat) :
+    Drun DTrunc2NotVarTagTM (i + 7) (Dinit DTrunc2NotVarTagTM (List.replicate i true)) =
+      { state := DTrunc2NotVarTagState.done, input := List.replicate i true,
+        head := i + 1, output := List.replicate i true ++ [false, true, false, false],
+        work := fun _ : Nat => false, workHead := 0 } := by
+  have hstart := Drun_DTrunc2NotVarTagTM_start (List.replicate i true)
+  have hscan : Drun DTrunc2NotVarTagTM (i + 1)
+      { state := DTrunc2NotVarTagState.scanFirst,
+        input := List.replicate i true, head := 1, output := [],
+        work := fun _ : Nat => false, workHead := 0 } =
+      { state := DTrunc2NotVarTagState.emit0,
+        input := List.replicate i true, head := i + 1,
+        output := List.replicate i true,
+        work := fun _ : Nat => false, workHead := 0 } := by
+    simpa using (Drun_DTrunc2NotVarTagTM_scan_all_true [] i (fun _ : Nat => false) 0)
+  have hemit := Drun_DTrunc2NotVarTagTM_emit (List.replicate i true)
+    (List.replicate i true) (i + 1) (fun _ : Nat => false) 0
+  have hsecond : Drun DTrunc2NotVarTagTM 1
+      { state := DTrunc2NotVarTagState.scanSecond, input := List.replicate i true,
+        head := i + 1, output := List.replicate i true ++ [false, true, false, false],
+        work := fun _ : Nat => false, workHead := 0 } =
+      { state := DTrunc2NotVarTagState.done, input := List.replicate i true,
+        head := i + 1, output := List.replicate i true ++ [false, true, false, false],
+        work := fun _ : Nat => false, workHead := 0 } := by
+    simpa [firstUnaryCode] using
+      (Drun_DTrunc2NotVarTagTM_scanSecond (List.replicate i true) ([] : Word)
+        (List.replicate i true ++ [false, true, false, false]) (fun _ : Nat => false) 0)
+  rw [show i + 7 = 1 + ((i + 1) + (4 + 1)) by omega, Drun_add_eq, hstart]
+  rw [Drun_add_eq, hscan]
+  rw [Drun_add_eq, hemit]
+  rw [hsecond]
+
+lemma Drun_DTrunc2NotVarTagTM_false_run (i : Nat) (zs : Word) :
+    Drun DTrunc2NotVarTagTM (i + zs.length + 7)
+      (Dinit DTrunc2NotVarTagTM (List.replicate i true ++ false :: zs)) =
+      { state := DTrunc2NotVarTagState.done,
+        input := List.replicate i true ++ false :: zs,
+        head := i + 1 + (firstUnaryCode zs).length + 1,
+        output := List.replicate i true ++ [false] ++ [false, true, false, false] ++
+          firstUnaryCode zs,
+        work := fun _ : Nat => false, workHead := 0 } := by
+  let x : Word := List.replicate i true ++ false :: zs
+  have hstart := Drun_DTrunc2NotVarTagTM_start x
+  have hscan : Drun DTrunc2NotVarTagTM (i + 1)
+      { state := DTrunc2NotVarTagState.scanFirst, input := x, head := 1,
+        output := [], work := fun _ : Nat => false, workHead := 0 } =
+      { state := DTrunc2NotVarTagState.emit0, input := x, head := i + 2,
+        output := List.replicate i true ++ [false],
+        work := fun _ : Nat => false, workHead := 0 } := by
+    simpa [x] using (Drun_DTrunc2NotVarTagTM_scan_trues [] zs i (fun _ : Nat => false) 0)
+  have hemit : Drun DTrunc2NotVarTagTM 4
+      { state := DTrunc2NotVarTagState.emit0, input := x, head := i + 2,
+        output := List.replicate i true ++ [false],
+        work := fun _ : Nat => false, workHead := 0 } =
+      { state := DTrunc2NotVarTagState.scanSecond, input := x, head := i + 2,
+        output := List.replicate i true ++ [false] ++ [false, true, false, false],
+        work := fun _ : Nat => false, workHead := 0 } := by
+    simpa using (Drun_DTrunc2NotVarTagTM_emit x (List.replicate i true ++ [false])
+      (i + 2) (fun _ : Nat => false) 0)
+  have hsecond : Drun DTrunc2NotVarTagTM (zs.length + 1)
+      { state := DTrunc2NotVarTagState.scanSecond, input := x, head := i + 2,
+        output := List.replicate i true ++ [false] ++ [false, true, false, false],
+        work := fun _ : Nat => false, workHead := 0 } =
+      { state := DTrunc2NotVarTagState.done, input := x,
+        head := i + 1 + (firstUnaryCode zs).length + 1,
+        output := List.replicate i true ++ [false] ++ [false, true, false, false] ++
+          firstUnaryCode zs,
+        work := fun _ : Nat => false, workHead := 0 } := by
+    simpa [x, List.append_assoc] using
+      (Drun_DTrunc2NotVarTagTM_scanSecond
+        (List.replicate i true ++ [false]) zs
+        (List.replicate i true ++ [false] ++ [false, true, false, false])
+        (fun _ : Nat => false) 0)
+  rw [show i + zs.length + 7 = 1 + ((i + 1) + (4 + (zs.length + 1))) by omega]
+  rw [Drun_add_eq, hstart]
+  rw [Drun_add_eq, hscan]
+  rw [Drun_add_eq, hemit]
+  rw [hsecond]
+
+lemma Drun_DTrunc2NotVarTagTM_full (z : Word) :
+    ∃ s : Nat, s ≤ z.length + 7 ∧
+      Dhalted DTrunc2NotVarTagTM (Drun DTrunc2NotVarTagTM s (Dinit DTrunc2NotVarTagTM z)) = true ∧
+      (Drun DTrunc2NotVarTagTM s (Dinit DTrunc2NotVarTagTM z)).output =
+        insertNotVarTagTotal (firstTwoCodes z) := by
+  rcases word_eq_replicate_true_append z with ⟨i, y, hzy, hy⟩
+  subst z
+  rcases hy with rfl | ⟨zs, rfl⟩
+  · refine ⟨i + 7, by simp, ?_, ?_⟩
+    · simp only [List.append_nil]
+      rw [Drun_DTrunc2NotVarTagTM_all_true_run i]
+      simp [Dhalted, DTrunc2NotVarTagTM, DTrunc2NotVarTagState.done]
+    · simp only [List.append_nil]
+      rw [Drun_DTrunc2NotVarTagTM_all_true_run i]
+      simp [firstTwoCodes_all_true, insertNotVarTagTotal_replicate_true]
+  · refine ⟨i + zs.length + 7, by simp, ?_, ?_⟩
+    · rw [Drun_DTrunc2NotVarTagTM_false_run i zs]
+      simp [Dhalted, DTrunc2NotVarTagTM, DTrunc2NotVarTagState.done]
+    · rw [Drun_DTrunc2NotVarTagTM_false_run i zs]
+      simp [firstTwoCodes_true_false, insertNotVarTagTotal_replicate_true_false,
+        List.append_assoc]
+
+lemma DTrunc2NotVarTagTM_noWork : DNoWork DTrunc2NotVarTagTM := by
+  intro q sym wsym
+  have hq : q.val = 0 ∨ q.val = 1 ∨ q.val = 2 ∨ q.val = 3 ∨ q.val = 4 ∨ q.val = 5 ∨ q.val = 6 ∨ q.val = 7 ∨ q.val = 8 := by omega
+  rcases hq with h0 | h1 | h2 | h3 | h4 | h5 | h6 | h7 | h8
+  · have hq' : q = ⟨0, by decide⟩ := by ext; assumption
+    subst q
+    cases sym with
+    | none => cases wsym <;> simp [DTrunc2NotVarTagTM, DTrunc2NotVarTagState.start, DTrunc2NotVarTagState.scanFirst, DTrunc2NotVarTagState.emit0, DTrunc2NotVarTagState.emit1, DTrunc2NotVarTagState.emit2, DTrunc2NotVarTagState.emit3, DTrunc2NotVarTagState.scanSecond, DTrunc2NotVarTagState.done, DTrunc2NotVarTagState.reject]
+    | some b => cases b <;> cases wsym <;> simp [DTrunc2NotVarTagTM, DTrunc2NotVarTagState.start, DTrunc2NotVarTagState.scanFirst, DTrunc2NotVarTagState.emit0, DTrunc2NotVarTagState.emit1, DTrunc2NotVarTagState.emit2, DTrunc2NotVarTagState.emit3, DTrunc2NotVarTagState.scanSecond, DTrunc2NotVarTagState.done, DTrunc2NotVarTagState.reject]
+  · have hq' : q = ⟨1, by decide⟩ := by ext; assumption
+    subst q
+    cases sym with
+    | none => cases wsym <;> simp [DTrunc2NotVarTagTM, DTrunc2NotVarTagState.start, DTrunc2NotVarTagState.scanFirst, DTrunc2NotVarTagState.emit0, DTrunc2NotVarTagState.emit1, DTrunc2NotVarTagState.emit2, DTrunc2NotVarTagState.emit3, DTrunc2NotVarTagState.scanSecond, DTrunc2NotVarTagState.done, DTrunc2NotVarTagState.reject]
+    | some b => cases b <;> cases wsym <;> simp [DTrunc2NotVarTagTM, DTrunc2NotVarTagState.start, DTrunc2NotVarTagState.scanFirst, DTrunc2NotVarTagState.emit0, DTrunc2NotVarTagState.emit1, DTrunc2NotVarTagState.emit2, DTrunc2NotVarTagState.emit3, DTrunc2NotVarTagState.scanSecond, DTrunc2NotVarTagState.done, DTrunc2NotVarTagState.reject]
+  · have hq' : q = ⟨2, by decide⟩ := by ext; assumption
+    subst q
+    cases sym with
+    | none => cases wsym <;> simp [DTrunc2NotVarTagTM, DTrunc2NotVarTagState.start, DTrunc2NotVarTagState.scanFirst, DTrunc2NotVarTagState.emit0, DTrunc2NotVarTagState.emit1, DTrunc2NotVarTagState.emit2, DTrunc2NotVarTagState.emit3, DTrunc2NotVarTagState.scanSecond, DTrunc2NotVarTagState.done, DTrunc2NotVarTagState.reject]
+    | some b => cases b <;> cases wsym <;> simp [DTrunc2NotVarTagTM, DTrunc2NotVarTagState.start, DTrunc2NotVarTagState.scanFirst, DTrunc2NotVarTagState.emit0, DTrunc2NotVarTagState.emit1, DTrunc2NotVarTagState.emit2, DTrunc2NotVarTagState.emit3, DTrunc2NotVarTagState.scanSecond, DTrunc2NotVarTagState.done, DTrunc2NotVarTagState.reject]
+  · have hq' : q = ⟨3, by decide⟩ := by ext; assumption
+    subst q
+    cases sym with
+    | none => cases wsym <;> simp [DTrunc2NotVarTagTM, DTrunc2NotVarTagState.start, DTrunc2NotVarTagState.scanFirst, DTrunc2NotVarTagState.emit0, DTrunc2NotVarTagState.emit1, DTrunc2NotVarTagState.emit2, DTrunc2NotVarTagState.emit3, DTrunc2NotVarTagState.scanSecond, DTrunc2NotVarTagState.done, DTrunc2NotVarTagState.reject]
+    | some b => cases b <;> cases wsym <;> simp [DTrunc2NotVarTagTM, DTrunc2NotVarTagState.start, DTrunc2NotVarTagState.scanFirst, DTrunc2NotVarTagState.emit0, DTrunc2NotVarTagState.emit1, DTrunc2NotVarTagState.emit2, DTrunc2NotVarTagState.emit3, DTrunc2NotVarTagState.scanSecond, DTrunc2NotVarTagState.done, DTrunc2NotVarTagState.reject]
+  · have hq' : q = ⟨4, by decide⟩ := by ext; assumption
+    subst q
+    cases sym with
+    | none => cases wsym <;> simp [DTrunc2NotVarTagTM, DTrunc2NotVarTagState.start, DTrunc2NotVarTagState.scanFirst, DTrunc2NotVarTagState.emit0, DTrunc2NotVarTagState.emit1, DTrunc2NotVarTagState.emit2, DTrunc2NotVarTagState.emit3, DTrunc2NotVarTagState.scanSecond, DTrunc2NotVarTagState.done, DTrunc2NotVarTagState.reject]
+    | some b => cases b <;> cases wsym <;> simp [DTrunc2NotVarTagTM, DTrunc2NotVarTagState.start, DTrunc2NotVarTagState.scanFirst, DTrunc2NotVarTagState.emit0, DTrunc2NotVarTagState.emit1, DTrunc2NotVarTagState.emit2, DTrunc2NotVarTagState.emit3, DTrunc2NotVarTagState.scanSecond, DTrunc2NotVarTagState.done, DTrunc2NotVarTagState.reject]
+  · have hq' : q = ⟨5, by decide⟩ := by ext; assumption
+    subst q
+    cases sym with
+    | none => cases wsym <;> simp [DTrunc2NotVarTagTM, DTrunc2NotVarTagState.start, DTrunc2NotVarTagState.scanFirst, DTrunc2NotVarTagState.emit0, DTrunc2NotVarTagState.emit1, DTrunc2NotVarTagState.emit2, DTrunc2NotVarTagState.emit3, DTrunc2NotVarTagState.scanSecond, DTrunc2NotVarTagState.done, DTrunc2NotVarTagState.reject]
+    | some b => cases b <;> cases wsym <;> simp [DTrunc2NotVarTagTM, DTrunc2NotVarTagState.start, DTrunc2NotVarTagState.scanFirst, DTrunc2NotVarTagState.emit0, DTrunc2NotVarTagState.emit1, DTrunc2NotVarTagState.emit2, DTrunc2NotVarTagState.emit3, DTrunc2NotVarTagState.scanSecond, DTrunc2NotVarTagState.done, DTrunc2NotVarTagState.reject]
+  · have hq' : q = ⟨6, by decide⟩ := by ext; assumption
+    subst q
+    cases sym with
+    | none => cases wsym <;> simp [DTrunc2NotVarTagTM, DTrunc2NotVarTagState.start, DTrunc2NotVarTagState.scanFirst, DTrunc2NotVarTagState.emit0, DTrunc2NotVarTagState.emit1, DTrunc2NotVarTagState.emit2, DTrunc2NotVarTagState.emit3, DTrunc2NotVarTagState.scanSecond, DTrunc2NotVarTagState.done, DTrunc2NotVarTagState.reject]
+    | some b => cases b <;> cases wsym <;> simp [DTrunc2NotVarTagTM, DTrunc2NotVarTagState.start, DTrunc2NotVarTagState.scanFirst, DTrunc2NotVarTagState.emit0, DTrunc2NotVarTagState.emit1, DTrunc2NotVarTagState.emit2, DTrunc2NotVarTagState.emit3, DTrunc2NotVarTagState.scanSecond, DTrunc2NotVarTagState.done, DTrunc2NotVarTagState.reject]
+  · have hq' : q = ⟨7, by decide⟩ := by ext; assumption
+    subst q
+    cases sym with
+    | none => cases wsym <;> simp [DTrunc2NotVarTagTM, DTrunc2NotVarTagState.start, DTrunc2NotVarTagState.scanFirst, DTrunc2NotVarTagState.emit0, DTrunc2NotVarTagState.emit1, DTrunc2NotVarTagState.emit2, DTrunc2NotVarTagState.emit3, DTrunc2NotVarTagState.scanSecond, DTrunc2NotVarTagState.done, DTrunc2NotVarTagState.reject]
+    | some b => cases b <;> cases wsym <;> simp [DTrunc2NotVarTagTM, DTrunc2NotVarTagState.start, DTrunc2NotVarTagState.scanFirst, DTrunc2NotVarTagState.emit0, DTrunc2NotVarTagState.emit1, DTrunc2NotVarTagState.emit2, DTrunc2NotVarTagState.emit3, DTrunc2NotVarTagState.scanSecond, DTrunc2NotVarTagState.done, DTrunc2NotVarTagState.reject]
+  · have hq' : q = ⟨8, by decide⟩ := by ext; assumption
+    subst q
+    cases sym with
+    | none => cases wsym <;> simp [DTrunc2NotVarTagTM, DTrunc2NotVarTagState.start, DTrunc2NotVarTagState.scanFirst, DTrunc2NotVarTagState.emit0, DTrunc2NotVarTagState.emit1, DTrunc2NotVarTagState.emit2, DTrunc2NotVarTagState.emit3, DTrunc2NotVarTagState.scanSecond, DTrunc2NotVarTagState.done, DTrunc2NotVarTagState.reject]
+    | some b => cases b <;> cases wsym <;> simp [DTrunc2NotVarTagTM, DTrunc2NotVarTagState.start, DTrunc2NotVarTagState.scanFirst, DTrunc2NotVarTagState.emit0, DTrunc2NotVarTagState.emit1, DTrunc2NotVarTagState.emit2, DTrunc2NotVarTagState.emit3, DTrunc2NotVarTagState.scanSecond, DTrunc2NotVarTagState.done, DTrunc2NotVarTagState.reject]
+
+theorem dPolyTimeComputableClean_trunc2NotVarTag :
+    DPolyTimeComputableClean (fun z => insertNotVarTagTotal (firstTwoCodes z)) := by
+  refine DPolyTimeComputableClean.of_machine DTrunc2NotVarTagTM (X + C 7) (X + C 4)
+    (fun z => insertNotVarTagTotal (firstTwoCodes z)) ?_ ?_ ?_ ?_
+  · intro q
+    rfl
+  · exact DTrunc2NotVarTagTM_noWork
+  · intro z
+    rcases Drun_DTrunc2NotVarTagTM_full z with ⟨s, hs, hh, hout⟩
+    rw [Drun_eq_of_halted_within DTrunc2NotVarTagTM (Dinit DTrunc2NotVarTagTM z)
+      (by simpa using hs) hh]
+    exact hh
+  · intro z
+    rcases Drun_DTrunc2NotVarTagTM_full z with ⟨s, hs, hh, hout⟩
+    constructor
+    · simp only [Polynomial.eval_add, Polynomial.eval_X, Polynomial.eval_C]
+      dsimp [Dboutput]
+      rw [Drun_eq_of_halted_within DTrunc2NotVarTagTM (Dinit DTrunc2NotVarTagTM z)
+        (by simpa using hs) hh]
+      exact hout
+    · simp [insertNotVarTagTotal_length, firstTwoCodes_length_le]
+
+theorem dPolyTimeComputableClean_pairVarNotVarEncode_firstTwoCodes :
+    DPolyTimeComputableClean (fun z => Formula.pairVarNotVarEncode (firstTwoCodes z)) := by
+  change DPolyTimeComputableClean
+    (fun z => ([true, true, false, false] : Word) ++
+      insertNotVarTagTotal (firstTwoCodes z))
+  exact DPolyTimeComputableClean_prepend [true, true, false, false]
+    dPolyTimeComputableClean_trunc2NotVarTag
+
+
+-- ---------------------------------------------------------------------------
+-- A clean transducer that inserts a variable tag and keeps exactly two codes
+-- ---------------------------------------------------------------------------
+
+abbrev DTrunc3VarTagState := Fin 8
+
+namespace DTrunc3VarTagState
+
+def start : DTrunc3VarTagState := ⟨0, by decide⟩
+def scanFirst : DTrunc3VarTagState := ⟨1, by decide⟩
+def emit0 : DTrunc3VarTagState := ⟨2, by decide⟩
+def emit1 : DTrunc3VarTagState := ⟨3, by decide⟩
+def skipSecond : DTrunc3VarTagState := ⟨4, by decide⟩
+def copyRest : DTrunc3VarTagState := ⟨5, by decide⟩
+def done : DTrunc3VarTagState := ⟨6, by decide⟩
+def reject : DTrunc3VarTagState := ⟨7, by decide⟩
+
+end DTrunc3VarTagState
+
+/-- Insert the second-variable tag after the first unary code, copy the second
+    unary code, skip the second unary code, and copy the remainder. -/
+def DTrunc3VarTagTM : DTM DTrunc3VarTagState where
+  step := fun q sym _ =>
+    if q = DTrunc3VarTagState.start then
+      { next := DTrunc3VarTagState.scanFirst, output := none, inputMove := some true
+        workWrite := none, workMove := none }
+    else if q = DTrunc3VarTagState.scanFirst then
+      match sym with
+      | some b =>
+          if b then
+            { next := DTrunc3VarTagState.scanFirst, output := some b,
+              inputMove := some true, workWrite := none, workMove := none }
+          else
+            { next := DTrunc3VarTagState.emit0, output := some b,
+              inputMove := some true, workWrite := none, workMove := none }
+      | none =>
+          { next := DTrunc3VarTagState.emit0, output := none, inputMove := none,
+            workWrite := none, workMove := none }
+    else if q = DTrunc3VarTagState.emit0 then
+      { next := DTrunc3VarTagState.emit1, output := some false, inputMove := none
+        workWrite := none, workMove := none }
+    else if q = DTrunc3VarTagState.emit1 then
+      { next := DTrunc3VarTagState.skipSecond, output := some false, inputMove := none
+        workWrite := none, workMove := none }
+    else if q = DTrunc3VarTagState.skipSecond then
+      match sym with
+      | some true =>
+          { next := DTrunc3VarTagState.skipSecond, output := none,
+            inputMove := some true, workWrite := none, workMove := none }
+      | some false =>
+          { next := DTrunc3VarTagState.copyRest, output := none,
+            inputMove := some true, workWrite := none, workMove := none }
+      | none =>
+          { next := DTrunc3VarTagState.copyRest, output := none, inputMove := none
+            workWrite := none, workMove := none }
+    else if q = DTrunc3VarTagState.copyRest then
+      match sym with
+      | some b =>
+          { next := DTrunc3VarTagState.copyRest, output := some b,
+            inputMove := some true, workWrite := none, workMove := none }
+      | none =>
+          { next := DTrunc3VarTagState.done, output := none, inputMove := none
+            workWrite := none, workMove := none }
+    else
+      { next := q, output := none, inputMove := none
+        workWrite := none, workMove := none }
+  start := DTrunc3VarTagState.start
+  accept := DTrunc3VarTagState.done
+  reject := DTrunc3VarTagState.reject
+
+lemma Drun_DTrunc3VarTagTM_start (z : Word) :
+    Drun DTrunc3VarTagTM 1 (Dinit DTrunc3VarTagTM z) =
+      { state := DTrunc3VarTagState.scanFirst, input := z, head := 1, output := [],
+        work := fun _ : Nat => false, workHead := 0 } := by
+  simp [Drun, Dhalted, Dinit, Dstep, Dread, DTrunc3VarTagTM, Dmove,
+    DTrunc3VarTagState.start, DTrunc3VarTagState.scanFirst,
+    DTrunc3VarTagState.emit0, DTrunc3VarTagState.emit1,
+    DTrunc3VarTagState.skipSecond, DTrunc3VarTagState.copyRest,
+    DTrunc3VarTagState.done,
+    DTrunc3VarTagState.reject]
+
+lemma Drun_DTrunc3VarTagTM_scan_all_true (pre : Word) (k : Nat)
+    (wk : Nat → Bool) (wh : Nat) :
+    Drun DTrunc3VarTagTM (k + 1)
+      { state := DTrunc3VarTagState.scanFirst,
+        input := pre ++ List.replicate k true, head := pre.length + 1,
+        output := pre, work := wk, workHead := wh } =
+      { state := DTrunc3VarTagState.emit0,
+        input := pre ++ List.replicate k true, head := pre.length + k + 1,
+        output := pre ++ List.replicate k true, work := wk, workHead := wh } := by
+  induction k generalizing pre with
+  | zero =>
+      simp [Drun, Dhalted, Dstep, Dread, Dmove, DTrunc3VarTagTM,
+        DTrunc3VarTagState.start, DTrunc3VarTagState.scanFirst,
+        DTrunc3VarTagState.emit0, DTrunc3VarTagState.emit1,
+        DTrunc3VarTagState.skipSecond, DTrunc3VarTagState.done,
+        DTrunc3VarTagState.reject]
+  | succ k ih =>
+      rw [show k.succ + 1 = 1 + (k + 1) by omega, Drun_add_eq]
+      let c : DConfig DTrunc3VarTagState :=
+        { state := DTrunc3VarTagState.scanFirst,
+          input := pre ++ List.replicate k.succ true, head := pre.length + 1,
+          output := pre, work := wk, workHead := wh }
+      let c' : DConfig DTrunc3VarTagState :=
+        { state := DTrunc3VarTagState.scanFirst,
+          input := pre ++ List.replicate k.succ true, head := pre.length + 2,
+          output := pre ++ [true], work := wk, workHead := wh }
+      have hstep : Drun DTrunc3VarTagTM 1 c = c' := by
+        simp [c, c', Drun, Dhalted, Dstep, Dread, DTrunc3VarTagTM, Dmove,
+          List.replicate_succ, DTrunc3VarTagState.start,
+          DTrunc3VarTagState.scanFirst, DTrunc3VarTagState.emit0,
+          DTrunc3VarTagState.emit1, DTrunc3VarTagState.skipSecond,
+          DTrunc3VarTagState.done, DTrunc3VarTagState.reject]
+      change Drun DTrunc3VarTagTM (k + 1) (Drun DTrunc3VarTagTM 1 c) = _
+      rw [hstep]
+      simpa [c', List.replicate_succ, List.append_assoc,
+        Nat.add_assoc, Nat.add_comm, Nat.add_left_comm] using ih (pre := pre ++ [true])
+
+lemma Drun_DTrunc3VarTagTM_scan_trues (pre z : Word) (k : Nat)
+    (wk : Nat → Bool) (wh : Nat) :
+    Drun DTrunc3VarTagTM (k + 1)
+      { state := DTrunc3VarTagState.scanFirst,
+        input := pre ++ List.replicate k true ++ false :: z,
+        head := pre.length + 1, output := pre, work := wk, workHead := wh } =
+      { state := DTrunc3VarTagState.emit0,
+        input := pre ++ List.replicate k true ++ false :: z,
+        head := pre.length + k + 2,
+        output := pre ++ List.replicate k true ++ [false],
+        work := wk, workHead := wh } := by
+  induction k generalizing pre with
+  | zero =>
+      simp [Drun, Dhalted, Dstep, Dread, DTrunc3VarTagTM, Dmove,
+        DTrunc3VarTagState.start, DTrunc3VarTagState.scanFirst,
+        DTrunc3VarTagState.emit0, DTrunc3VarTagState.emit1,
+        DTrunc3VarTagState.skipSecond, DTrunc3VarTagState.done,
+        DTrunc3VarTagState.reject]
+  | succ k ih =>
+      rw [show k.succ + 1 = 1 + (k + 1) by omega, Drun_add_eq]
+      let c : DConfig DTrunc3VarTagState :=
+        { state := DTrunc3VarTagState.scanFirst,
+          input := pre ++ List.replicate k.succ true ++ false :: z,
+          head := pre.length + 1, output := pre, work := wk, workHead := wh }
+      let c' : DConfig DTrunc3VarTagState :=
+        { state := DTrunc3VarTagState.scanFirst,
+          input := pre ++ List.replicate k.succ true ++ false :: z,
+          head := pre.length + 2, output := pre ++ [true],
+          work := wk, workHead := wh }
+      have hstep : Drun DTrunc3VarTagTM 1 c = c' := by
+        simp [c, c', Drun, Dhalted, Dstep, Dread, DTrunc3VarTagTM, Dmove,
+          List.replicate_succ, DTrunc3VarTagState.start,
+          DTrunc3VarTagState.scanFirst, DTrunc3VarTagState.emit0,
+          DTrunc3VarTagState.emit1, DTrunc3VarTagState.skipSecond,
+          DTrunc3VarTagState.done, DTrunc3VarTagState.reject]
+      change Drun DTrunc3VarTagTM (k + 1) (Drun DTrunc3VarTagTM 1 c) = _
+      rw [hstep]
+      simpa [c', List.replicate_succ, List.append_assoc,
+        Nat.add_assoc, Nat.add_comm, Nat.add_left_comm] using ih (pre := pre ++ [true])
+
+lemma Drun_DTrunc3VarTagTM_emit (inp out : Word) (h : Nat)
+    (wk : Nat → Bool) (wh : Nat) :
+    Drun DTrunc3VarTagTM 2
+      { state := DTrunc3VarTagState.emit0, input := inp, head := h,
+        output := out, work := wk, workHead := wh } =
+      { state := DTrunc3VarTagState.skipSecond, input := inp, head := h,
+        output := out ++ [false, false], work := wk, workHead := wh } := by
+  simp [Drun, Dhalted, Dstep, Dread, Dmove, DTrunc3VarTagTM,
+    DTrunc3VarTagState.start, DTrunc3VarTagState.scanFirst,
+    DTrunc3VarTagState.emit0, DTrunc3VarTagState.emit1,
+    DTrunc3VarTagState.skipSecond, DTrunc3VarTagState.copyRest,
+    DTrunc3VarTagState.done,
+    DTrunc3VarTagState.reject, List.append_assoc]
+
+lemma Drun_DTrunc3VarTagTM_copy (skipped rest out : Word)
+    (wk : Nat → Bool) (wh : Nat) :
+    Drun DTrunc3VarTagTM (rest.length + 1)
+      { state := DTrunc3VarTagState.copyRest, input := skipped ++ rest,
+        head := skipped.length + 1, output := out, work := wk, workHead := wh } =
+      { state := DTrunc3VarTagState.done, input := skipped ++ rest,
+        head := skipped.length + rest.length + 1, output := out ++ rest,
+        work := wk, workHead := wh } := by
+  induction rest generalizing skipped out with
+  | nil =>
+      simp [Drun, Dhalted, Dstep, Dread, DTrunc3VarTagTM,
+        DTrunc3VarTagState.start, DTrunc3VarTagState.scanFirst,
+        DTrunc3VarTagState.emit0, DTrunc3VarTagState.emit1, DTrunc3VarTagState.skipSecond,
+        DTrunc3VarTagState.copyRest, DTrunc3VarTagState.done,
+        DTrunc3VarTagState.reject]
+  | cons b bs ih =>
+      rw [show (b :: bs).length + 1 = 1 + (bs.length + 1) by
+        simp [Nat.add_comm, Nat.add_left_comm], Drun_add_eq]
+      let c : DConfig DTrunc3VarTagState :=
+        { state := DTrunc3VarTagState.copyRest, input := skipped ++ b :: bs,
+          head := skipped.length + 1, output := out, work := wk, workHead := wh }
+      let c' : DConfig DTrunc3VarTagState :=
+        { state := DTrunc3VarTagState.copyRest, input := skipped ++ b :: bs,
+          head := skipped.length + 2, output := out ++ [b], work := wk, workHead := wh }
+      have hstep : Drun DTrunc3VarTagTM 1 c = c' := by
+        simp [c, c', Drun, Dhalted, Dstep, Dread, DTrunc3VarTagTM, Dmove,
+          DTrunc3VarTagState.start, DTrunc3VarTagState.scanFirst,
+        DTrunc3VarTagState.emit0, DTrunc3VarTagState.emit1, DTrunc3VarTagState.skipSecond,
+          DTrunc3VarTagState.copyRest, DTrunc3VarTagState.done,
+          DTrunc3VarTagState.reject]
+      change Drun DTrunc3VarTagTM (bs.length + 1) (Drun DTrunc3VarTagTM 1 c) = _
+      rw [hstep]
+      simpa [c', List.append_assoc, Nat.add_assoc, Nat.add_comm, Nat.add_left_comm]
+        using ih (skipped := skipped ++ [b]) (out := out ++ [b])
+
+
+lemma Drun_DTrunc3VarTagTM_skipSecond (pre z out : Word)
+    (wk : Nat → Bool) (wh : Nat) :
+    Drun DTrunc3VarTagTM (z.length + 2)
+      { state := DTrunc3VarTagState.skipSecond, input := pre ++ z,
+        head := pre.length + 1, output := out, work := wk, workHead := wh } =
+      { state := DTrunc3VarTagState.done, input := pre ++ z,
+        head := pre.length + z.length + 1, output := out ++ dropFirstUnary z,
+        work := wk, workHead := wh } := by
+  induction z generalizing pre out with
+  | nil =>
+      simp [Drun, Dhalted, Dstep, Dread, DTrunc3VarTagTM,
+        DTrunc3VarTagState.start, DTrunc3VarTagState.scanFirst,
+        DTrunc3VarTagState.emit0, DTrunc3VarTagState.emit1, DTrunc3VarTagState.skipSecond,
+        DTrunc3VarTagState.copyRest, DTrunc3VarTagState.done,
+        DTrunc3VarTagState.reject, dropFirstUnary]
+  | cons b bs ih =>
+      rw [show (b :: bs).length + 2 = 1 + (bs.length + 2) by
+        simp [Nat.add_comm, Nat.add_left_comm], Drun_add_eq]
+      let c : DConfig DTrunc3VarTagState :=
+        { state := DTrunc3VarTagState.skipSecond, input := pre ++ b :: bs,
+          head := pre.length + 1, output := out, work := wk, workHead := wh }
+      have hstep : Drun DTrunc3VarTagTM 1 c =
+          { state := if b then DTrunc3VarTagState.skipSecond else DTrunc3VarTagState.copyRest,
+            input := pre ++ b :: bs, head := pre.length + 2, output := out,
+            work := wk, workHead := wh } := by
+        cases b <;>
+          simp [c, Drun, Dhalted, Dstep, Dread, DTrunc3VarTagTM, Dmove,
+            DTrunc3VarTagState.start, DTrunc3VarTagState.scanFirst,
+        DTrunc3VarTagState.emit0, DTrunc3VarTagState.emit1, DTrunc3VarTagState.skipSecond,
+            DTrunc3VarTagState.copyRest, DTrunc3VarTagState.done,
+            DTrunc3VarTagState.reject]
+      cases b with
+      | false =>
+          change Drun DTrunc3VarTagTM (bs.length + 2) (Drun DTrunc3VarTagTM 1 c) = _
+          rw [hstep]
+          simp only [Bool.false_eq_true, ↓reduceIte]
+          have hc : Drun DTrunc3VarTagTM (bs.length + 1)
+              { state := DTrunc3VarTagState.copyRest, input := pre ++ false :: bs,
+                head := pre.length + 2, output := out, work := wk, workHead := wh } =
+              { state := DTrunc3VarTagState.done, input := pre ++ false :: bs,
+                head := pre.length + bs.length + 2, output := out ++ bs,
+                work := wk, workHead := wh } := by
+            simpa [List.append_assoc, Nat.add_assoc, Nat.add_comm, Nat.add_left_comm] using
+              (Drun_DTrunc3VarTagTM_copy (skipped := pre ++ [false]) (rest := bs)
+                (out := out) wk wh)
+          rw [show bs.length + 2 = (bs.length + 1) + 1 by omega, Drun_add_eq, hc]
+          simp [Drun, Dhalted, DTrunc3VarTagTM, DTrunc3VarTagState.done,
+            dropFirstUnary, List.append_assoc, Nat.add_assoc, Nat.add_comm, Nat.add_left_comm]
+      | true =>
+          change Drun DTrunc3VarTagTM (bs.length + 2) (Drun DTrunc3VarTagTM 1 c) = _
+          rw [hstep]
+          simpa [List.append_assoc, Nat.add_assoc, Nat.add_comm, Nat.add_left_comm,
+            dropFirstUnary] using ih (pre := pre ++ [true]) (out := out)
+
+
+
+lemma firstThirdCodes_replicate_true_false (i : Nat) (zs : Word) :
+    firstThirdCodes (List.replicate i true ++ false :: zs) =
+      List.replicate i true ++ [false] ++ dropFirstUnary zs := by
+  simp [firstThirdCodes, firstUnaryCode_replicate_true_false,
+    dropFirstUnary_replicate_true_false]
+
+lemma Drun_DTrunc3VarTagTM_all_true_run (i : Nat) :
+    Drun DTrunc3VarTagTM (i + 6) (Dinit DTrunc3VarTagTM (List.replicate i true)) =
+      { state := DTrunc3VarTagState.done, input := List.replicate i true,
+        head := i + 1, output := List.replicate i true ++ [false, false],
+        work := fun _ : Nat => false, workHead := 0 } := by
+  have hstart := Drun_DTrunc3VarTagTM_start (List.replicate i true)
+  have hscan : Drun DTrunc3VarTagTM (i + 1)
+      { state := DTrunc3VarTagState.scanFirst,
+        input := List.replicate i true, head := 1, output := [],
+        work := fun _ : Nat => false, workHead := 0 } =
+      { state := DTrunc3VarTagState.emit0,
+        input := List.replicate i true, head := i + 1,
+        output := List.replicate i true,
+        work := fun _ : Nat => false, workHead := 0 } := by
+    simpa using (Drun_DTrunc3VarTagTM_scan_all_true [] i (fun _ : Nat => false) 0)
+  have hemit := Drun_DTrunc3VarTagTM_emit (List.replicate i true)
+    (List.replicate i true) (i + 1) (fun _ : Nat => false) 0
+  have hskip := Drun_DTrunc3VarTagTM_skipSecond (List.replicate i true) ([] : Word)
+    (List.replicate i true ++ [false, false]) (fun _ : Nat => false) 0
+  rw [show i + 6 = 1 + ((i + 1) + (2 + 2)) by omega, Drun_add_eq, hstart]
+  rw [Drun_add_eq, hscan]
+  rw [Drun_add_eq, hemit]
+  simpa [dropFirstUnary] using hskip
+
+lemma Drun_DTrunc3VarTagTM_false_run (i : Nat) (zs : Word) :
+    Drun DTrunc3VarTagTM (i + zs.length + 6)
+      (Dinit DTrunc3VarTagTM (List.replicate i true ++ false :: zs)) =
+      { state := DTrunc3VarTagState.done,
+        input := List.replicate i true ++ false :: zs,
+        head := i + zs.length + 2,
+        output := List.replicate i true ++ [false] ++ [false, false] ++
+          dropFirstUnary zs,
+        work := fun _ : Nat => false, workHead := 0 } := by
+  let x : Word := List.replicate i true ++ false :: zs
+  have hstart := Drun_DTrunc3VarTagTM_start x
+  have hscan : Drun DTrunc3VarTagTM (i + 1)
+      { state := DTrunc3VarTagState.scanFirst, input := x, head := 1,
+        output := [], work := fun _ : Nat => false, workHead := 0 } =
+      { state := DTrunc3VarTagState.emit0, input := x, head := i + 2,
+        output := List.replicate i true ++ [false],
+        work := fun _ : Nat => false, workHead := 0 } := by
+    simpa [x] using (Drun_DTrunc3VarTagTM_scan_trues [] zs i (fun _ : Nat => false) 0)
+  have hemit := Drun_DTrunc3VarTagTM_emit x (List.replicate i true ++ [false])
+    (i + 2) (fun _ : Nat => false) 0
+  have hskip := Drun_DTrunc3VarTagTM_skipSecond
+    (List.replicate i true ++ [false]) zs
+    (List.replicate i true ++ [false] ++ [false, false])
+    (fun _ : Nat => false) 0
+  rw [show i + zs.length + 6 = 1 + ((i + 1) + (2 + (zs.length + 2))) by omega]
+  rw [Drun_add_eq, hstart]
+  rw [Drun_add_eq, hscan]
+  rw [Drun_add_eq, hemit]
+  simpa [x, List.append_assoc, Nat.add_assoc, Nat.add_comm, Nat.add_left_comm] using hskip
+
+lemma Drun_DTrunc3VarTagTM_full (z : Word) :
+    ∃ s : Nat, s ≤ z.length + z.length + 6 ∧
+      Dhalted DTrunc3VarTagTM (Drun DTrunc3VarTagTM s (Dinit DTrunc3VarTagTM z)) = true ∧
+      (Drun DTrunc3VarTagTM s (Dinit DTrunc3VarTagTM z)).output =
+        insertVarTagTotal (firstThirdCodes z) := by
+  rcases word_eq_replicate_true_append z with ⟨i, y, hzy, hy⟩
+  subst z
+  rcases hy with rfl | ⟨zs, rfl⟩
+  · refine ⟨i + 6, by simp, ?_, ?_⟩
+    · simp only [List.append_nil]
+      rw [Drun_DTrunc3VarTagTM_all_true_run i]
+      simp [Dhalted, DTrunc3VarTagTM, DTrunc3VarTagState.done]
+    · simp only [List.append_nil]
+      rw [Drun_DTrunc3VarTagTM_all_true_run i]
+      simp [firstThirdCodes_all_true_aux, insertVarTagTotal_replicate_true]
+  · refine ⟨i + zs.length + 6, by
+      simp [List.length_append, List.length_replicate]
+      omega, ?_, ?_⟩
+    · rw [Drun_DTrunc3VarTagTM_false_run i zs]
+      simp [Dhalted, DTrunc3VarTagTM, DTrunc3VarTagState.done]
+    · rw [Drun_DTrunc3VarTagTM_false_run i zs]
+      simp [firstThirdCodes_replicate_true_false,
+        insertVarTagTotal_replicate_true_false, List.append_assoc]
+
+lemma DTrunc3VarTagTM_noWork : DNoWork DTrunc3VarTagTM := by
+  intro q sym wsym
+  have hq : q.val = 0 ∨ q.val = 1 ∨ q.val = 2 ∨ q.val = 3 ∨ q.val = 4 ∨ q.val = 5 ∨ q.val = 6 ∨ q.val = 7 := by omega
+  rcases hq with h0 | h1 | h2 | h3 | h4 | h5 | h6 | h7
+  · have hq' : q = ⟨0, by decide⟩ := by ext; assumption
+    subst q
+    cases sym with
+    | none => cases wsym <;> simp [DTrunc3VarTagTM, DTrunc3VarTagState.start, DTrunc3VarTagState.scanFirst, DTrunc3VarTagState.emit0, DTrunc3VarTagState.emit1, DTrunc3VarTagState.skipSecond, DTrunc3VarTagState.copyRest, DTrunc3VarTagState.done, DTrunc3VarTagState.reject]
+    | some b => cases b <;> cases wsym <;> simp [DTrunc3VarTagTM, DTrunc3VarTagState.start, DTrunc3VarTagState.scanFirst, DTrunc3VarTagState.emit0, DTrunc3VarTagState.emit1, DTrunc3VarTagState.skipSecond, DTrunc3VarTagState.copyRest, DTrunc3VarTagState.done, DTrunc3VarTagState.reject]
+  · have hq' : q = ⟨1, by decide⟩ := by ext; assumption
+    subst q
+    cases sym with
+    | none => cases wsym <;> simp [DTrunc3VarTagTM, DTrunc3VarTagState.start, DTrunc3VarTagState.scanFirst, DTrunc3VarTagState.emit0, DTrunc3VarTagState.emit1, DTrunc3VarTagState.skipSecond, DTrunc3VarTagState.copyRest, DTrunc3VarTagState.done, DTrunc3VarTagState.reject]
+    | some b => cases b <;> cases wsym <;> simp [DTrunc3VarTagTM, DTrunc3VarTagState.start, DTrunc3VarTagState.scanFirst, DTrunc3VarTagState.emit0, DTrunc3VarTagState.emit1, DTrunc3VarTagState.skipSecond, DTrunc3VarTagState.copyRest, DTrunc3VarTagState.done, DTrunc3VarTagState.reject]
+  · have hq' : q = ⟨2, by decide⟩ := by ext; assumption
+    subst q
+    cases sym with
+    | none => cases wsym <;> simp [DTrunc3VarTagTM, DTrunc3VarTagState.start, DTrunc3VarTagState.scanFirst, DTrunc3VarTagState.emit0, DTrunc3VarTagState.emit1, DTrunc3VarTagState.skipSecond, DTrunc3VarTagState.copyRest, DTrunc3VarTagState.done, DTrunc3VarTagState.reject]
+    | some b => cases b <;> cases wsym <;> simp [DTrunc3VarTagTM, DTrunc3VarTagState.start, DTrunc3VarTagState.scanFirst, DTrunc3VarTagState.emit0, DTrunc3VarTagState.emit1, DTrunc3VarTagState.skipSecond, DTrunc3VarTagState.copyRest, DTrunc3VarTagState.done, DTrunc3VarTagState.reject]
+  · have hq' : q = ⟨3, by decide⟩ := by ext; assumption
+    subst q
+    cases sym with
+    | none => cases wsym <;> simp [DTrunc3VarTagTM, DTrunc3VarTagState.start, DTrunc3VarTagState.scanFirst, DTrunc3VarTagState.emit0, DTrunc3VarTagState.emit1, DTrunc3VarTagState.skipSecond, DTrunc3VarTagState.copyRest, DTrunc3VarTagState.done, DTrunc3VarTagState.reject]
+    | some b => cases b <;> cases wsym <;> simp [DTrunc3VarTagTM, DTrunc3VarTagState.start, DTrunc3VarTagState.scanFirst, DTrunc3VarTagState.emit0, DTrunc3VarTagState.emit1, DTrunc3VarTagState.skipSecond, DTrunc3VarTagState.copyRest, DTrunc3VarTagState.done, DTrunc3VarTagState.reject]
+  · have hq' : q = ⟨4, by decide⟩ := by ext; assumption
+    subst q
+    cases sym with
+    | none => cases wsym <;> simp [DTrunc3VarTagTM, DTrunc3VarTagState.start, DTrunc3VarTagState.scanFirst, DTrunc3VarTagState.emit0, DTrunc3VarTagState.emit1, DTrunc3VarTagState.skipSecond, DTrunc3VarTagState.copyRest, DTrunc3VarTagState.done, DTrunc3VarTagState.reject]
+    | some b => cases b <;> cases wsym <;> simp [DTrunc3VarTagTM, DTrunc3VarTagState.start, DTrunc3VarTagState.scanFirst, DTrunc3VarTagState.emit0, DTrunc3VarTagState.emit1, DTrunc3VarTagState.skipSecond, DTrunc3VarTagState.copyRest, DTrunc3VarTagState.done, DTrunc3VarTagState.reject]
+  · have hq' : q = ⟨5, by decide⟩ := by ext; assumption
+    subst q
+    cases sym with
+    | none => cases wsym <;> simp [DTrunc3VarTagTM, DTrunc3VarTagState.start, DTrunc3VarTagState.scanFirst, DTrunc3VarTagState.emit0, DTrunc3VarTagState.emit1, DTrunc3VarTagState.skipSecond, DTrunc3VarTagState.copyRest, DTrunc3VarTagState.done, DTrunc3VarTagState.reject]
+    | some b => cases b <;> cases wsym <;> simp [DTrunc3VarTagTM, DTrunc3VarTagState.start, DTrunc3VarTagState.scanFirst, DTrunc3VarTagState.emit0, DTrunc3VarTagState.emit1, DTrunc3VarTagState.skipSecond, DTrunc3VarTagState.copyRest, DTrunc3VarTagState.done, DTrunc3VarTagState.reject]
+  · have hq' : q = ⟨6, by decide⟩ := by ext; assumption
+    subst q
+    cases sym with
+    | none => cases wsym <;> simp [DTrunc3VarTagTM, DTrunc3VarTagState.start, DTrunc3VarTagState.scanFirst, DTrunc3VarTagState.emit0, DTrunc3VarTagState.emit1, DTrunc3VarTagState.skipSecond, DTrunc3VarTagState.copyRest, DTrunc3VarTagState.done, DTrunc3VarTagState.reject]
+    | some b => cases b <;> cases wsym <;> simp [DTrunc3VarTagTM, DTrunc3VarTagState.start, DTrunc3VarTagState.scanFirst, DTrunc3VarTagState.emit0, DTrunc3VarTagState.emit1, DTrunc3VarTagState.skipSecond, DTrunc3VarTagState.copyRest, DTrunc3VarTagState.done, DTrunc3VarTagState.reject]
+  · have hq' : q = ⟨7, by decide⟩ := by ext; assumption
+    subst q
+    cases sym with
+    | none => cases wsym <;> simp [DTrunc3VarTagTM, DTrunc3VarTagState.start, DTrunc3VarTagState.scanFirst, DTrunc3VarTagState.emit0, DTrunc3VarTagState.emit1, DTrunc3VarTagState.skipSecond, DTrunc3VarTagState.copyRest, DTrunc3VarTagState.done, DTrunc3VarTagState.reject]
+    | some b => cases b <;> cases wsym <;> simp [DTrunc3VarTagTM, DTrunc3VarTagState.start, DTrunc3VarTagState.scanFirst, DTrunc3VarTagState.emit0, DTrunc3VarTagState.emit1, DTrunc3VarTagState.skipSecond, DTrunc3VarTagState.copyRest, DTrunc3VarTagState.done, DTrunc3VarTagState.reject]
+
+theorem dPolyTimeComputableClean_trunc3VarTag :
+    DPolyTimeComputableClean (fun z => insertVarTagTotal (firstThirdCodes z)) := by
+  refine DPolyTimeComputableClean.of_machine DTrunc3VarTagTM (X + X + C 6) (X + C 2)
+    (fun z => insertVarTagTotal (firstThirdCodes z)) ?_ ?_ ?_ ?_
+  · intro q
+    rfl
+  · exact DTrunc3VarTagTM_noWork
+  · intro z
+    rcases Drun_DTrunc3VarTagTM_full z with ⟨s, hs, hh, hout⟩
+    simp only [Polynomial.eval_add, Polynomial.eval_X, Polynomial.eval_C]
+    rw [Drun_eq_of_halted_within DTrunc3VarTagTM (Dinit DTrunc3VarTagTM z)
+      (by omega) hh]
+    exact hh
+  · intro z
+    rcases Drun_DTrunc3VarTagTM_full z with ⟨s, hs, hh, hout⟩
+    constructor
+    · simp only [Polynomial.eval_add, Polynomial.eval_X, Polynomial.eval_C]
+      dsimp [Dboutput]
+      rw [Drun_eq_of_halted_within DTrunc3VarTagTM (Dinit DTrunc3VarTagTM z)
+        (by omega) hh]
+      exact hout
+    · simp [insertVarTagTotal_length, firstThirdCodes_length_le]
+
+
+-- ---------------------------------------------------------------------------
+-- A clean transducer that inserts a variable tag and keeps exactly two codes
+-- ---------------------------------------------------------------------------
+
+abbrev DTrunc3NotVarTagState := Fin 10
+
+namespace DTrunc3NotVarTagState
+
+def start : DTrunc3NotVarTagState := ⟨0, by decide⟩
+def scanFirst : DTrunc3NotVarTagState := ⟨1, by decide⟩
+def emit0 : DTrunc3NotVarTagState := ⟨2, by decide⟩
+def emit1 : DTrunc3NotVarTagState := ⟨3, by decide⟩
+def emit2 : DTrunc3NotVarTagState := ⟨4, by decide⟩
+def emit3 : DTrunc3NotVarTagState := ⟨5, by decide⟩
+def skipSecond : DTrunc3NotVarTagState := ⟨6, by decide⟩
+def copyRest : DTrunc3NotVarTagState := ⟨7, by decide⟩
+def done : DTrunc3NotVarTagState := ⟨8, by decide⟩
+def reject : DTrunc3NotVarTagState := ⟨9, by decide⟩
+
+end DTrunc3NotVarTagState
+
+/-- Insert the second-variable tag after the first unary code, copy the second
+    unary code, skip the second unary code, and copy the remainder. -/
+def DTrunc3NotVarTagTM : DTM DTrunc3NotVarTagState where
+  step := fun q sym _ =>
+    if q = DTrunc3NotVarTagState.start then
+      { next := DTrunc3NotVarTagState.scanFirst, output := none, inputMove := some true
+        workWrite := none, workMove := none }
+    else if q = DTrunc3NotVarTagState.scanFirst then
+      match sym with
+      | some b =>
+          if b then
+            { next := DTrunc3NotVarTagState.scanFirst, output := some b,
+              inputMove := some true, workWrite := none, workMove := none }
+          else
+            { next := DTrunc3NotVarTagState.emit0, output := some b,
+              inputMove := some true, workWrite := none, workMove := none }
+      | none =>
+          { next := DTrunc3NotVarTagState.emit0, output := none, inputMove := none,
+            workWrite := none, workMove := none }
+    else if q.val = 2 then
+      { next := DTrunc3NotVarTagState.emit1, output := some false, inputMove := none
+        workWrite := none, workMove := none }
+    else if q.val = 3 then
+      { next := DTrunc3NotVarTagState.emit2, output := some true, inputMove := none
+        workWrite := none, workMove := none }
+    else if q.val = 4 then
+      { next := DTrunc3NotVarTagState.emit3, output := some false, inputMove := none
+        workWrite := none, workMove := none }
+    else if q.val = 5 then
+      { next := DTrunc3NotVarTagState.skipSecond, output := some false, inputMove := none
+        workWrite := none, workMove := none }
+    else if q = DTrunc3NotVarTagState.skipSecond then
+      match sym with
+      | some true =>
+          { next := DTrunc3NotVarTagState.skipSecond, output := none,
+            inputMove := some true, workWrite := none, workMove := none }
+      | some false =>
+          { next := DTrunc3NotVarTagState.copyRest, output := none,
+            inputMove := some true, workWrite := none, workMove := none }
+      | none =>
+          { next := DTrunc3NotVarTagState.copyRest, output := none, inputMove := none
+            workWrite := none, workMove := none }
+    else if q = DTrunc3NotVarTagState.copyRest then
+      match sym with
+      | some b =>
+          { next := DTrunc3NotVarTagState.copyRest, output := some b,
+            inputMove := some true, workWrite := none, workMove := none }
+      | none =>
+          { next := DTrunc3NotVarTagState.done, output := none, inputMove := none
+            workWrite := none, workMove := none }
+    else
+      { next := q, output := none, inputMove := none
+        workWrite := none, workMove := none }
+  start := DTrunc3NotVarTagState.start
+  accept := DTrunc3NotVarTagState.done
+  reject := DTrunc3NotVarTagState.reject
+
+lemma Drun_DTrunc3NotVarTagTM_start (z : Word) :
+    Drun DTrunc3NotVarTagTM 1 (Dinit DTrunc3NotVarTagTM z) =
+      { state := DTrunc3NotVarTagState.scanFirst, input := z, head := 1, output := [],
+        work := fun _ : Nat => false, workHead := 0 } := by
+  simp [Drun, Dhalted, Dinit, Dstep, Dread, DTrunc3NotVarTagTM, Dmove,
+    DTrunc3NotVarTagState.start, DTrunc3NotVarTagState.scanFirst,
+    DTrunc3NotVarTagState.emit0, DTrunc3NotVarTagState.emit1,
+    DTrunc3NotVarTagState.emit2, DTrunc3NotVarTagState.emit3,
+    DTrunc3NotVarTagState.skipSecond, DTrunc3NotVarTagState.copyRest,
+    DTrunc3NotVarTagState.done,
+    DTrunc3NotVarTagState.reject]
+
+lemma Drun_DTrunc3NotVarTagTM_scan_all_true (pre : Word) (k : Nat)
+    (wk : Nat → Bool) (wh : Nat) :
+    Drun DTrunc3NotVarTagTM (k + 1)
+      { state := DTrunc3NotVarTagState.scanFirst,
+        input := pre ++ List.replicate k true, head := pre.length + 1,
+        output := pre, work := wk, workHead := wh } =
+      { state := DTrunc3NotVarTagState.emit0,
+        input := pre ++ List.replicate k true, head := pre.length + k + 1,
+        output := pre ++ List.replicate k true, work := wk, workHead := wh } := by
+  induction k generalizing pre with
+  | zero =>
+      simp [Drun, Dhalted, Dstep, Dread, Dmove, DTrunc3NotVarTagTM,
+        DTrunc3NotVarTagState.start, DTrunc3NotVarTagState.scanFirst,
+        DTrunc3NotVarTagState.emit0, DTrunc3NotVarTagState.emit1,
+        DTrunc3NotVarTagState.emit2, DTrunc3NotVarTagState.emit3,
+        DTrunc3NotVarTagState.skipSecond, DTrunc3NotVarTagState.done,
+        DTrunc3NotVarTagState.reject]
+  | succ k ih =>
+      rw [show k.succ + 1 = 1 + (k + 1) by omega, Drun_add_eq]
+      let c : DConfig DTrunc3NotVarTagState :=
+        { state := DTrunc3NotVarTagState.scanFirst,
+          input := pre ++ List.replicate k.succ true, head := pre.length + 1,
+          output := pre, work := wk, workHead := wh }
+      let c' : DConfig DTrunc3NotVarTagState :=
+        { state := DTrunc3NotVarTagState.scanFirst,
+          input := pre ++ List.replicate k.succ true, head := pre.length + 2,
+          output := pre ++ [true], work := wk, workHead := wh }
+      have hstep : Drun DTrunc3NotVarTagTM 1 c = c' := by
+        simp [c, c', Drun, Dhalted, Dstep, Dread, DTrunc3NotVarTagTM, Dmove,
+          List.replicate_succ, DTrunc3NotVarTagState.start,
+          DTrunc3NotVarTagState.scanFirst, DTrunc3NotVarTagState.emit0,
+          DTrunc3NotVarTagState.emit1, DTrunc3NotVarTagState.skipSecond,
+          DTrunc3NotVarTagState.done, DTrunc3NotVarTagState.reject]
+      change Drun DTrunc3NotVarTagTM (k + 1) (Drun DTrunc3NotVarTagTM 1 c) = _
+      rw [hstep]
+      simpa [c', List.replicate_succ, List.append_assoc,
+        Nat.add_assoc, Nat.add_comm, Nat.add_left_comm] using ih (pre := pre ++ [true])
+
+lemma Drun_DTrunc3NotVarTagTM_scan_trues (pre z : Word) (k : Nat)
+    (wk : Nat → Bool) (wh : Nat) :
+    Drun DTrunc3NotVarTagTM (k + 1)
+      { state := DTrunc3NotVarTagState.scanFirst,
+        input := pre ++ List.replicate k true ++ false :: z,
+        head := pre.length + 1, output := pre, work := wk, workHead := wh } =
+      { state := DTrunc3NotVarTagState.emit0,
+        input := pre ++ List.replicate k true ++ false :: z,
+        head := pre.length + k + 2,
+        output := pre ++ List.replicate k true ++ [false],
+        work := wk, workHead := wh } := by
+  induction k generalizing pre with
+  | zero =>
+      simp [Drun, Dhalted, Dstep, Dread, DTrunc3NotVarTagTM, Dmove,
+        DTrunc3NotVarTagState.start, DTrunc3NotVarTagState.scanFirst,
+        DTrunc3NotVarTagState.emit0, DTrunc3NotVarTagState.emit1,
+        DTrunc3NotVarTagState.emit2, DTrunc3NotVarTagState.emit3,
+        DTrunc3NotVarTagState.skipSecond, DTrunc3NotVarTagState.done,
+        DTrunc3NotVarTagState.reject]
+  | succ k ih =>
+      rw [show k.succ + 1 = 1 + (k + 1) by omega, Drun_add_eq]
+      let c : DConfig DTrunc3NotVarTagState :=
+        { state := DTrunc3NotVarTagState.scanFirst,
+          input := pre ++ List.replicate k.succ true ++ false :: z,
+          head := pre.length + 1, output := pre, work := wk, workHead := wh }
+      let c' : DConfig DTrunc3NotVarTagState :=
+        { state := DTrunc3NotVarTagState.scanFirst,
+          input := pre ++ List.replicate k.succ true ++ false :: z,
+          head := pre.length + 2, output := pre ++ [true],
+          work := wk, workHead := wh }
+      have hstep : Drun DTrunc3NotVarTagTM 1 c = c' := by
+        simp [c, c', Drun, Dhalted, Dstep, Dread, DTrunc3NotVarTagTM, Dmove,
+          List.replicate_succ, DTrunc3NotVarTagState.start,
+          DTrunc3NotVarTagState.scanFirst, DTrunc3NotVarTagState.emit0,
+          DTrunc3NotVarTagState.emit1, DTrunc3NotVarTagState.skipSecond,
+          DTrunc3NotVarTagState.done, DTrunc3NotVarTagState.reject]
+      change Drun DTrunc3NotVarTagTM (k + 1) (Drun DTrunc3NotVarTagTM 1 c) = _
+      rw [hstep]
+      simpa [c', List.replicate_succ, List.append_assoc,
+        Nat.add_assoc, Nat.add_comm, Nat.add_left_comm] using ih (pre := pre ++ [true])
+
+lemma Drun_DTrunc3NotVarTagTM_emit (inp out : Word) (h : Nat)
+    (wk : Nat → Bool) (wh : Nat) :
+    Drun DTrunc3NotVarTagTM 4
+      { state := DTrunc3NotVarTagState.emit0, input := inp, head := h,
+        output := out, work := wk, workHead := wh } =
+      { state := DTrunc3NotVarTagState.skipSecond, input := inp, head := h,
+        output := out ++ [false, true, false, false], work := wk, workHead := wh } := by
+  let c0 : DConfig DTrunc3NotVarTagState :=
+    { state := DTrunc3NotVarTagState.emit0, input := inp, head := h,
+      output := out, work := wk, workHead := wh }
+  let c1 : DConfig DTrunc3NotVarTagState :=
+    { state := DTrunc3NotVarTagState.emit1, input := inp, head := h,
+      output := out ++ [false], work := wk, workHead := wh }
+  let c2 : DConfig DTrunc3NotVarTagState :=
+    { state := DTrunc3NotVarTagState.emit2, input := inp, head := h,
+      output := out ++ [false, true], work := wk, workHead := wh }
+  let c3 : DConfig DTrunc3NotVarTagState :=
+    { state := DTrunc3NotVarTagState.emit3, input := inp, head := h,
+      output := out ++ [false, true, false], work := wk, workHead := wh }
+  let c4 : DConfig DTrunc3NotVarTagState :=
+    { state := DTrunc3NotVarTagState.skipSecond, input := inp, head := h,
+      output := out ++ [false, true, false, false], work := wk, workHead := wh }
+  have h1 : Drun DTrunc3NotVarTagTM 1 c0 = c1 := by
+    simp [c0, c1, Drun, Dhalted, Dstep, Dread, Dmove, DTrunc3NotVarTagTM,
+      DTrunc3NotVarTagState.start, DTrunc3NotVarTagState.scanFirst,
+      DTrunc3NotVarTagState.emit0, DTrunc3NotVarTagState.emit1,
+      DTrunc3NotVarTagState.emit2, DTrunc3NotVarTagState.emit3,
+      DTrunc3NotVarTagState.skipSecond, DTrunc3NotVarTagState.copyRest,
+      DTrunc3NotVarTagState.done, DTrunc3NotVarTagState.reject, List.append_assoc]
+  have h2 : Drun DTrunc3NotVarTagTM 1 c1 = c2 := by
+    simp [c1, c2, Drun, Dhalted, Dstep, Dread, Dmove, DTrunc3NotVarTagTM,
+      DTrunc3NotVarTagState.start, DTrunc3NotVarTagState.scanFirst,
+      DTrunc3NotVarTagState.emit0, DTrunc3NotVarTagState.emit1,
+      DTrunc3NotVarTagState.emit2, DTrunc3NotVarTagState.emit3,
+      DTrunc3NotVarTagState.skipSecond, DTrunc3NotVarTagState.copyRest,
+      DTrunc3NotVarTagState.done, DTrunc3NotVarTagState.reject, List.append_assoc]
+  have h3 : Drun DTrunc3NotVarTagTM 1 c2 = c3 := by
+    simp [c2, c3, Drun, Dhalted, Dstep, Dread, Dmove, DTrunc3NotVarTagTM,
+      DTrunc3NotVarTagState.start, DTrunc3NotVarTagState.scanFirst,
+      DTrunc3NotVarTagState.emit0, DTrunc3NotVarTagState.emit1,
+      DTrunc3NotVarTagState.emit2, DTrunc3NotVarTagState.emit3,
+      DTrunc3NotVarTagState.skipSecond, DTrunc3NotVarTagState.copyRest,
+      DTrunc3NotVarTagState.done, DTrunc3NotVarTagState.reject, List.append_assoc]
+  have h4 : Drun DTrunc3NotVarTagTM 1 c3 = c4 := by
+    simp [c3, c4, Drun, Dhalted, Dstep, Dread, Dmove, DTrunc3NotVarTagTM,
+      DTrunc3NotVarTagState.start, DTrunc3NotVarTagState.scanFirst,
+      DTrunc3NotVarTagState.emit0, DTrunc3NotVarTagState.emit1,
+      DTrunc3NotVarTagState.emit2, DTrunc3NotVarTagState.emit3,
+      DTrunc3NotVarTagState.skipSecond, DTrunc3NotVarTagState.copyRest,
+      DTrunc3NotVarTagState.done, DTrunc3NotVarTagState.reject, List.append_assoc]
+  change Drun DTrunc3NotVarTagTM 4 c0 = c4
+  rw [show 4 = 1 + 3 by omega, Drun_add_eq, h1]
+  rw [show 3 = 1 + 2 by omega, Drun_add_eq, h2]
+  rw [show 2 = 1 + 1 by omega, Drun_add_eq, h3]
+  rw [h4]
+
+lemma Drun_DTrunc3NotVarTagTM_copy (skipped rest out : Word)
+    (wk : Nat → Bool) (wh : Nat) :
+    Drun DTrunc3NotVarTagTM (rest.length + 1)
+      { state := DTrunc3NotVarTagState.copyRest, input := skipped ++ rest,
+        head := skipped.length + 1, output := out, work := wk, workHead := wh } =
+      { state := DTrunc3NotVarTagState.done, input := skipped ++ rest,
+        head := skipped.length + rest.length + 1, output := out ++ rest,
+        work := wk, workHead := wh } := by
+  induction rest generalizing skipped out with
+  | nil =>
+      simp [Drun, Dhalted, Dstep, Dread, DTrunc3NotVarTagTM,
+        DTrunc3NotVarTagState.start, DTrunc3NotVarTagState.scanFirst,
+        DTrunc3NotVarTagState.emit0, DTrunc3NotVarTagState.emit1, DTrunc3NotVarTagState.skipSecond,
+        DTrunc3NotVarTagState.copyRest, DTrunc3NotVarTagState.done,
+        DTrunc3NotVarTagState.reject]
+  | cons b bs ih =>
+      rw [show (b :: bs).length + 1 = 1 + (bs.length + 1) by
+        simp [Nat.add_comm, Nat.add_left_comm], Drun_add_eq]
+      let c : DConfig DTrunc3NotVarTagState :=
+        { state := DTrunc3NotVarTagState.copyRest, input := skipped ++ b :: bs,
+          head := skipped.length + 1, output := out, work := wk, workHead := wh }
+      let c' : DConfig DTrunc3NotVarTagState :=
+        { state := DTrunc3NotVarTagState.copyRest, input := skipped ++ b :: bs,
+          head := skipped.length + 2, output := out ++ [b], work := wk, workHead := wh }
+      have hstep : Drun DTrunc3NotVarTagTM 1 c = c' := by
+        simp [c, c', Drun, Dhalted, Dstep, Dread, DTrunc3NotVarTagTM, Dmove,
+          DTrunc3NotVarTagState.start, DTrunc3NotVarTagState.scanFirst,
+        DTrunc3NotVarTagState.emit0, DTrunc3NotVarTagState.emit1, DTrunc3NotVarTagState.skipSecond,
+          DTrunc3NotVarTagState.copyRest, DTrunc3NotVarTagState.done,
+          DTrunc3NotVarTagState.reject]
+      change Drun DTrunc3NotVarTagTM (bs.length + 1) (Drun DTrunc3NotVarTagTM 1 c) = _
+      rw [hstep]
+      simpa [c', List.append_assoc, Nat.add_assoc, Nat.add_comm, Nat.add_left_comm]
+        using ih (skipped := skipped ++ [b]) (out := out ++ [b])
+
+
+lemma Drun_DTrunc3NotVarTagTM_skipSecond (pre z out : Word)
+    (wk : Nat → Bool) (wh : Nat) :
+    Drun DTrunc3NotVarTagTM (z.length + 2)
+      { state := DTrunc3NotVarTagState.skipSecond, input := pre ++ z,
+        head := pre.length + 1, output := out, work := wk, workHead := wh } =
+      { state := DTrunc3NotVarTagState.done, input := pre ++ z,
+        head := pre.length + z.length + 1, output := out ++ dropFirstUnary z,
+        work := wk, workHead := wh } := by
+  induction z generalizing pre out with
+  | nil =>
+      simp [Drun, Dhalted, Dstep, Dread, DTrunc3NotVarTagTM,
+        DTrunc3NotVarTagState.start, DTrunc3NotVarTagState.scanFirst,
+        DTrunc3NotVarTagState.emit0, DTrunc3NotVarTagState.emit1, DTrunc3NotVarTagState.skipSecond,
+        DTrunc3NotVarTagState.copyRest, DTrunc3NotVarTagState.done,
+        DTrunc3NotVarTagState.reject, dropFirstUnary]
+  | cons b bs ih =>
+      rw [show (b :: bs).length + 2 = 1 + (bs.length + 2) by
+        simp [Nat.add_comm, Nat.add_left_comm], Drun_add_eq]
+      let c : DConfig DTrunc3NotVarTagState :=
+        { state := DTrunc3NotVarTagState.skipSecond, input := pre ++ b :: bs,
+          head := pre.length + 1, output := out, work := wk, workHead := wh }
+      have hstep : Drun DTrunc3NotVarTagTM 1 c =
+          { state := if b then DTrunc3NotVarTagState.skipSecond else DTrunc3NotVarTagState.copyRest,
+            input := pre ++ b :: bs, head := pre.length + 2, output := out,
+            work := wk, workHead := wh } := by
+        cases b <;>
+          simp [c, Drun, Dhalted, Dstep, Dread, DTrunc3NotVarTagTM, Dmove,
+            DTrunc3NotVarTagState.start, DTrunc3NotVarTagState.scanFirst,
+        DTrunc3NotVarTagState.emit0, DTrunc3NotVarTagState.emit1, DTrunc3NotVarTagState.skipSecond,
+            DTrunc3NotVarTagState.copyRest, DTrunc3NotVarTagState.done,
+            DTrunc3NotVarTagState.reject]
+      cases b with
+      | false =>
+          change Drun DTrunc3NotVarTagTM (bs.length + 2) (Drun DTrunc3NotVarTagTM 1 c) = _
+          rw [hstep]
+          simp only [Bool.false_eq_true, ↓reduceIte]
+          have hc : Drun DTrunc3NotVarTagTM (bs.length + 1)
+              { state := DTrunc3NotVarTagState.copyRest, input := pre ++ false :: bs,
+                head := pre.length + 2, output := out, work := wk, workHead := wh } =
+              { state := DTrunc3NotVarTagState.done, input := pre ++ false :: bs,
+                head := pre.length + bs.length + 2, output := out ++ bs,
+                work := wk, workHead := wh } := by
+            simpa [List.append_assoc, Nat.add_assoc, Nat.add_comm, Nat.add_left_comm] using
+              (Drun_DTrunc3NotVarTagTM_copy (skipped := pre ++ [false]) (rest := bs)
+                (out := out) wk wh)
+          rw [show bs.length + 2 = (bs.length + 1) + 1 by omega, Drun_add_eq, hc]
+          simp [Drun, Dhalted, DTrunc3NotVarTagTM, DTrunc3NotVarTagState.done,
+            dropFirstUnary, List.append_assoc, Nat.add_assoc, Nat.add_comm, Nat.add_left_comm]
+      | true =>
+          change Drun DTrunc3NotVarTagTM (bs.length + 2) (Drun DTrunc3NotVarTagTM 1 c) = _
+          rw [hstep]
+          simpa [List.append_assoc, Nat.add_assoc, Nat.add_comm, Nat.add_left_comm,
+            dropFirstUnary] using ih (pre := pre ++ [true]) (out := out)
+
+
+
+lemma Drun_DTrunc3NotVarTagTM_all_true_run (i : Nat) :
+    Drun DTrunc3NotVarTagTM (i + 8) (Dinit DTrunc3NotVarTagTM (List.replicate i true)) =
+      { state := DTrunc3NotVarTagState.done, input := List.replicate i true,
+        head := i + 1, output := List.replicate i true ++ [false, true, false, false],
+        work := fun _ : Nat => false, workHead := 0 } := by
+  have hstart := Drun_DTrunc3NotVarTagTM_start (List.replicate i true)
+  have hscan : Drun DTrunc3NotVarTagTM (i + 1)
+      { state := DTrunc3NotVarTagState.scanFirst,
+        input := List.replicate i true, head := 1, output := [],
+        work := fun _ : Nat => false, workHead := 0 } =
+      { state := DTrunc3NotVarTagState.emit0,
+        input := List.replicate i true, head := i + 1,
+        output := List.replicate i true,
+        work := fun _ : Nat => false, workHead := 0 } := by
+    simpa using (Drun_DTrunc3NotVarTagTM_scan_all_true [] i (fun _ : Nat => false) 0)
+  have hemit := Drun_DTrunc3NotVarTagTM_emit (List.replicate i true)
+    (List.replicate i true) (i + 1) (fun _ : Nat => false) 0
+  have hskip := Drun_DTrunc3NotVarTagTM_skipSecond (List.replicate i true) ([] : Word)
+    (List.replicate i true ++ [false, true, false, false]) (fun _ : Nat => false) 0
+  rw [show i + 8 = 1 + ((i + 1) + (4 + 2)) by omega, Drun_add_eq, hstart]
+  rw [Drun_add_eq, hscan]
+  rw [Drun_add_eq, hemit]
+  simpa [dropFirstUnary] using hskip
+
+lemma Drun_DTrunc3NotVarTagTM_false_run (i : Nat) (zs : Word) :
+    Drun DTrunc3NotVarTagTM (i + zs.length + 8)
+      (Dinit DTrunc3NotVarTagTM (List.replicate i true ++ false :: zs)) =
+      { state := DTrunc3NotVarTagState.done,
+        input := List.replicate i true ++ false :: zs,
+        head := i + zs.length + 2,
+        output := List.replicate i true ++ [false] ++ [false, true, false, false] ++
+          dropFirstUnary zs,
+        work := fun _ : Nat => false, workHead := 0 } := by
+  let x : Word := List.replicate i true ++ false :: zs
+  have hstart := Drun_DTrunc3NotVarTagTM_start x
+  have hscan : Drun DTrunc3NotVarTagTM (i + 1)
+      { state := DTrunc3NotVarTagState.scanFirst, input := x, head := 1,
+        output := [], work := fun _ : Nat => false, workHead := 0 } =
+      { state := DTrunc3NotVarTagState.emit0, input := x, head := i + 2,
+        output := List.replicate i true ++ [false],
+        work := fun _ : Nat => false, workHead := 0 } := by
+    simpa [x] using (Drun_DTrunc3NotVarTagTM_scan_trues [] zs i (fun _ : Nat => false) 0)
+  have hemit := Drun_DTrunc3NotVarTagTM_emit x (List.replicate i true ++ [false])
+    (i + 2) (fun _ : Nat => false) 0
+  have hskip := Drun_DTrunc3NotVarTagTM_skipSecond
+    (List.replicate i true ++ [false]) zs
+    (List.replicate i true ++ [false] ++ [false, true, false, false])
+    (fun _ : Nat => false) 0
+  rw [show i + zs.length + 8 = 1 + ((i + 1) + (4 + (zs.length + 2))) by omega]
+  rw [Drun_add_eq, hstart]
+  rw [Drun_add_eq, hscan]
+  rw [Drun_add_eq, hemit]
+  simpa [x, List.append_assoc, Nat.add_assoc, Nat.add_comm, Nat.add_left_comm] using hskip
+
+lemma Drun_DTrunc3NotVarTagTM_full (z : Word) :
+    ∃ s : Nat, s ≤ z.length + z.length + 8 ∧
+      Dhalted DTrunc3NotVarTagTM (Drun DTrunc3NotVarTagTM s (Dinit DTrunc3NotVarTagTM z)) = true ∧
+      (Drun DTrunc3NotVarTagTM s (Dinit DTrunc3NotVarTagTM z)).output =
+        insertNotVarTagTotal (firstThirdCodes z) := by
+  rcases word_eq_replicate_true_append z with ⟨i, y, hzy, hy⟩
+  subst z
+  rcases hy with rfl | ⟨zs, rfl⟩
+  · refine ⟨i + 8, by simp, ?_, ?_⟩
+    · simp only [List.append_nil]
+      rw [Drun_DTrunc3NotVarTagTM_all_true_run i]
+      simp [Dhalted, DTrunc3NotVarTagTM, DTrunc3NotVarTagState.done]
+    · simp only [List.append_nil]
+      rw [Drun_DTrunc3NotVarTagTM_all_true_run i]
+      simp [firstThirdCodes_all_true_aux, insertNotVarTagTotal_replicate_true]
+  · refine ⟨i + zs.length + 8, by
+      simp [List.length_append, List.length_replicate]
+      omega, ?_, ?_⟩
+    · rw [Drun_DTrunc3NotVarTagTM_false_run i zs]
+      simp [Dhalted, DTrunc3NotVarTagTM, DTrunc3NotVarTagState.done]
+    · rw [Drun_DTrunc3NotVarTagTM_false_run i zs]
+      simp [firstThirdCodes_replicate_true_false,
+        insertNotVarTagTotal_replicate_true_false, List.append_assoc]
+
+lemma DTrunc3NotVarTagTM_noWork : DNoWork DTrunc3NotVarTagTM := by
+  intro q sym wsym
+  have hq : q.val = 0 ∨ q.val = 1 ∨ q.val = 2 ∨ q.val = 3 ∨ q.val = 4 ∨ q.val = 5 ∨ q.val = 6 ∨ q.val = 7 ∨ q.val = 8 ∨ q.val = 9 := by omega
+  rcases hq with h0 | h1 | h2 | h3 | h4 | h5 | h6 | h7 | h8 | h9
+  · have hq' : q = ⟨0, by decide⟩ := by ext; assumption
+    subst q
+    cases sym with
+    | none => cases wsym <;> simp [DTrunc3NotVarTagTM, DTrunc3NotVarTagState.start, DTrunc3NotVarTagState.scanFirst, DTrunc3NotVarTagState.emit0, DTrunc3NotVarTagState.emit1, DTrunc3NotVarTagState.emit2, DTrunc3NotVarTagState.emit3, DTrunc3NotVarTagState.skipSecond, DTrunc3NotVarTagState.copyRest, DTrunc3NotVarTagState.done, DTrunc3NotVarTagState.reject]
+    | some b => cases b <;> cases wsym <;> simp [DTrunc3NotVarTagTM, DTrunc3NotVarTagState.start, DTrunc3NotVarTagState.scanFirst, DTrunc3NotVarTagState.emit0, DTrunc3NotVarTagState.emit1, DTrunc3NotVarTagState.emit2, DTrunc3NotVarTagState.emit3, DTrunc3NotVarTagState.skipSecond, DTrunc3NotVarTagState.copyRest, DTrunc3NotVarTagState.done, DTrunc3NotVarTagState.reject]
+  · have hq' : q = ⟨1, by decide⟩ := by ext; assumption
+    subst q
+    cases sym with
+    | none => cases wsym <;> simp [DTrunc3NotVarTagTM, DTrunc3NotVarTagState.start, DTrunc3NotVarTagState.scanFirst, DTrunc3NotVarTagState.emit0, DTrunc3NotVarTagState.emit1, DTrunc3NotVarTagState.emit2, DTrunc3NotVarTagState.emit3, DTrunc3NotVarTagState.skipSecond, DTrunc3NotVarTagState.copyRest, DTrunc3NotVarTagState.done, DTrunc3NotVarTagState.reject]
+    | some b => cases b <;> cases wsym <;> simp [DTrunc3NotVarTagTM, DTrunc3NotVarTagState.start, DTrunc3NotVarTagState.scanFirst, DTrunc3NotVarTagState.emit0, DTrunc3NotVarTagState.emit1, DTrunc3NotVarTagState.emit2, DTrunc3NotVarTagState.emit3, DTrunc3NotVarTagState.skipSecond, DTrunc3NotVarTagState.copyRest, DTrunc3NotVarTagState.done, DTrunc3NotVarTagState.reject]
+  · have hq' : q = ⟨2, by decide⟩ := by ext; assumption
+    subst q
+    cases sym with
+    | none => cases wsym <;> simp [DTrunc3NotVarTagTM, DTrunc3NotVarTagState.start, DTrunc3NotVarTagState.scanFirst, DTrunc3NotVarTagState.emit0, DTrunc3NotVarTagState.emit1, DTrunc3NotVarTagState.emit2, DTrunc3NotVarTagState.emit3, DTrunc3NotVarTagState.skipSecond, DTrunc3NotVarTagState.copyRest, DTrunc3NotVarTagState.done, DTrunc3NotVarTagState.reject]
+    | some b => cases b <;> cases wsym <;> simp [DTrunc3NotVarTagTM, DTrunc3NotVarTagState.start, DTrunc3NotVarTagState.scanFirst, DTrunc3NotVarTagState.emit0, DTrunc3NotVarTagState.emit1, DTrunc3NotVarTagState.emit2, DTrunc3NotVarTagState.emit3, DTrunc3NotVarTagState.skipSecond, DTrunc3NotVarTagState.copyRest, DTrunc3NotVarTagState.done, DTrunc3NotVarTagState.reject]
+  · have hq' : q = ⟨3, by decide⟩ := by ext; assumption
+    subst q
+    cases sym with
+    | none => cases wsym <;> simp [DTrunc3NotVarTagTM, DTrunc3NotVarTagState.start, DTrunc3NotVarTagState.scanFirst, DTrunc3NotVarTagState.emit0, DTrunc3NotVarTagState.emit1, DTrunc3NotVarTagState.emit2, DTrunc3NotVarTagState.emit3, DTrunc3NotVarTagState.skipSecond, DTrunc3NotVarTagState.copyRest, DTrunc3NotVarTagState.done, DTrunc3NotVarTagState.reject]
+    | some b => cases b <;> cases wsym <;> simp [DTrunc3NotVarTagTM, DTrunc3NotVarTagState.start, DTrunc3NotVarTagState.scanFirst, DTrunc3NotVarTagState.emit0, DTrunc3NotVarTagState.emit1, DTrunc3NotVarTagState.emit2, DTrunc3NotVarTagState.emit3, DTrunc3NotVarTagState.skipSecond, DTrunc3NotVarTagState.copyRest, DTrunc3NotVarTagState.done, DTrunc3NotVarTagState.reject]
+  · have hq' : q = ⟨4, by decide⟩ := by ext; assumption
+    subst q
+    cases sym with
+    | none => cases wsym <;> simp [DTrunc3NotVarTagTM, DTrunc3NotVarTagState.start, DTrunc3NotVarTagState.scanFirst, DTrunc3NotVarTagState.emit0, DTrunc3NotVarTagState.emit1, DTrunc3NotVarTagState.emit2, DTrunc3NotVarTagState.emit3, DTrunc3NotVarTagState.skipSecond, DTrunc3NotVarTagState.copyRest, DTrunc3NotVarTagState.done, DTrunc3NotVarTagState.reject]
+    | some b => cases b <;> cases wsym <;> simp [DTrunc3NotVarTagTM, DTrunc3NotVarTagState.start, DTrunc3NotVarTagState.scanFirst, DTrunc3NotVarTagState.emit0, DTrunc3NotVarTagState.emit1, DTrunc3NotVarTagState.emit2, DTrunc3NotVarTagState.emit3, DTrunc3NotVarTagState.skipSecond, DTrunc3NotVarTagState.copyRest, DTrunc3NotVarTagState.done, DTrunc3NotVarTagState.reject]
+  · have hq' : q = ⟨5, by decide⟩ := by ext; assumption
+    subst q
+    cases sym with
+    | none => cases wsym <;> simp [DTrunc3NotVarTagTM, DTrunc3NotVarTagState.start, DTrunc3NotVarTagState.scanFirst, DTrunc3NotVarTagState.emit0, DTrunc3NotVarTagState.emit1, DTrunc3NotVarTagState.emit2, DTrunc3NotVarTagState.emit3, DTrunc3NotVarTagState.skipSecond, DTrunc3NotVarTagState.copyRest, DTrunc3NotVarTagState.done, DTrunc3NotVarTagState.reject]
+    | some b => cases b <;> cases wsym <;> simp [DTrunc3NotVarTagTM, DTrunc3NotVarTagState.start, DTrunc3NotVarTagState.scanFirst, DTrunc3NotVarTagState.emit0, DTrunc3NotVarTagState.emit1, DTrunc3NotVarTagState.emit2, DTrunc3NotVarTagState.emit3, DTrunc3NotVarTagState.skipSecond, DTrunc3NotVarTagState.copyRest, DTrunc3NotVarTagState.done, DTrunc3NotVarTagState.reject]
+  · have hq' : q = ⟨6, by decide⟩ := by ext; assumption
+    subst q
+    cases sym with
+    | none => cases wsym <;> simp [DTrunc3NotVarTagTM, DTrunc3NotVarTagState.start, DTrunc3NotVarTagState.scanFirst, DTrunc3NotVarTagState.emit0, DTrunc3NotVarTagState.emit1, DTrunc3NotVarTagState.emit2, DTrunc3NotVarTagState.emit3, DTrunc3NotVarTagState.skipSecond, DTrunc3NotVarTagState.copyRest, DTrunc3NotVarTagState.done, DTrunc3NotVarTagState.reject]
+    | some b => cases b <;> cases wsym <;> simp [DTrunc3NotVarTagTM, DTrunc3NotVarTagState.start, DTrunc3NotVarTagState.scanFirst, DTrunc3NotVarTagState.emit0, DTrunc3NotVarTagState.emit1, DTrunc3NotVarTagState.emit2, DTrunc3NotVarTagState.emit3, DTrunc3NotVarTagState.skipSecond, DTrunc3NotVarTagState.copyRest, DTrunc3NotVarTagState.done, DTrunc3NotVarTagState.reject]
+  · have hq' : q = ⟨7, by decide⟩ := by ext; assumption
+    subst q
+    cases sym with
+    | none => cases wsym <;> simp [DTrunc3NotVarTagTM, DTrunc3NotVarTagState.start, DTrunc3NotVarTagState.scanFirst, DTrunc3NotVarTagState.emit0, DTrunc3NotVarTagState.emit1, DTrunc3NotVarTagState.emit2, DTrunc3NotVarTagState.emit3, DTrunc3NotVarTagState.skipSecond, DTrunc3NotVarTagState.copyRest, DTrunc3NotVarTagState.done, DTrunc3NotVarTagState.reject]
+    | some b => cases b <;> cases wsym <;> simp [DTrunc3NotVarTagTM, DTrunc3NotVarTagState.start, DTrunc3NotVarTagState.scanFirst, DTrunc3NotVarTagState.emit0, DTrunc3NotVarTagState.emit1, DTrunc3NotVarTagState.emit2, DTrunc3NotVarTagState.emit3, DTrunc3NotVarTagState.skipSecond, DTrunc3NotVarTagState.copyRest, DTrunc3NotVarTagState.done, DTrunc3NotVarTagState.reject]
+  · have hq' : q = ⟨8, by decide⟩ := by ext; assumption
+    subst q
+    cases sym with
+    | none => cases wsym <;> simp [DTrunc3NotVarTagTM, DTrunc3NotVarTagState.start, DTrunc3NotVarTagState.scanFirst, DTrunc3NotVarTagState.emit0, DTrunc3NotVarTagState.emit1, DTrunc3NotVarTagState.emit2, DTrunc3NotVarTagState.emit3, DTrunc3NotVarTagState.skipSecond, DTrunc3NotVarTagState.copyRest, DTrunc3NotVarTagState.done, DTrunc3NotVarTagState.reject]
+    | some b => cases b <;> cases wsym <;> simp [DTrunc3NotVarTagTM, DTrunc3NotVarTagState.start, DTrunc3NotVarTagState.scanFirst, DTrunc3NotVarTagState.emit0, DTrunc3NotVarTagState.emit1, DTrunc3NotVarTagState.emit2, DTrunc3NotVarTagState.emit3, DTrunc3NotVarTagState.skipSecond, DTrunc3NotVarTagState.copyRest, DTrunc3NotVarTagState.done, DTrunc3NotVarTagState.reject]
+  · have hq' : q = ⟨9, by decide⟩ := by ext; assumption
+    subst q
+    cases sym with
+    | none => cases wsym <;> simp [DTrunc3NotVarTagTM, DTrunc3NotVarTagState.start, DTrunc3NotVarTagState.scanFirst, DTrunc3NotVarTagState.emit0, DTrunc3NotVarTagState.emit1, DTrunc3NotVarTagState.emit2, DTrunc3NotVarTagState.emit3, DTrunc3NotVarTagState.skipSecond, DTrunc3NotVarTagState.copyRest, DTrunc3NotVarTagState.done, DTrunc3NotVarTagState.reject]
+    | some b => cases b <;> cases wsym <;> simp [DTrunc3NotVarTagTM, DTrunc3NotVarTagState.start, DTrunc3NotVarTagState.scanFirst, DTrunc3NotVarTagState.emit0, DTrunc3NotVarTagState.emit1, DTrunc3NotVarTagState.emit2, DTrunc3NotVarTagState.emit3, DTrunc3NotVarTagState.skipSecond, DTrunc3NotVarTagState.copyRest, DTrunc3NotVarTagState.done, DTrunc3NotVarTagState.reject]
+
+theorem dPolyTimeComputableClean_trunc3NotVarTag :
+    DPolyTimeComputableClean (fun z => insertNotVarTagTotal (firstThirdCodes z)) := by
+  refine DPolyTimeComputableClean.of_machine DTrunc3NotVarTagTM (X + X + C 8) (X + C 4)
+    (fun z => insertNotVarTagTotal (firstThirdCodes z)) ?_ ?_ ?_ ?_
+  · intro q
+    rfl
+  · exact DTrunc3NotVarTagTM_noWork
+  · intro z
+    rcases Drun_DTrunc3NotVarTagTM_full z with ⟨s, hs, hh, hout⟩
+    simp only [Polynomial.eval_add, Polynomial.eval_X, Polynomial.eval_C]
+    rw [Drun_eq_of_halted_within DTrunc3NotVarTagTM (Dinit DTrunc3NotVarTagTM z)
+      (by omega) hh]
+    exact hh
+  · intro z
+    rcases Drun_DTrunc3NotVarTagTM_full z with ⟨s, hs, hh, hout⟩
+    constructor
+    · simp only [Polynomial.eval_add, Polynomial.eval_X, Polynomial.eval_C]
+      dsimp [Dboutput]
+      rw [Drun_eq_of_halted_within DTrunc3NotVarTagTM (Dinit DTrunc3NotVarTagTM z)
+        (by omega) hh]
+      exact hout
+    · simp [insertNotVarTagTotal_length, firstThirdCodes_length_le]
+
+
+/-- Encode the constraint of an `and` node from three concatenated unary codes. -/
+def andNodeConstraintEncodeFromTriple (z : Word) : Word :=
+  ([true, false] : Word) ++
+    ([true, false] : Word) ++ Formula.pairOrNotVarVarEncode (firstTwoCodes z) ++
+      Formula.pairOrNotVarVarEncode (firstThirdCodes z) ++
+    ([true, true] : Word) ++ Formula.pairVarNotVarEncode (firstTwoCodes z) ++
+      ([false, true, false, false] : Word) ++ thirdCode z
+
+lemma andNodeConstraintEncodeFromTriple_unary_triple (a b c : Nat) :
+    andNodeConstraintEncodeFromTriple
+        (Formula.encodeNat a ++ Formula.encodeNat b ++ Formula.encodeNat c) =
+      (nodeConstraintFormula (NodeDesc.and a b c)).encode := by
+  rw [andNodeConstraintEncodeFromTriple, firstTwoCodes_triple, firstThirdCodes_triple,
+    thirdCode_triple]
+  rw [Formula.pairOrNotVarVarEncode_unary_pair, Formula.pairOrNotVarVarEncode_unary_pair,
+    Formula.pairVarNotVarEncode_unary_pair]
+  simp [nodeConstraintFormula, Formula.encode_and_eq, Formula.encode_or_eq,
+    Formula.encode_not_eq, Formula.encode_var_eq, List.append_assoc]
+
+def andNodeConstraintDTMObligation : Prop :=
+  DPolyTimeComputable andNodeConstraintEncodeFromTriple
+
+/-- Encode the constraint of an `or` node from three concatenated unary codes. -/
+def orNodeConstraintEncodeFromTriple (z : Word) : Word :=
+  ([true, false] : Word) ++
+    ([true, false] : Word) ++ Formula.pairVarNotVarEncode (firstTwoCodes z) ++
+      Formula.pairVarNotVarEncode (firstThirdCodes z) ++
+    ([true, true] : Word) ++ Formula.pairOrNotVarVarEncode (firstTwoCodes z) ++
+      ([false, false] : Word) ++ thirdCode z
+
+lemma orNodeConstraintEncodeFromTriple_unary_triple (a b c : Nat) :
+    orNodeConstraintEncodeFromTriple
+        (Formula.encodeNat a ++ Formula.encodeNat b ++ Formula.encodeNat c) =
+      (nodeConstraintFormula (NodeDesc.or a b c)).encode := by
+  rw [orNodeConstraintEncodeFromTriple, firstTwoCodes_triple, firstThirdCodes_triple,
+    thirdCode_triple]
+  rw [Formula.pairVarNotVarEncode_unary_pair, Formula.pairVarNotVarEncode_unary_pair,
+    Formula.pairOrNotVarVarEncode_unary_pair]
+  simp [nodeConstraintFormula, Formula.encode_and_eq, Formula.encode_or_eq,
+    Formula.encode_not_eq, Formula.encode_var_eq, List.append_assoc]
+
+def orNodeConstraintDTMObligation : Prop :=
+  DPolyTimeComputable orNodeConstraintEncodeFromTriple
+
+theorem dPolyTimeComputableClean_pairOrNotVarVarEncode_firstThirdCodes :
+    DPolyTimeComputableClean (fun z => Formula.pairOrNotVarVarEncode (firstThirdCodes z)) := by
+  change DPolyTimeComputableClean
+    (fun z => ([true, true, false, true, false, false] : Word) ++
+      insertVarTagTotal (firstThirdCodes z))
+  exact DPolyTimeComputableClean_prepend [true, true, false, true, false, false]
+    dPolyTimeComputableClean_trunc3VarTag
+
+theorem dPolyTimeComputableClean_pairVarNotVarEncode_firstThirdCodes :
+    DPolyTimeComputableClean (fun z => Formula.pairVarNotVarEncode (firstThirdCodes z)) := by
+  change DPolyTimeComputableClean
+    (fun z => ([true, true, false, false] : Word) ++
+      insertNotVarTagTotal (firstThirdCodes z))
+  exact DPolyTimeComputableClean_prepend [true, true, false, false]
+    dPolyTimeComputableClean_trunc3NotVarTag
+
+theorem andNodeConstraintDTMObligation_proved : andNodeConstraintDTMObligation := by
+  unfold andNodeConstraintDTMObligation
+  have hthird : DPolyTimeComputableClean
+      (fun z : Word => ([false, true, false, false] : Word) ++ thirdCode z) :=
+    DPolyTimeComputableClean_prepend [false, true, false, false]
+      dPolyTimeComputableClean_thirdCode
+  have htail : DPolyTimeComputableClean (fun z : Word =>
+      Formula.pairVarNotVarEncode (firstTwoCodes z) ++
+        (([false, true, false, false] : Word) ++ thirdCode z)) :=
+    DPolyTimeComputableCleanAppend
+      (fun z : Word => Formula.pairVarNotVarEncode (firstTwoCodes z))
+      (fun z : Word => ([false, true, false, false] : Word) ++ thirdCode z)
+      dPolyTimeComputableClean_pairVarNotVarEncode_firstTwoCodes hthird
+  have hconj : DPolyTimeComputableClean (fun z : Word =>
+      ([true, true] : Word) ++
+        (Formula.pairVarNotVarEncode (firstTwoCodes z) ++
+          (([false, true, false, false] : Word) ++ thirdCode z))) :=
+    DPolyTimeComputableClean_prepend [true, true] htail
+  have hconj' : DPolyTimeComputableClean (fun z : Word =>
+      Formula.pairOrNotVarVarEncode (firstThirdCodes z) ++
+        (([true, true] : Word) ++
+          (Formula.pairVarNotVarEncode (firstTwoCodes z) ++
+            (([false, true, false, false] : Word) ++ thirdCode z))) ) :=
+    DPolyTimeComputableCleanAppend
+      (fun z : Word => Formula.pairOrNotVarVarEncode (firstThirdCodes z))
+      (fun z : Word =>
+        ([true, true] : Word) ++
+          (Formula.pairVarNotVarEncode (firstTwoCodes z) ++
+            (([false, true, false, false] : Word) ++ thirdCode z)))
+      dPolyTimeComputableClean_pairOrNotVarVarEncode_firstThirdCodes hconj
+  have hconj'' : DPolyTimeComputableClean (fun z : Word =>
+      Formula.pairOrNotVarVarEncode (firstTwoCodes z) ++
+        (Formula.pairOrNotVarVarEncode (firstThirdCodes z) ++
+          (([true, true] : Word) ++
+            (Formula.pairVarNotVarEncode (firstTwoCodes z) ++
+              (([false, true, false, false] : Word) ++ thirdCode z)))) ) :=
+    DPolyTimeComputableCleanAppend
+      (fun z : Word => Formula.pairOrNotVarVarEncode (firstTwoCodes z))
+      (fun z : Word =>
+        Formula.pairOrNotVarVarEncode (firstThirdCodes z) ++
+          (([true, true] : Word) ++
+            (Formula.pairVarNotVarEncode (firstTwoCodes z) ++
+              (([false, true, false, false] : Word) ++ thirdCode z))))
+      dPolyTimeComputableClean_pairOrNotVarVarEncode_firstTwoCodes hconj'
+  have hpre : DPolyTimeComputableClean (fun z : Word =>
+      ([true, false] : Word) ++
+        (Formula.pairOrNotVarVarEncode (firstTwoCodes z) ++
+          (Formula.pairOrNotVarVarEncode (firstThirdCodes z) ++
+            (([true, true] : Word) ++
+              (Formula.pairVarNotVarEncode (firstTwoCodes z) ++
+                (([false, true, false, false] : Word) ++ thirdCode z))))) ) :=
+    DPolyTimeComputableClean_prepend [true, false] hconj''
+  have hfinal : DPolyTimeComputableClean (fun z : Word =>
+      ([true, false] : Word) ++
+        (([true, false] : Word) ++
+          (Formula.pairOrNotVarVarEncode (firstTwoCodes z) ++
+            (Formula.pairOrNotVarVarEncode (firstThirdCodes z) ++
+              (([true, true] : Word) ++
+                (Formula.pairVarNotVarEncode (firstTwoCodes z) ++
+                  (([false, true, false, false] : Word) ++ thirdCode z))))) )) :=
+    DPolyTimeComputableClean_prepend [true, false] hpre
+  have heq : (fun z : Word =>
+      ([true, false] : Word) ++
+        (([true, false] : Word) ++
+          (Formula.pairOrNotVarVarEncode (firstTwoCodes z) ++
+            (Formula.pairOrNotVarVarEncode (firstThirdCodes z) ++
+              (([true, true] : Word) ++
+                (Formula.pairVarNotVarEncode (firstTwoCodes z) ++
+                  (([false, true, false, false] : Word) ++ thirdCode z))))))) =
+      andNodeConstraintEncodeFromTriple := by
+    funext z
+    simp [andNodeConstraintEncodeFromTriple, List.append_assoc]
+  rw [← heq]
+  exact hfinal.toPoly
+
+theorem orNodeConstraintDTMObligation_proved : orNodeConstraintDTMObligation := by
+  unfold orNodeConstraintDTMObligation
+  have hthird : DPolyTimeComputableClean
+      (fun z : Word => ([false, false] : Word) ++ thirdCode z) :=
+    DPolyTimeComputableClean_prepend [false, false] dPolyTimeComputableClean_thirdCode
+  have hconj : DPolyTimeComputableClean (fun z : Word =>
+      ([true, true] : Word) ++
+        (Formula.pairOrNotVarVarEncode (firstTwoCodes z) ++
+          (([false, false] : Word) ++ thirdCode z)) ) :=
+    DPolyTimeComputableClean_prepend [true, true]
+      (DPolyTimeComputableCleanAppend
+        (fun z : Word => Formula.pairOrNotVarVarEncode (firstTwoCodes z))
+        (fun z : Word => ([false, false] : Word) ++ thirdCode z)
+        dPolyTimeComputableClean_pairOrNotVarVarEncode_firstTwoCodes hthird)
+  have hconj' : DPolyTimeComputableClean (fun z : Word =>
+      Formula.pairVarNotVarEncode (firstThirdCodes z) ++
+        (([true, true] : Word) ++
+          (Formula.pairOrNotVarVarEncode (firstTwoCodes z) ++
+            (([false, false] : Word) ++ thirdCode z))) ) :=
+    DPolyTimeComputableCleanAppend
+      (fun z : Word => Formula.pairVarNotVarEncode (firstThirdCodes z))
+      (fun z : Word =>
+        ([true, true] : Word) ++
+          (Formula.pairOrNotVarVarEncode (firstTwoCodes z) ++
+            (([false, false] : Word) ++ thirdCode z)))
+      dPolyTimeComputableClean_pairVarNotVarEncode_firstThirdCodes hconj
+  have hconj'' : DPolyTimeComputableClean (fun z : Word =>
+      Formula.pairVarNotVarEncode (firstTwoCodes z) ++
+        (Formula.pairVarNotVarEncode (firstThirdCodes z) ++
+          (([true, true] : Word) ++
+            (Formula.pairOrNotVarVarEncode (firstTwoCodes z) ++
+              (([false, false] : Word) ++ thirdCode z)))) ) :=
+    DPolyTimeComputableCleanAppend
+      (fun z : Word => Formula.pairVarNotVarEncode (firstTwoCodes z))
+      (fun z : Word =>
+        Formula.pairVarNotVarEncode (firstThirdCodes z) ++
+          (([true, true] : Word) ++
+            (Formula.pairOrNotVarVarEncode (firstTwoCodes z) ++
+              (([false, false] : Word) ++ thirdCode z))))
+      dPolyTimeComputableClean_pairVarNotVarEncode_firstTwoCodes hconj'
+  have hpre : DPolyTimeComputableClean (fun z : Word =>
+      ([true, false] : Word) ++
+        (Formula.pairVarNotVarEncode (firstTwoCodes z) ++
+          (Formula.pairVarNotVarEncode (firstThirdCodes z) ++
+            (([true, true] : Word) ++
+              (Formula.pairOrNotVarVarEncode (firstTwoCodes z) ++
+                (([false, false] : Word) ++ thirdCode z))))) ) :=
+    DPolyTimeComputableClean_prepend [true, false] hconj''
+  have hfinal : DPolyTimeComputableClean (fun z : Word =>
+      ([true, false] : Word) ++
+        (([true, false] : Word) ++
+          (Formula.pairVarNotVarEncode (firstTwoCodes z) ++
+            (Formula.pairVarNotVarEncode (firstThirdCodes z) ++
+              (([true, true] : Word) ++
+                (Formula.pairOrNotVarVarEncode (firstTwoCodes z) ++
+                  (([false, false] : Word) ++ thirdCode z))))) )) :=
+    DPolyTimeComputableClean_prepend [true, false] hpre
+  have heq : (fun z : Word =>
+      ([true, false] : Word) ++
+        (([true, false] : Word) ++
+          (Formula.pairVarNotVarEncode (firstTwoCodes z) ++
+            (Formula.pairVarNotVarEncode (firstThirdCodes z) ++
+              (([true, true] : Word) ++
+                (Formula.pairOrNotVarVarEncode (firstTwoCodes z) ++
+                  (([false, false] : Word) ++ thirdCode z))))))) =
+      orNodeConstraintEncodeFromTriple := by
+    funext z
+    simp [orNodeConstraintEncodeFromTriple, List.append_assoc]
+  rw [← heq]
+  exact hfinal.toPoly
+
+
+
 /-- Rebuild the constraint of a circuit node from its descriptor. -/
 def nodeDescOfCircuit (c n : Circuit) : NodeDesc :=
   match n with
@@ -10949,11 +16895,49 @@ lemma nodeConstraintFormula_nodeDescOfCircuit (c n : Circuit) :
       (tseitinConstraint c n).encode := by
   cases n <;> simp [nodeDescOfCircuit, nodeConstraintFormula, tseitinConstraint, nodeLit]
 
-/-- Assemble the encoded constraint from a descriptor word. -/
-def nodeConstraintEncode (z : Word) : Word :=
-  match parseNodeDesc z with
-  | none => []
-  | some d => (nodeConstraintFormula d).encode
+/-- Encode the constraint for a constant-true node from its unary index code. -/
+def constTrueConstraintEncode (z : Word) : Word :=
+  ([false, false] : Word) ++ z
+
+lemma constTrueConstraintEncode_unary (i : Nat) :
+    constTrueConstraintEncode (Formula.encodeNat i) =
+      (nodeConstraintFormula (NodeDesc.const true i)).encode := by
+  simp [constTrueConstraintEncode, nodeConstraintFormula, Formula.encode_var_eq]
+
+theorem dPolyTimeComputable_constTrueConstraintEncode :
+    DPolyTimeComputable constTrueConstraintEncode := by
+  change DPolyTimeComputable (fun z => ([false, false] : Word) ++ z)
+  simpa using (dPolyTimeComputable_prepend ([false, false] : Word))
+
+/-- Encode the constraint for a constant-false node from its unary index code. -/
+def constFalseConstraintEncode (z : Word) : Word :=
+  ([false, true, false, false] : Word) ++ z
+
+lemma constFalseConstraintEncode_unary (i : Nat) :
+    constFalseConstraintEncode (Formula.encodeNat i) =
+      (nodeConstraintFormula (NodeDesc.const false i)).encode := by
+  simp [constFalseConstraintEncode, nodeConstraintFormula, Formula.encode_var_eq,
+    Formula.encode_not_eq]
+
+theorem dPolyTimeComputable_constFalseConstraintEncode :
+    DPolyTimeComputable constFalseConstraintEncode := by
+  change DPolyTimeComputable (fun z => ([false, true, false, false] : Word) ++ z)
+  simpa using (dPolyTimeComputable_prepend ([false, true, false, false] : Word))
+
+
+/-- Assemble the encoded constraint from a descriptor word.  The branch
+    structure matches the descriptor dispatcher, so the machine realization
+    computes this function on every word, including malformed descriptors. -/
+def nodeConstraintEncode : Word → Word
+  | false :: false :: false :: rest =>
+      constFalseConstraintEncode (firstUnaryCode rest)
+  | false :: false :: true :: rest =>
+      constTrueConstraintEncode (firstUnaryCode rest)
+  | false :: true :: rest => varNodeConstraintEncodeFromPair rest
+  | true :: false :: false :: rest => notNodeConstraintEncodeFromPair rest
+  | true :: false :: true :: rest => andNodeConstraintEncodeFromTriple rest
+  | true :: true :: true :: rest => orNodeConstraintEncodeFromTriple rest
+  | _ => []
 
 lemma NodeDesc.encode_injective {d e : NodeDesc} (h : d.encode = e.encode) : d = e := by
   have h1 : parseNodeDesc d.encode = some d := parseNodeDesc_encode d
@@ -10964,7 +16948,47 @@ lemma NodeDesc.encode_injective {d e : NodeDesc} (h : d.encode = e.encode) : d =
 
 lemma nodeConstraintEncode_nodeDesc (d : NodeDesc) :
     nodeConstraintEncode d.encode = (nodeConstraintFormula d).encode := by
-  simp [nodeConstraintEncode, parseNodeDesc_encode]
+  cases d with
+  | const b a =>
+      cases b
+      · rw [show NodeDesc.encode (NodeDesc.const false a) =
+            false :: false :: false :: Formula.encodeNat a by
+          simp [NodeDesc.encode]]
+        rw [nodeConstraintEncode]
+        rw [show firstUnaryCode (Formula.encodeNat a) = Formula.encodeNat a by
+          simpa using (firstUnaryCode_encodeNat_append a [])]
+        exact constFalseConstraintEncode_unary a
+      · rw [show NodeDesc.encode (NodeDesc.const true a) =
+            false :: false :: true :: Formula.encodeNat a by
+          simp [NodeDesc.encode]]
+        rw [nodeConstraintEncode]
+        rw [show firstUnaryCode (Formula.encodeNat a) = Formula.encodeNat a by
+          simpa using (firstUnaryCode_encodeNat_append a [])]
+        exact constTrueConstraintEncode_unary a
+  | var a i =>
+      rw [show NodeDesc.encode (NodeDesc.var a i) =
+          false :: true :: (Formula.encodeNat a ++ Formula.encodeNat i) by
+        simp [NodeDesc.encode]]
+      simp [nodeConstraintEncode, varNodeConstraintEncodeFromPair_unary_pair]
+  | not a b =>
+      rw [show NodeDesc.encode (NodeDesc.not a b) =
+          true :: false :: false :: (Formula.encodeNat a ++ Formula.encodeNat b) by
+        simp [NodeDesc.encode]]
+      simp [nodeConstraintEncode, notNodeConstraintEncodeFromPair_unary_pair]
+  | and a b c =>
+      rw [show NodeDesc.encode (NodeDesc.and a b c) =
+          true :: false :: true ::
+            (Formula.encodeNat a ++ Formula.encodeNat b ++ Formula.encodeNat c) by
+        simp [NodeDesc.encode]]
+      rw [nodeConstraintEncode]
+      exact andNodeConstraintEncodeFromTriple_unary_triple a b c
+  | or a b c =>
+      rw [show NodeDesc.encode (NodeDesc.or a b c) =
+          true :: true :: true ::
+            (Formula.encodeNat a ++ Formula.encodeNat b ++ Formula.encodeNat c) by
+        simp [NodeDesc.encode]]
+      rw [nodeConstraintEncode]
+      exact orNodeConstraintEncodeFromTriple_unary_triple a b c
 
 lemma nodeConstraintEncode_descOfCircuit (c n : Circuit) :
     nodeConstraintEncode (nodeDescOfCircuit c n).encode =
@@ -11140,6 +17164,12 @@ lemma nodeConstraintSeqEncode_encode (ds : List NodeDesc) :
 /-- The descriptor sequence of all constraints of a circuit. -/
 def nodeDescSeqOfCircuit (c : Circuit) : List NodeDesc :=
   c.nodesList.map (nodeDescOfCircuit c)
+
+lemma nodeConstraintSeqEncode_singleton (d : NodeDesc) :
+    nodeConstraintSeqEncode (NodeDescSeq.encode [d]) =
+      (Formula.and (nodeConstraintFormula d) Formula.trueFormula).encode := by
+  rw [nodeConstraintSeqEncode_encode]
+  simp [andMany]
 
 lemma nodeConstraintSeqEncode_descSeqOfCircuit (c : Circuit) :
     nodeConstraintSeqEncode (NodeDescSeq.encode (nodeDescSeqOfCircuit c)) =
@@ -12340,4 +18370,5141 @@ theorem not_PEqualsNP_of_obligations
   exact SATNPComplete_and_not_PPoly_implies_not_PEqualsNP
     (SATNPComplete_of_obligations hv hr) hlow
 
+/-- The same conclusion when the semantic reduction is obtained from the
+     composable DTM subroutines and the model bridge. -/
+theorem not_PEqualsNP_of_DTM_obligations
+    (hv : SATVerifierTMExists) (hbridge : DTMPolyTimeBridge)
+    (hsub : NPReductionDTMSubroutineObligation) (hlow : SATNotInPPoly) :
+    ¬ PEqualsNP := by
+  exact not_PEqualsNP_of_obligations hv
+    (NPSemanticReductionIsPolyTime_of_DTM hbridge hsub) hlow
+
+
+-- ---------------------------------------------------------------------------
+-- Clean identity and constant-node witnesses
+-- ---------------------------------------------------------------------------
+
+lemma DIdTM_noWork : DNoWork DIdTM := by
+  intro q sym wsym
+  have hq : q.val = 0 ∨ q.val = 1 ∨ q.val = 2 ∨ q.val = 3 := by omega
+  rcases hq with h0 | h1 | h2 | h3
+  · have hq' : q = ⟨0, by decide⟩ := by ext; assumption
+    subst q
+    cases sym <;> cases wsym <;>
+      simp [DIdTM, DIdState.start, DIdState.scan, DIdState.done, DIdState.reject]
+  · have hq' : q = ⟨1, by decide⟩ := by ext; assumption
+    subst q
+    cases sym <;> cases wsym <;>
+      simp [DIdTM, DIdState.start, DIdState.scan, DIdState.done, DIdState.reject]
+  · have hq' : q = ⟨2, by decide⟩ := by ext; assumption
+    subst q
+    cases sym <;> cases wsym <;>
+      simp [DIdTM, DIdState.start, DIdState.scan, DIdState.done, DIdState.reject]
+  · have hq' : q = ⟨3, by decide⟩ := by ext; assumption
+    subst q
+    cases sym <;> cases wsym <;>
+      simp [DIdTM, DIdState.start, DIdState.scan, DIdState.done, DIdState.reject]
+
+lemma dPolyTimeComputableClean_id : DPolyTimeComputableClean id := by
+  refine DPolyTimeComputableClean.of_machine DIdTM (X + C 2) X id
+    (fun _ => rfl) DIdTM_noWork ?_ ?_
+  · intro x
+    have hstart := Drun_DIdTM_start x
+    have hfinal : Drun DIdTM (x.length + 1)
+        { state := DIdState.scan, input := x, head := 1, output := [],
+          work := fun _ : Nat => false, workHead := 0 } =
+        { state := DIdState.done, input := x, head := x.length + 1,
+          output := x, work := fun _ : Nat => false, workHead := 0 } := by
+      simpa using (Drun_DIdTM_scan_suffix [] x (fun _ : Nat => false) 0)
+    simp only [Polynomial.eval_add, Polynomial.eval_X, Polynomial.eval_C]
+    change Dhalted DIdTM (Drun DIdTM (x.length + 2) (Dinit DIdTM x)) = true
+    rw [show x.length + 2 = 1 + (x.length + 1) by omega, Drun_add_eq, hstart, hfinal]
+    simp [Dhalted, DIdTM]
+  · intro x
+    have hstart := Drun_DIdTM_start x
+    have hfinal : Drun DIdTM (x.length + 1)
+        { state := DIdState.scan, input := x, head := 1, output := [],
+          work := fun _ : Nat => false, workHead := 0 } =
+        { state := DIdState.done, input := x, head := x.length + 1,
+          output := x, work := fun _ : Nat => false, workHead := 0 } := by
+      simpa using (Drun_DIdTM_scan_suffix [] x (fun _ : Nat => false) 0)
+    constructor
+    · change Dboutput DIdTM ((X + C 2 : TimeBound).eval x.length) x = id x
+      simp only [Polynomial.eval_add, Polynomial.eval_X, Polynomial.eval_C]
+      dsimp [Dboutput]
+      rw [show x.length + 2 = 1 + (x.length + 1) by omega, Drun_add_eq, hstart, hfinal]
+    · simp
+
+theorem dPolyTimeComputableClean_constTrueConstraintEncode :
+    DPolyTimeComputableClean constTrueConstraintEncode := by
+  change DPolyTimeComputableClean (fun z => ([false, false] : Word) ++ id z)
+  simpa only [id_eq] using
+    (DPolyTimeComputableClean_prepend ([false, false] : Word)
+      dPolyTimeComputableClean_id)
+
+theorem dPolyTimeComputableClean_constFalseConstraintEncode :
+    DPolyTimeComputableClean constFalseConstraintEncode := by
+  change DPolyTimeComputableClean (fun z => ([false, true, false, false] : Word) ++ id z)
+  simpa only [id_eq] using
+    (DPolyTimeComputableClean_prepend ([false, true, false, false] : Word)
+      dPolyTimeComputableClean_id)
+
+theorem dPolyTimeComputableClean_pairVarVarEncode :
+    DPolyTimeComputableClean Formula.pairVarVarEncode := by
+  change DPolyTimeComputableClean
+    (fun x => ([true, true, false, false] : Word) ++ insertVarTagTotal x)
+  exact DPolyTimeComputableClean_prepend [true, true, false, false]
+    dPolyTimeComputableClean_insertVarTagTotal
+
+theorem dPolyTimeComputableClean_pairNotVarNotVarEncode :
+    DPolyTimeComputableClean Formula.pairNotVarNotVarEncode := by
+  change DPolyTimeComputableClean
+    (fun x => ([true, true, false, true, false, false] : Word) ++ insertNotVarTagTotal x)
+  exact DPolyTimeComputableClean_prepend [true, true, false, true, false, false]
+    dPolyTimeComputableClean_insertNotVarTagTotal
+
+theorem dPolyTimeComputableClean_pairVarVarEncode_firstTwoCodes :
+    DPolyTimeComputableClean (fun z => Formula.pairVarVarEncode (firstTwoCodes z)) := by
+  change DPolyTimeComputableClean
+    (fun z => ([true, true, false, false] : Word) ++
+      insertVarTagTotal (firstTwoCodes z))
+  exact DPolyTimeComputableClean_prepend [true, true, false, false]
+    dPolyTimeComputableClean_trunc2VarTag
+
+theorem dPolyTimeComputableClean_pairNotVarNotVarEncode_firstTwoCodes :
+    DPolyTimeComputableClean (fun z => Formula.pairNotVarNotVarEncode (firstTwoCodes z)) := by
+  change DPolyTimeComputableClean
+    (fun z => ([true, true, false, true, false, false] : Word) ++
+      insertNotVarTagTotal (firstTwoCodes z))
+  exact DPolyTimeComputableClean_prepend [true, true, false, true, false, false]
+    dPolyTimeComputableClean_trunc2NotVarTag
+
+theorem dPolyTimeComputableClean_varNodeConstraintEncodeFromPair :
+    DPolyTimeComputableClean varNodeConstraintEncodeFromPair := by
+  change DPolyTimeComputableClean (fun z : Word =>
+    ([true, false] : Word) ++
+      (Formula.pairOrNotVarVarEncode z ++ Formula.pairVarNotVarEncode z))
+  exact DPolyTimeComputableClean_prepend [true, false]
+    (DPolyTimeComputableCleanAppend
+      (fun z : Word => Formula.pairOrNotVarVarEncode z)
+      (fun z : Word => Formula.pairVarNotVarEncode z)
+      dPolyTimeComputableClean_pairOrNotVarVarEncode
+      dPolyTimeComputableClean_pairVarNotVarEncode)
+
+theorem dPolyTimeComputableClean_notNodeConstraintEncodeFromPair :
+    DPolyTimeComputableClean notNodeConstraintEncodeFromPair := by
+  change DPolyTimeComputableClean (fun z : Word =>
+    ([true, false] : Word) ++
+      (Formula.pairNotVarNotVarEncode z ++ Formula.pairVarVarEncode z))
+  exact DPolyTimeComputableClean_prepend [true, false]
+    (DPolyTimeComputableCleanAppend
+      (fun z : Word => Formula.pairNotVarNotVarEncode z)
+      (fun z : Word => Formula.pairVarVarEncode z)
+      dPolyTimeComputableClean_pairNotVarNotVarEncode
+      dPolyTimeComputableClean_pairVarVarEncode)
+
+-- ---------------------------------------------------------------------------
+-- A generic pattern-dispatch transducer
+-- ---------------------------------------------------------------------------
+
+abbrev DBranchSum (σcf σct σv σn σa σo : Type) :=
+  σcf ⊕ (σct ⊕ (σv ⊕ (σn ⊕ (σa ⊕ σo))))
+
+abbrev DDescDispatchState (σcf σct σv σn σa σo : Type) :=
+  Fin 20 ⊕ DBranchSum σcf σct σv σn σa σo
+
+instance DBranchSum.instDecidableEq [DecidableEq σcf] [DecidableEq σct]
+    [DecidableEq σv] [DecidableEq σn] [DecidableEq σa] [DecidableEq σo] :
+    DecidableEq (DBranchSum σcf σct σv σn σa σo) := inferInstance
+
+instance DDescDispatchState.instDecidableEq [DecidableEq σcf] [DecidableEq σct]
+    [DecidableEq σv] [DecidableEq σn] [DecidableEq σa] [DecidableEq σo] :
+    DecidableEq (DDescDispatchState σcf σct σv σn σa σo) := inferInstance
+
+instance DDescDispatchState.instFintype [Fintype σcf] [Fintype σct]
+    [Fintype σv] [Fintype σn] [Fintype σa] [Fintype σo] :
+    Fintype (DDescDispatchState σcf σct σv σn σa σo) := inferInstance
+
+namespace DDescDispatchState
+
+def tag (n : Nat) (h : n < 20 := by decide) : DDescDispatchState σcf σct σv σn σa σo :=
+  Sum.inl ⟨n, h⟩
+
+def start : DDescDispatchState σcf σct σv σn σa σo := tag 0
+def fSeen : DDescDispatchState σcf σct σv σn σa σo := tag 1
+def ffSeen : DDescDispatchState σcf σct σv σn σa σo := tag 2
+def tSeen : DDescDispatchState σcf σct σv σn σa σo := tag 3
+def tfSeen : DDescDispatchState σcf σct σv σn σa σo := tag 4
+def ttSeen : DDescDispatchState σcf σct σv σn σa σo := tag 5
+def copyF : DDescDispatchState σcf σct σv σn σa σo := tag 6
+def copyT : DDescDispatchState σcf σct σv σn σa σo := tag 7
+def copyV : DDescDispatchState σcf σct σv σn σa σo := tag 8
+def copyN : DDescDispatchState σcf σct σv σn σa σo := tag 9
+def copyA : DDescDispatchState σcf σct σv σn σa σo := tag 10
+def copyO : DDescDispatchState σcf σct σv σn σa σo := tag 11
+def entryF : DDescDispatchState σcf σct σv σn σa σo := tag 12
+def entryT : DDescDispatchState σcf σct σv σn σa σo := tag 13
+def entryV : DDescDispatchState σcf σct σv σn σa σo := tag 14
+def entryN : DDescDispatchState σcf σct σv σn σa σo := tag 15
+def entryA : DDescDispatchState σcf σct σv σn σa σo := tag 16
+def entryO : DDescDispatchState σcf σct σv σn σa σo := tag 17
+def done : DDescDispatchState σcf σct σv σn σa σo := tag 18
+def reject : DDescDispatchState σcf σct σv σn σa σo := tag 19
+
+def cF (q : σcf) : DDescDispatchState σcf σct σv σn σa σo :=
+  Sum.inr (Sum.inl q)
+def cT (q : σct) : DDescDispatchState σcf σct σv σn σa σo :=
+  Sum.inr (Sum.inr (Sum.inl q))
+def cV (q : σv) : DDescDispatchState σcf σct σv σn σa σo :=
+  Sum.inr (Sum.inr (Sum.inr (Sum.inl q)))
+def cN (q : σn) : DDescDispatchState σcf σct σv σn σa σo :=
+  Sum.inr (Sum.inr (Sum.inr (Sum.inr (Sum.inl q))))
+def cA (q : σa) : DDescDispatchState σcf σct σv σn σa σo :=
+  Sum.inr (Sum.inr (Sum.inr (Sum.inr (Sum.inr (Sum.inl q)))))
+def cO (q : σo) : DDescDispatchState σcf σct σv σn σa σo :=
+  Sum.inr (Sum.inr (Sum.inr (Sum.inr (Sum.inr (Sum.inr q)))))
+
+end DDescDispatchState
+
+/-- The branch action of the descriptor dispatcher.  A branch machine that
+    enters its accept or reject state is normalized to the dispatcher's common
+    halt state in the same step. -/
+def DDescDispatchBranchAction {σ S : Type} [Fintype σ] [DecidableEq σ] (M : DTM σ)
+    (ctor : σ → S) (doneS rejectS : S) (q : σ) (sym : Option Bool)
+    (wsym : Bool) : DAction S :=
+  let tr : DAction σ :=
+    if q = M.accept then
+      { next := q, output := none, inputMove := none, workWrite := none, workMove := none }
+    else if q = M.reject then
+      { next := q, output := none, inputMove := none, workWrite := none, workMove := none }
+    else M.step q sym wsym
+  { next := if tr.next = M.accept then doneS
+            else if tr.next = M.reject then rejectS
+            else ctor tr.next,
+    output := tr.output,
+    inputMove := tr.inputMove,
+    workWrite := tr.workWrite,
+    workMove := tr.workMove }
+
+namespace DDescDispatchTM
+
+def idleAction {S : Type} (s : S) : DAction S :=
+  { next := s, output := none, inputMove := none, workWrite := none, workMove := none }
+
+def rejectAction {σcf σct σv σn σa σo : Type} :
+    DAction (DDescDispatchState σcf σct σv σn σa σo) :=
+  idleAction DDescDispatchState.reject
+
+def copyAction {σcf σct σv σn σa σo : Type}
+    (copyS entryS : DDescDispatchState σcf σct σv σn σa σo)
+    (sym : Option Bool) : DAction (DDescDispatchState σcf σct σv σn σa σo) :=
+  match sym with
+  | some b =>
+      { next := copyS
+        output := some b
+        inputMove := some true
+        workWrite := none
+        workMove := none }
+  | none => idleAction entryS
+
+def entryAction {σ : Type} (ctor : σ →
+    DDescDispatchState σcf σct σv σn σa σo) (q : σ) :
+    DAction (DDescDispatchState σcf σct σv σn σa σo) :=
+  idleAction (ctor q)
+
+end DDescDispatchTM
+
+def DDescDispatchTM
+    {σcf σct σv σn σa σo : Type}
+    [Fintype σcf] [DecidableEq σcf] [Fintype σct] [DecidableEq σct]
+    [Fintype σv] [DecidableEq σv] [Fintype σn] [DecidableEq σn]
+    [Fintype σa] [DecidableEq σa] [Fintype σo] [DecidableEq σo]
+    (Mcf : DTM σcf) (Mct : DTM σct) (Mv : DTM σv) (Mn : DTM σn)
+    (Ma : DTM σa) (Mo : DTM σo) :
+    DTM (DDescDispatchState σcf σct σv σn σa σo) where
+  step
+    | Sum.inl tag, sym, wsym =>
+        if tag.val = 0 then
+          if wsym then
+            match sym with
+            | some false =>
+                { next := DDescDispatchState.fSeen, output := none,
+                  inputMove := some true, workWrite := some false, workMove := none }
+            | some true =>
+                { next := DDescDispatchState.tSeen, output := none,
+                  inputMove := some true, workWrite := some false, workMove := none }
+            | none =>
+                { next := DDescDispatchState.reject, output := none,
+                  inputMove := none, workWrite := some false, workMove := none }
+          else
+            { next := DDescDispatchState.start, output := none,
+              inputMove := some true, workWrite := some true, workMove := none }
+        else if tag.val = 1 then
+          match sym with
+          | some false =>
+              { next := DDescDispatchState.ffSeen, output := none,
+                inputMove := some true, workWrite := none, workMove := none }
+          | some true =>
+              { next := DDescDispatchState.copyV, output := none,
+                inputMove := some true, workWrite := none, workMove := none }
+          | none => DDescDispatchTM.rejectAction
+        else if tag.val = 2 then
+          match sym with
+          | some b =>
+              { next := if b then DDescDispatchState.copyT else DDescDispatchState.copyF,
+                output := none, inputMove := some true, workWrite := none, workMove := none }
+          | none => DDescDispatchTM.rejectAction
+        else if tag.val = 3 then
+          match sym with
+          | some false =>
+              { next := DDescDispatchState.tfSeen, output := none,
+                inputMove := some true, workWrite := none, workMove := none }
+          | some true =>
+              { next := DDescDispatchState.ttSeen, output := none,
+                inputMove := some true, workWrite := none, workMove := none }
+          | none => DDescDispatchTM.rejectAction
+        else if tag.val = 4 then
+          match sym with
+          | some b =>
+              { next := if b then DDescDispatchState.copyA else DDescDispatchState.copyN,
+                output := none, inputMove := some true, workWrite := none, workMove := none }
+          | none => DDescDispatchTM.rejectAction
+        else if tag.val = 5 then
+          match sym with
+          | some true =>
+              { next := DDescDispatchState.copyO, output := none,
+                inputMove := some true, workWrite := none, workMove := none }
+          | _ => DDescDispatchTM.rejectAction
+        else if tag.val = 6 then DDescDispatchTM.copyAction DDescDispatchState.copyF DDescDispatchState.entryF sym
+        else if tag.val = 7 then DDescDispatchTM.copyAction DDescDispatchState.copyT DDescDispatchState.entryT sym
+        else if tag.val = 8 then DDescDispatchTM.copyAction DDescDispatchState.copyV DDescDispatchState.entryV sym
+        else if tag.val = 9 then DDescDispatchTM.copyAction DDescDispatchState.copyN DDescDispatchState.entryN sym
+        else if tag.val = 10 then DDescDispatchTM.copyAction DDescDispatchState.copyA DDescDispatchState.entryA sym
+        else if tag.val = 11 then DDescDispatchTM.copyAction DDescDispatchState.copyO DDescDispatchState.entryO sym
+        else if tag.val = 12 then DDescDispatchTM.entryAction DDescDispatchState.cF Mcf.start
+        else if tag.val = 13 then DDescDispatchTM.entryAction DDescDispatchState.cT Mct.start
+        else if tag.val = 14 then DDescDispatchTM.entryAction DDescDispatchState.cV Mv.start
+        else if tag.val = 15 then DDescDispatchTM.entryAction DDescDispatchState.cN Mn.start
+        else if tag.val = 16 then DDescDispatchTM.entryAction DDescDispatchState.cA Ma.start
+        else if tag.val = 17 then DDescDispatchTM.entryAction DDescDispatchState.cO Mo.start
+        else DDescDispatchTM.idleAction DDescDispatchState.done
+    | Sum.inr (Sum.inl q), sym, wsym =>
+        DDescDispatchBranchAction Mcf DDescDispatchState.cF
+          DDescDispatchState.done DDescDispatchState.reject q sym wsym
+    | Sum.inr (Sum.inr (Sum.inl q)), sym, wsym =>
+        DDescDispatchBranchAction Mct DDescDispatchState.cT
+          DDescDispatchState.done DDescDispatchState.reject q sym wsym
+    | Sum.inr (Sum.inr (Sum.inr (Sum.inl q))), sym, wsym =>
+        DDescDispatchBranchAction Mv DDescDispatchState.cV
+          DDescDispatchState.done DDescDispatchState.reject q sym wsym
+    | Sum.inr (Sum.inr (Sum.inr (Sum.inr (Sum.inl q)))), sym, wsym =>
+        DDescDispatchBranchAction Mn DDescDispatchState.cN
+          DDescDispatchState.done DDescDispatchState.reject q sym wsym
+    | Sum.inr (Sum.inr (Sum.inr (Sum.inr (Sum.inr (Sum.inl q))))), sym, wsym =>
+        DDescDispatchBranchAction Ma DDescDispatchState.cA
+          DDescDispatchState.done DDescDispatchState.reject q sym wsym
+    | Sum.inr (Sum.inr (Sum.inr (Sum.inr (Sum.inr (Sum.inr q))))), sym, wsym =>
+        DDescDispatchBranchAction Mo DDescDispatchState.cO
+          DDescDispatchState.done DDescDispatchState.reject q sym wsym
+  handoff := fun s =>
+    match s with
+    | Sum.inl tag => 12 ≤ tag.val && tag.val ≤ 17
+    | Sum.inr _ => false
+  headReset := fun s =>
+    match s with
+    | Sum.inr (Sum.inl q) => Mcf.headReset q
+    | Sum.inr (Sum.inr (Sum.inl q)) => Mct.headReset q
+    | Sum.inr (Sum.inr (Sum.inr (Sum.inl q))) => Mv.headReset q
+    | Sum.inr (Sum.inr (Sum.inr (Sum.inr (Sum.inl q)))) => Mn.headReset q
+    | Sum.inr (Sum.inr (Sum.inr (Sum.inr (Sum.inr (Sum.inl q))))) => Ma.headReset q
+    | Sum.inr (Sum.inr (Sum.inr (Sum.inr (Sum.inr (Sum.inr q))))) => Mo.headReset q
+    | Sum.inl _ => false
+  start := DDescDispatchState.start
+  accept := DDescDispatchState.done
+  reject := DDescDispatchState.reject
+
+
+/-- Lift a configuration of a branch machine into the dispatcher. -/
+def liftDispatch {σ S : Type} (ctor : σ → S) (c : DConfig σ) : DConfig S :=
+  { state := ctor c.state, input := c.input, head := c.head, output := c.output,
+    work := c.work, workHead := c.workHead }
+
+/-- Normalize a halted branch configuration into the dispatcher's common halt. -/
+def haltLiftDispatch {σ S : Type} [Fintype σ] [DecidableEq σ] (M : DTM σ)
+    (doneS rejectS : S) (c : DConfig σ) :
+    DConfig S :=
+  { state := if c.state = M.accept then doneS else rejectS,
+    input := c.input, head := c.head, output := c.output,
+    work := c.work, workHead := c.workHead }
+
+lemma DDescDispatchBranchAction_next_eq {σ S : Type}
+    [Fintype σ] [DecidableEq σ]
+    (M : DTM σ) (ctor : σ → S) (doneS rejectS : S)
+    (sym : Option Bool) (wsym : Bool) {q : σ}
+    (hqacc : q ≠ M.accept) (hqrej : q ≠ M.reject) :
+    (DDescDispatchBranchAction M ctor doneS rejectS q sym wsym).next =
+      (let n := (M.step q sym wsym).next
+       if n = M.accept then doneS else if n = M.reject then rejectS else ctor n) := by
+  simp [DDescDispatchBranchAction, hqacc, hqrej]
+
+lemma DDescDispatchBranchAction_output_eq {σ S : Type}
+    [Fintype σ] [DecidableEq σ]
+    (M : DTM σ) (ctor : σ → S) (doneS rejectS : S)
+    (sym : Option Bool) (wsym : Bool) {q : σ}
+    (hqacc : q ≠ M.accept) (hqrej : q ≠ M.reject) :
+    (DDescDispatchBranchAction M ctor doneS rejectS q sym wsym).output =
+      (M.step q sym wsym).output := by
+  simp [DDescDispatchBranchAction, hqacc, hqrej]
+
+lemma DDescDispatchBranchAction_inputMove_eq {σ S : Type}
+    [Fintype σ] [DecidableEq σ]
+    (M : DTM σ) (ctor : σ → S) (doneS rejectS : S)
+    (sym : Option Bool) (wsym : Bool) {q : σ}
+    (hqacc : q ≠ M.accept) (hqrej : q ≠ M.reject) :
+    (DDescDispatchBranchAction M ctor doneS rejectS q sym wsym).inputMove =
+      (M.step q sym wsym).inputMove := by
+  simp [DDescDispatchBranchAction, hqacc, hqrej]
+
+lemma DDescDispatchBranchAction_workWrite_eq {σ S : Type}
+    [Fintype σ] [DecidableEq σ]
+    (M : DTM σ) (ctor : σ → S) (doneS rejectS : S)
+    (sym : Option Bool) (wsym : Bool) {q : σ}
+    (hqacc : q ≠ M.accept) (hqrej : q ≠ M.reject) :
+    (DDescDispatchBranchAction M ctor doneS rejectS q sym wsym).workWrite =
+      (M.step q sym wsym).workWrite := by
+  simp [DDescDispatchBranchAction, hqacc, hqrej]
+
+lemma DDescDispatchBranchAction_workMove_eq {σ S : Type}
+    [Fintype σ] [DecidableEq σ]
+    (M : DTM σ) (ctor : σ → S) (doneS rejectS : S)
+    (sym : Option Bool) (wsym : Bool) {q : σ}
+    (hqacc : q ≠ M.accept) (hqrej : q ≠ M.reject) :
+    (DDescDispatchBranchAction M ctor doneS rejectS q sym wsym).workMove =
+      (M.step q sym wsym).workMove := by
+  simp [DDescDispatchBranchAction, hqacc, hqrej]
+
+lemma Dstep_liftDispatch_branch {σ S : Type}
+    [Fintype σ] [DecidableEq σ] [Fintype S] [DecidableEq S]
+    (D : DTM S) (M : DTM σ) (ctor : σ → S) (doneS rejectS : S)
+    (hstep : ∀ q sym wsym, D.step (ctor q) sym wsym =
+      DDescDispatchBranchAction M ctor doneS rejectS q sym wsym)
+    (hhand : ∀ q, D.handoff (ctor q) = false)
+    (hreset : ∀ q, D.headReset (ctor q) = M.headReset q)
+    (hno : ∀ q, M.handoff q = false)
+    (c : DConfig σ) (hcacc : c.state ≠ M.accept) (hcrej : c.state ≠ M.reject) :
+    Dstep D (liftDispatch ctor c) =
+      let sym := Dread c
+      let wsym := c.work c.workHead
+      let tr := M.step c.state sym wsym
+      { state := if tr.next = M.accept then doneS
+                 else if tr.next = M.reject then rejectS
+                 else ctor tr.next,
+        input := c.input,
+        head := if M.headReset c.state then 0
+                else match tr.inputMove with
+          | none => c.head
+          | some dir => Dmove dir c.head,
+        output := match tr.output with
+          | none => c.output
+          | some b => c.output ++ [b],
+        work := DwriteWork c.work c.workHead tr.workWrite,
+        workHead := match tr.workMove with
+          | none => c.workHead
+          | some dir => Dmove dir c.workHead } := by
+  apply DConfig.ext_eq
+  · change (D.step (ctor c.state) (Dread (liftDispatch ctor c))
+        ((liftDispatch ctor c).work ((liftDispatch ctor c).workHead))).next =
+      (let sym := Dread c
+       let wsym := c.work c.workHead
+       let tr := M.step c.state sym wsym
+       if tr.next = M.accept then doneS
+       else if tr.next = M.reject then rejectS
+       else ctor tr.next)
+    rw [show Dread (liftDispatch ctor c) = Dread c by rfl]
+    rw [show (liftDispatch ctor c).work ((liftDispatch ctor c).workHead) =
+      c.work c.workHead by rfl]
+    rw [hstep c.state (Dread c) (c.work c.workHead)]
+    exact DDescDispatchBranchAction_next_eq M ctor doneS rejectS
+      (Dread c) (c.work c.workHead) hcacc hcrej
+  · change (if D.handoff (ctor c.state) then c.output else c.input) = c.input
+    rw [hhand c.state]
+    simp
+  · change (if D.handoff (ctor c.state) then 0
+        else if D.headReset (ctor c.state) then 0
+        else match (D.step (ctor c.state) (Dread (liftDispatch ctor c))
+              ((liftDispatch ctor c).work ((liftDispatch ctor c).workHead))).inputMove with
+          | none => c.head
+          | some dir => Dmove dir c.head) =
+      (if M.headReset c.state then 0
+       else match (M.step c.state (Dread c) (c.work c.workHead)).inputMove with
+        | none => c.head
+        | some dir => Dmove dir c.head)
+    rw [hhand c.state, hreset c.state,
+      show Dread (liftDispatch ctor c) = Dread c by rfl,
+      show (liftDispatch ctor c).work ((liftDispatch ctor c).workHead) =
+        c.work c.workHead by rfl,
+      hstep c.state (Dread c) (c.work c.workHead),
+      DDescDispatchBranchAction_inputMove_eq M ctor doneS rejectS
+        (Dread c) (c.work c.workHead) hcacc hcrej]
+    simp
+  · change (if D.handoff (ctor c.state) then []
+        else match (D.step (ctor c.state) (Dread (liftDispatch ctor c))
+              ((liftDispatch ctor c).work ((liftDispatch ctor c).workHead))).output with
+          | none => c.output
+          | some b => c.output ++ [b]) =
+      match (M.step c.state (Dread c) (c.work c.workHead)).output with
+        | none => c.output
+        | some b => c.output ++ [b]
+    rw [hhand c.state,
+      show Dread (liftDispatch ctor c) = Dread c by rfl,
+      show (liftDispatch ctor c).work ((liftDispatch ctor c).workHead) =
+        c.work c.workHead by rfl,
+      hstep c.state (Dread c) (c.work c.workHead),
+      DDescDispatchBranchAction_output_eq M ctor doneS rejectS
+        (Dread c) (c.work c.workHead) hcacc hcrej]
+    simp
+  · change (if D.handoff (ctor c.state) then (fun _ => false)
+        else DwriteWork c.work c.workHead
+          (D.step (ctor c.state) (Dread (liftDispatch ctor c))
+            ((liftDispatch ctor c).work ((liftDispatch ctor c).workHead))).workWrite) =
+      DwriteWork c.work c.workHead
+        (M.step c.state (Dread c) (c.work c.workHead)).workWrite
+    rw [hhand c.state,
+      show Dread (liftDispatch ctor c) = Dread c by rfl,
+      show (liftDispatch ctor c).work ((liftDispatch ctor c).workHead) =
+        c.work c.workHead by rfl,
+      hstep c.state (Dread c) (c.work c.workHead),
+      DDescDispatchBranchAction_workWrite_eq M ctor doneS rejectS
+        (Dread c) (c.work c.workHead) hcacc hcrej]
+    simp
+  · change (if D.handoff (ctor c.state) then 0
+        else match (D.step (ctor c.state) (Dread (liftDispatch ctor c))
+              ((liftDispatch ctor c).work ((liftDispatch ctor c).workHead))).workMove with
+          | none => c.workHead
+          | some dir => Dmove dir c.workHead) =
+      match (M.step c.state (Dread c) (c.work c.workHead)).workMove with
+        | none => c.workHead
+        | some dir => Dmove dir c.workHead
+    rw [hhand c.state,
+      show Dread (liftDispatch ctor c) = Dread c by rfl,
+      show (liftDispatch ctor c).work ((liftDispatch ctor c).workHead) =
+        c.work c.workHead by rfl,
+      hstep c.state (Dread c) (c.work c.workHead),
+      DDescDispatchBranchAction_workMove_eq M ctor doneS rejectS
+        (Dread c) (c.work c.workHead) hcacc hcrej]
+    simp
+
+lemma Dstep_DDescDispatchTM_branch {σ S : Type}
+    [Fintype σ] [DecidableEq σ] [Fintype S] [DecidableEq S]
+    (D : DTM S) (M : DTM σ) (ctor : σ → S) (doneS rejectS : S)
+    (hstep : ∀ q sym wsym, D.step (ctor q) sym wsym =
+      DDescDispatchBranchAction M ctor doneS rejectS q sym wsym)
+    (hhand : ∀ q, D.handoff (ctor q) = false)
+    (hreset : ∀ q, D.headReset (ctor q) = M.headReset q)
+    (hno : ∀ q, M.handoff q = false)
+    (hcf : ∀ q, ctor q ≠ doneS) (hcr : ∀ q, ctor q ≠ rejectS)
+    (c : DConfig σ) (hc : Dhalted M c = false) :
+    Dstep D (liftDispatch ctor c) =
+      if Dhalted M (Dstep M c) = true then haltLiftDispatch M doneS rejectS (Dstep M c)
+      else liftDispatch ctor (Dstep M c) := by
+  have hcacc : c.state ≠ M.accept := by
+    intro h
+    have := hc
+    simp [Dhalted, h] at this
+  have hcrej : c.state ≠ M.reject := by
+    intro h
+    have := hc
+    simp [Dhalted, h] at this
+  rw [Dstep_liftDispatch_branch D M ctor doneS rejectS hstep hhand hreset hno
+    c hcacc hcrej]
+  by_cases hacc : (M.step c.state (Dread c) (c.work c.workHead)).next = M.accept
+  · simp [Dhalted, Dstep, hno c.state, hacc, haltLiftDispatch, liftDispatch]
+  · by_cases hrej : (M.step c.state (Dread c) (c.work c.workHead)).next = M.reject
+    · by_cases heq : M.reject = M.accept
+      · exfalso
+        exact hacc (by simpa [heq] using hrej)
+      · simp [Dhalted, Dstep, hno c.state, hacc, hrej, heq,
+          haltLiftDispatch, liftDispatch]
+    · simp [Dhalted, Dstep, hno c.state, hacc, hrej,
+        haltLiftDispatch, liftDispatch]
+
+lemma Drun_DDescDispatchTM_branch {σ S : Type}
+    [Fintype σ] [DecidableEq σ] [Fintype S] [DecidableEq S]
+    (D : DTM S) (M : DTM σ) (ctor : σ → S) (doneS rejectS : S)
+    (hstep : ∀ q sym wsym, D.step (ctor q) sym wsym =
+      DDescDispatchBranchAction M ctor doneS rejectS q sym wsym)
+    (hhand : ∀ q, D.handoff (ctor q) = false)
+    (hreset : ∀ q, D.headReset (ctor q) = M.headReset q)
+    (hno : ∀ q, M.handoff q = false)
+    (hcf : ∀ q, ctor q ≠ doneS) (hcr : ∀ q, ctor q ≠ rejectS)
+    (hDacc : D.accept = doneS) (hDrej : D.reject = rejectS)
+    (t : Nat) (c : DConfig σ) (hc : Dhalted M c = false) :
+    Drun D t (liftDispatch ctor c) =
+      if Dhalted M (Drun M t c) = true then haltLiftDispatch M doneS rejectS (Drun M t c)
+      else liftDispatch ctor (Drun M t c) := by
+  induction t generalizing c with
+  | zero =>
+      simp [Drun, hc, liftDispatch]
+  | succ t ih =>
+      by_cases hct : Dhalted M (Drun M t c) = true
+      · have hfrz : Drun M (t + 1) c = Drun M t c := by
+          exact Drun_eq_of_halted_within M c (Nat.le_succ t) hct
+        rw [Drun_add_eq, ih c hc, hfrz]
+        have hstate : (Drun M t c).state = M.accept ∨
+            (Drun M t c).state = M.reject := by
+          have hh := hct
+          simp [Dhalted] at hh
+          exact hh
+        have hhaltD : Dhalted D (haltLiftDispatch M doneS rejectS (Drun M t c)) = true := by
+          rcases hstate with haccst | hrejst
+          · simp [haltLiftDispatch, Dhalted, haccst, hDacc, hDrej]
+          · by_cases heq : M.reject = M.accept
+            · have hsacc : (Drun M t c).state = M.accept := by
+                simpa [heq] using hrejst
+              simp [haltLiftDispatch, Dhalted, hsacc, hDacc, hDrej]
+            · simp [haltLiftDispatch, Dhalted, heq, hrejst, hDrej]
+        rw [show (if Dhalted M (Drun M t c) = true then
+              haltLiftDispatch M doneS rejectS (Drun M t c)
+            else liftDispatch ctor (Drun M t c)) =
+              haltLiftDispatch M doneS rejectS (Drun M t c) by simp [hct]]
+        rw [show Drun D 1 (haltLiftDispatch M doneS rejectS (Drun M t c)) =
+              haltLiftDispatch M doneS rejectS (Drun M t c) by simp [Drun, hhaltD]]
+      · have hctf : Dhalted M (Drun M t c) = false := by
+          cases h : Dhalted M (Drun M t c) <;> simp_all
+        have hstep' := Dstep_DDescDispatchTM_branch D M ctor doneS rejectS
+          hstep hhand hreset hno hcf hcr (Drun M t c) hctf
+        have hnext : Drun M (t + 1) c = Dstep M (Drun M t c) := by
+          rw [Drun_add_eq]
+          change (if Dhalted M (Drun M t c) = true then Drun M t c
+            else Dstep M (Drun M t c)) = Dstep M (Drun M t c)
+          rw [hctf]
+          rfl
+        rw [hnext, Drun_add_eq, ih c hc]
+        have hDnot : Dhalted D (liftDispatch ctor (Drun M t c)) = false := by
+          simp [Dhalted, liftDispatch, hcf, hcr, hDacc, hDrej]
+        rw [show (if Dhalted M (Drun M t c) = true then
+              haltLiftDispatch M doneS rejectS (Drun M t c)
+            else liftDispatch ctor (Drun M t c)) =
+              liftDispatch ctor (Drun M t c) by simp [hctf]]
+        rw [show Drun D 1 (liftDispatch ctor (Drun M t c)) =
+              Dstep D (liftDispatch ctor (Drun M t c)) by
+          change (if Dhalted D (liftDispatch ctor (Drun M t c)) = true then
+              liftDispatch ctor (Drun M t c)
+            else Dstep D (liftDispatch ctor (Drun M t c))) =
+            Dstep D (liftDispatch ctor (Drun M t c))
+          rw [hDnot]
+          simp]
+        rw [hstep']
+
+
+-- ---------------------------------------------------------------------------
+-- A clean transducer for the first unary code
+-- ---------------------------------------------------------------------------
+
+abbrev DFirstUnaryState := Fin 4
+
+namespace DFirstUnaryState
+
+def start : DFirstUnaryState := ⟨0, by decide⟩
+def scan : DFirstUnaryState := ⟨1, by decide⟩
+def done : DFirstUnaryState := ⟨2, by decide⟩
+def reject : DFirstUnaryState := ⟨3, by decide⟩
+
+end DFirstUnaryState
+
+/-- The head position after scanning the first unary code. -/
+def firstUnaryHead : Word → Nat
+  | [] => 1
+  | false :: _ => 1
+  | true :: zs => firstUnaryHead zs + 1
+
+/-- Copy the initial run of `true`s and its terminating `false`, then halt.
+    Inputs ending before a `false` are copied in full. -/
+def DFirstUnaryTM : DTM DFirstUnaryState where
+  step := fun q sym _ =>
+    if q = DFirstUnaryState.start then
+      { next := DFirstUnaryState.scan, output := none, inputMove := some true
+        workWrite := none, workMove := none }
+    else if q = DFirstUnaryState.scan then
+      match sym with
+      | some true =>
+          { next := DFirstUnaryState.scan, output := some true, inputMove := some true
+            workWrite := none, workMove := none }
+      | some false =>
+          { next := DFirstUnaryState.done, output := some false, inputMove := none
+            workWrite := none, workMove := none }
+      | none =>
+          { next := DFirstUnaryState.done, output := none, inputMove := none
+            workWrite := none, workMove := none }
+    else
+      { next := q, output := none, inputMove := none
+        workWrite := none, workMove := none }
+  handoff := fun _ => false
+  headReset := fun _ => false
+  start := DFirstUnaryState.start
+  accept := DFirstUnaryState.done
+  reject := DFirstUnaryState.reject
+
+lemma DFirstUnaryTM_noWork : DNoWork DFirstUnaryTM := by
+  intro q sym wsym
+  have hq : q.val = 0 ∨ q.val = 1 ∨ q.val = 2 ∨ q.val = 3 := by omega
+  rcases hq with h0 | h1 | h2 | h3
+  · have hq' : q = DFirstUnaryState.start := by ext; assumption
+    subst q
+    cases sym with
+    | none =>
+        cases wsym <;> simp [DFirstUnaryTM, DFirstUnaryState.start,
+          DFirstUnaryState.scan, DFirstUnaryState.done, DFirstUnaryState.reject]
+    | some b =>
+        cases b <;> cases wsym <;>
+          simp [DFirstUnaryTM, DFirstUnaryState.start, DFirstUnaryState.scan,
+            DFirstUnaryState.done, DFirstUnaryState.reject]
+  · have hq' : q = DFirstUnaryState.scan := by ext; assumption
+    subst q
+    cases sym with
+    | none =>
+        cases wsym <;> simp [DFirstUnaryTM, DFirstUnaryState.start,
+          DFirstUnaryState.scan, DFirstUnaryState.done, DFirstUnaryState.reject]
+    | some b =>
+        cases b <;> cases wsym <;>
+          simp [DFirstUnaryTM, DFirstUnaryState.start, DFirstUnaryState.scan,
+            DFirstUnaryState.done, DFirstUnaryState.reject]
+  · have hq' : q = DFirstUnaryState.done := by ext; assumption
+    subst q
+    cases sym with
+    | none =>
+        cases wsym <;> simp [DFirstUnaryTM, DFirstUnaryState.start,
+          DFirstUnaryState.scan, DFirstUnaryState.done, DFirstUnaryState.reject]
+    | some b =>
+        cases b <;> cases wsym <;>
+          simp [DFirstUnaryTM, DFirstUnaryState.start, DFirstUnaryState.scan,
+            DFirstUnaryState.done, DFirstUnaryState.reject]
+  · have hq' : q = DFirstUnaryState.reject := by ext; assumption
+    subst q
+    cases sym with
+    | none =>
+        cases wsym <;> simp [DFirstUnaryTM, DFirstUnaryState.start,
+          DFirstUnaryState.scan, DFirstUnaryState.done, DFirstUnaryState.reject]
+    | some b =>
+        cases b <;> cases wsym <;>
+          simp [DFirstUnaryTM, DFirstUnaryState.start, DFirstUnaryState.scan,
+            DFirstUnaryState.done, DFirstUnaryState.reject]
+
+lemma Drun_DFirstUnaryTM_start (x : Word) :
+    Drun DFirstUnaryTM 1 (Dinit DFirstUnaryTM x) =
+      { state := DFirstUnaryState.scan, input := x, head := 1, output := [],
+        work := fun _ : Nat => false, workHead := 0 } := by
+  simp [Drun, Dhalted, Dinit, Dstep, Dread, DFirstUnaryTM, Dmove,
+    DFirstUnaryState.start, DFirstUnaryState.scan,
+    DFirstUnaryState.done, DFirstUnaryState.reject]
+
+lemma Drun_DFirstUnaryTM_scan_pre (pre : Word) (x : Word)
+    (wk : Nat → Bool) (wh : Nat) :
+    Drun DFirstUnaryTM (x.length + 1)
+      { state := DFirstUnaryState.scan, input := pre ++ x,
+        head := pre.length + 1, output := pre, work := wk, workHead := wh } =
+      { state := DFirstUnaryState.done, input := pre ++ x,
+        head := pre.length + firstUnaryHead x, output := pre ++ firstUnaryCode x,
+        work := wk, workHead := wh } := by
+  induction x generalizing pre wk wh with
+  | nil =>
+      simp [Drun, Dhalted, Dstep, Dread, DFirstUnaryTM, Dmove,
+        firstUnaryHead, firstUnaryCode,
+        DFirstUnaryState.start, DFirstUnaryState.scan,
+        DFirstUnaryState.done, DFirstUnaryState.reject]
+  | cons b bs ih =>
+      cases b
+      · simp [Drun, Dhalted, Dstep, Dread, DFirstUnaryTM, Dmove,
+          firstUnaryHead, firstUnaryCode,
+          DFirstUnaryState.start, DFirstUnaryState.scan,
+          DFirstUnaryState.done, DFirstUnaryState.reject]
+      · rw [show (true :: bs).length + 1 = 1 + (bs.length + 1) by
+          simp [Nat.add_assoc, Nat.add_comm, Nat.add_left_comm]]
+        rw [Drun_add_eq]
+        let c : DConfig DFirstUnaryState :=
+          { state := DFirstUnaryState.scan, input := pre ++ true :: bs,
+            head := pre.length + 1, output := pre, work := wk, workHead := wh }
+        let c' : DConfig DFirstUnaryState :=
+          { state := DFirstUnaryState.scan, input := pre ++ true :: bs,
+            head := pre.length + 2, output := pre ++ [true],
+            work := wk, workHead := wh }
+        have hstep : Drun DFirstUnaryTM 1 c = c' := by
+          simp [c, c', Drun, Dhalted, Dstep, Dread, DFirstUnaryTM, Dmove,
+            DFirstUnaryState.start, DFirstUnaryState.scan,
+            DFirstUnaryState.done, DFirstUnaryState.reject,
+            List.append_assoc]
+        change Drun DFirstUnaryTM (bs.length + 1) (Drun DFirstUnaryTM 1 c) = _
+        rw [hstep]
+        have hrec := ih (pre := pre ++ [true]) (wk := wk) (wh := wh)
+        simpa [c', firstUnaryHead, firstUnaryCode, List.append_assoc,
+          Nat.add_comm, Nat.add_left_comm, Nat.add_assoc] using hrec
+
+lemma Drun_DFirstUnaryTM_scan (x : Word) (wk : Nat → Bool) (wh : Nat) :
+    Drun DFirstUnaryTM (x.length + 1)
+      { state := DFirstUnaryState.scan, input := x, head := 1,
+        output := [], work := wk, workHead := wh } =
+      { state := DFirstUnaryState.done, input := x,
+        head := firstUnaryHead x, output := firstUnaryCode x,
+        work := wk, workHead := wh } := by
+  simpa using (Drun_DFirstUnaryTM_scan_pre [] x wk wh)
+
+lemma Drun_DFirstUnaryTM_halt (x : Word) :
+    Dhalted DFirstUnaryTM
+      (Drun DFirstUnaryTM ((X + C 2 : TimeBound).eval x.length)
+        (Dinit DFirstUnaryTM x)) = true := by
+  have hstart := Drun_DFirstUnaryTM_start x
+  have hscan := Drun_DFirstUnaryTM_scan x (fun _ : Nat => false) 0
+  simp only [Polynomial.eval_add, Polynomial.eval_X, Polynomial.eval_C]
+  rw [show x.length + 2 = 1 + (x.length + 1) by omega, Drun_add_eq, hstart, hscan]
+  simp [Dhalted, DFirstUnaryTM]
+
+lemma dPolyTimeComputableClean_firstUnaryCode :
+    DPolyTimeComputableClean firstUnaryCode := by
+  refine DPolyTimeComputableClean.of_machine DFirstUnaryTM (X + C 2) X firstUnaryCode
+    (fun _ => rfl) DFirstUnaryTM_noWork ?_ ?_
+  · exact Drun_DFirstUnaryTM_halt
+  · intro x
+    constructor
+    · have hstart := Drun_DFirstUnaryTM_start x
+      have hscan := Drun_DFirstUnaryTM_scan x (fun _ : Nat => false) 0
+      simp only [Polynomial.eval_add, Polynomial.eval_X, Polynomial.eval_C]
+      dsimp [Dboutput]
+      rw [show x.length + 2 = 1 + (x.length + 1) by omega, Drun_add_eq, hstart, hscan]
+    · simpa using firstUnaryCode_length_le x
+
+theorem dPolyTimeComputableClean_constTrueConstraintEncode_firstUnary :
+    DPolyTimeComputableClean (fun z => constTrueConstraintEncode (firstUnaryCode z)) := by
+  change DPolyTimeComputableClean (fun z => ([false, false] : Word) ++ firstUnaryCode z)
+  exact DPolyTimeComputableClean_prepend [false, false]
+    dPolyTimeComputableClean_firstUnaryCode
+
+theorem dPolyTimeComputableClean_constFalseConstraintEncode_firstUnary :
+    DPolyTimeComputableClean (fun z => constFalseConstraintEncode (firstUnaryCode z)) := by
+  change DPolyTimeComputableClean
+    (fun z => ([false, true, false, false] : Word) ++ firstUnaryCode z)
+  exact DPolyTimeComputableClean_prepend [false, true, false, false]
+    dPolyTimeComputableClean_firstUnaryCode
+
+
+
+-- ---------------------------------------------------------------------------
+-- Clean AND/OR node encoders for dispatcher branches
+-- ---------------------------------------------------------------------------
+
+theorem dPolyTimeComputableClean_andNodeConstraintEncodeFromTriple :
+    DPolyTimeComputableClean andNodeConstraintEncodeFromTriple := by
+  have hthird : DPolyTimeComputableClean
+      (fun z : Word => ([false, true, false, false] : Word) ++ thirdCode z) :=
+    DPolyTimeComputableClean_prepend [false, true, false, false]
+      dPolyTimeComputableClean_thirdCode
+  have hconj : DPolyTimeComputableClean (fun z : Word =>
+      ([true, true] : Word) ++
+        (Formula.pairVarNotVarEncode (firstTwoCodes z) ++
+          (([false, true, false, false] : Word) ++ thirdCode z)) ) :=
+    DPolyTimeComputableClean_prepend [true, true]
+      (DPolyTimeComputableCleanAppend
+        (fun z : Word => Formula.pairVarNotVarEncode (firstTwoCodes z))
+        (fun z : Word => ([false, true, false, false] : Word) ++ thirdCode z)
+        dPolyTimeComputableClean_pairVarNotVarEncode_firstTwoCodes hthird)
+  have hconj' : DPolyTimeComputableClean (fun z : Word =>
+      Formula.pairOrNotVarVarEncode (firstThirdCodes z) ++
+        (([true, true] : Word) ++
+          (Formula.pairVarNotVarEncode (firstTwoCodes z) ++
+            (([false, true, false, false] : Word) ++ thirdCode z))) ) :=
+    DPolyTimeComputableCleanAppend
+      (fun z : Word => Formula.pairOrNotVarVarEncode (firstThirdCodes z))
+      (fun z : Word =>
+        ([true, true] : Word) ++
+          (Formula.pairVarNotVarEncode (firstTwoCodes z) ++
+            (([false, true, false, false] : Word) ++ thirdCode z)))
+      dPolyTimeComputableClean_pairOrNotVarVarEncode_firstThirdCodes hconj
+  have hconj'' : DPolyTimeComputableClean (fun z : Word =>
+      Formula.pairOrNotVarVarEncode (firstTwoCodes z) ++
+        (Formula.pairOrNotVarVarEncode (firstThirdCodes z) ++
+          (([true, true] : Word) ++
+            (Formula.pairVarNotVarEncode (firstTwoCodes z) ++
+              (([false, true, false, false] : Word) ++ thirdCode z)))) ) :=
+    DPolyTimeComputableCleanAppend
+      (fun z : Word => Formula.pairOrNotVarVarEncode (firstTwoCodes z))
+      (fun z : Word =>
+        Formula.pairOrNotVarVarEncode (firstThirdCodes z) ++
+          (([true, true] : Word) ++
+            (Formula.pairVarNotVarEncode (firstTwoCodes z) ++
+              (([false, true, false, false] : Word) ++ thirdCode z))))
+      dPolyTimeComputableClean_pairOrNotVarVarEncode_firstTwoCodes hconj'
+  have hpre : DPolyTimeComputableClean (fun z : Word =>
+      ([true, false] : Word) ++
+        (Formula.pairOrNotVarVarEncode (firstTwoCodes z) ++
+          (Formula.pairOrNotVarVarEncode (firstThirdCodes z) ++
+            (([true, true] : Word) ++
+              (Formula.pairVarNotVarEncode (firstTwoCodes z) ++
+                (([false, true, false, false] : Word) ++ thirdCode z))))) ) :=
+    DPolyTimeComputableClean_prepend [true, false] hconj''
+  have hfinal : DPolyTimeComputableClean (fun z : Word =>
+      ([true, false] : Word) ++
+        (([true, false] : Word) ++
+          (Formula.pairOrNotVarVarEncode (firstTwoCodes z) ++
+            (Formula.pairOrNotVarVarEncode (firstThirdCodes z) ++
+              (([true, true] : Word) ++
+                (Formula.pairVarNotVarEncode (firstTwoCodes z) ++
+                  (([false, true, false, false] : Word) ++ thirdCode z))))) )) :=
+    DPolyTimeComputableClean_prepend [true, false] hpre
+  have heq : (fun z : Word =>
+      ([true, false] : Word) ++
+        (([true, false] : Word) ++
+          (Formula.pairOrNotVarVarEncode (firstTwoCodes z) ++
+            (Formula.pairOrNotVarVarEncode (firstThirdCodes z) ++
+              (([true, true] : Word) ++
+                (Formula.pairVarNotVarEncode (firstTwoCodes z) ++
+                  (([false, true, false, false] : Word) ++ thirdCode z))))))) =
+      andNodeConstraintEncodeFromTriple := by
+    funext z
+    simp [andNodeConstraintEncodeFromTriple, List.append_assoc]
+  rw [← heq]
+  exact hfinal
+
+theorem dPolyTimeComputableClean_orNodeConstraintEncodeFromTriple :
+    DPolyTimeComputableClean orNodeConstraintEncodeFromTriple := by
+  have hthird : DPolyTimeComputableClean
+      (fun z : Word => ([false, false] : Word) ++ thirdCode z) :=
+    DPolyTimeComputableClean_prepend [false, false] dPolyTimeComputableClean_thirdCode
+  have hconj : DPolyTimeComputableClean (fun z : Word =>
+      ([true, true] : Word) ++
+        (Formula.pairOrNotVarVarEncode (firstTwoCodes z) ++
+          (([false, false] : Word) ++ thirdCode z)) ) :=
+    DPolyTimeComputableClean_prepend [true, true]
+      (DPolyTimeComputableCleanAppend
+        (fun z : Word => Formula.pairOrNotVarVarEncode (firstTwoCodes z))
+        (fun z : Word => ([false, false] : Word) ++ thirdCode z)
+        dPolyTimeComputableClean_pairOrNotVarVarEncode_firstTwoCodes hthird)
+  have hconj' : DPolyTimeComputableClean (fun z : Word =>
+      Formula.pairVarNotVarEncode (firstThirdCodes z) ++
+        (([true, true] : Word) ++
+          (Formula.pairOrNotVarVarEncode (firstTwoCodes z) ++
+            (([false, false] : Word) ++ thirdCode z))) ) :=
+    DPolyTimeComputableCleanAppend
+      (fun z : Word => Formula.pairVarNotVarEncode (firstThirdCodes z))
+      (fun z : Word =>
+        ([true, true] : Word) ++
+          (Formula.pairOrNotVarVarEncode (firstTwoCodes z) ++
+            (([false, false] : Word) ++ thirdCode z)))
+      dPolyTimeComputableClean_pairVarNotVarEncode_firstThirdCodes hconj
+  have hconj'' : DPolyTimeComputableClean (fun z : Word =>
+      Formula.pairVarNotVarEncode (firstTwoCodes z) ++
+        (Formula.pairVarNotVarEncode (firstThirdCodes z) ++
+          (([true, true] : Word) ++
+            (Formula.pairOrNotVarVarEncode (firstTwoCodes z) ++
+              (([false, false] : Word) ++ thirdCode z)))) ) :=
+    DPolyTimeComputableCleanAppend
+      (fun z : Word => Formula.pairVarNotVarEncode (firstTwoCodes z))
+      (fun z : Word =>
+        Formula.pairVarNotVarEncode (firstThirdCodes z) ++
+          (([true, true] : Word) ++
+            (Formula.pairOrNotVarVarEncode (firstTwoCodes z) ++
+              (([false, false] : Word) ++ thirdCode z))))
+      dPolyTimeComputableClean_pairVarNotVarEncode_firstTwoCodes hconj'
+  have hpre : DPolyTimeComputableClean (fun z : Word =>
+      ([true, false] : Word) ++
+        (Formula.pairVarNotVarEncode (firstTwoCodes z) ++
+          (Formula.pairVarNotVarEncode (firstThirdCodes z) ++
+            (([true, true] : Word) ++
+              (Formula.pairOrNotVarVarEncode (firstTwoCodes z) ++
+                (([false, false] : Word) ++ thirdCode z))))) ) :=
+    DPolyTimeComputableClean_prepend [true, false] hconj''
+  have hfinal : DPolyTimeComputableClean (fun z : Word =>
+      ([true, false] : Word) ++
+        (([true, false] : Word) ++
+          (Formula.pairVarNotVarEncode (firstTwoCodes z) ++
+            (Formula.pairVarNotVarEncode (firstThirdCodes z) ++
+              (([true, true] : Word) ++
+                (Formula.pairOrNotVarVarEncode (firstTwoCodes z) ++
+                  (([false, false] : Word) ++ thirdCode z))))) )) :=
+    DPolyTimeComputableClean_prepend [true, false] hpre
+  have heq : (fun z : Word =>
+      ([true, false] : Word) ++
+        (([true, false] : Word) ++
+          (Formula.pairVarNotVarEncode (firstTwoCodes z) ++
+            (Formula.pairVarNotVarEncode (firstThirdCodes z) ++
+              (([true, true] : Word) ++
+                (Formula.pairOrNotVarVarEncode (firstTwoCodes z) ++
+                  (([false, false] : Word) ++ thirdCode z))))))) =
+      orNodeConstraintEncodeFromTriple := by
+    funext z
+    simp [orNodeConstraintEncodeFromTriple, List.append_assoc]
+  rw [← heq]
+  exact hfinal
+
+
+
+-- ---------------------------------------------------------------------------
+-- Copy-phase and tag-phase lemmas for the descriptor dispatcher
+-- ---------------------------------------------------------------------------
+
+lemma Drun_copy_to_entry {S : Type} [Fintype S] [DecidableEq S]
+    (D : DTM S) (copyS entryS : S)
+    (hcopySome : ∀ (b : Bool) (wsym : Bool), D.step copyS (some b) wsym =
+      { next := copyS, output := some b, inputMove := some true,
+        workWrite := none, workMove := none })
+    (hcopyNone : ∀ wsym : Bool, D.step copyS none wsym =
+      { next := entryS, output := none, inputMove := none,
+        workWrite := none, workMove := none })
+    (hhand : D.handoff copyS = false) (hreset : D.headReset copyS = false)
+    (hnacc : copyS ≠ D.accept) (hnrej : copyS ≠ D.reject)
+    (pre suffix out : Word) (wk : Nat → Bool) (wh : Nat) :
+    Drun D (suffix.length + 1)
+      { state := copyS, input := pre ++ suffix, head := pre.length + 1,
+        output := out, work := wk, workHead := wh } =
+      { state := entryS, input := pre ++ suffix,
+        head := (pre ++ suffix).length + 1, output := out ++ suffix,
+        work := wk, workHead := wh } := by
+  induction suffix generalizing pre out wk wh with
+  | nil =>
+      let c : DConfig S :=
+        { state := copyS, input := pre ++ [], head := pre.length + 1,
+          output := out, work := wk, workHead := wh }
+      change Drun D 1 c = _
+      have hc : Dhalted D c = false := by
+        simp [c, Dhalted, hnacc, hnrej]
+      have hstep : Dstep D c =
+          { state := entryS, input := pre ++ [], head := pre.length + 1,
+            output := out, work := wk, workHead := wh } := by
+        simp [c, Dstep, Dread, Dmove, hc, hhand, hreset, hcopyNone]
+      change Drun D 1 c = _
+      rw [show Drun D 1 c = Dstep D c by simp [Drun, hc]]
+      simpa using hstep
+  | cons b bs ih =>
+      rw [show (b :: bs).length + 1 = 1 + (bs.length + 1) by
+        simp [Nat.add_assoc, Nat.add_comm, Nat.add_left_comm]]
+      rw [Drun_add_eq]
+      let c : DConfig S :=
+        { state := copyS, input := pre ++ b :: bs, head := pre.length + 1,
+          output := out, work := wk, workHead := wh }
+      let c' : DConfig S :=
+        { state := copyS, input := pre ++ b :: bs, head := pre.length + 2,
+          output := out ++ [b], work := wk, workHead := wh }
+      have hc : Dhalted D c = false := by
+        simp [c, Dhalted, hnacc, hnrej]
+      have hstep : Dstep D c = c' := by
+        simp [c, c', Dstep, Dread, Dmove, hc, hhand, hreset, hcopySome b,
+          List.append_assoc]
+      change Drun D (bs.length + 1) (Drun D 1 c) = _
+      rw [show Drun D 1 c = Dstep D c by simp [Drun, hc]]
+      rw [hstep]
+      have hrec := ih (pre := pre ++ [b]) (out := out ++ [b]) (wk := wk) (wh := wh)
+      simpa [c', List.append_assoc, Nat.add_comm, Nat.add_left_comm, Nat.add_assoc] using hrec
+
+lemma Drun_DDescDispatchTM_copyF
+    {σcf σct σv σn σa σo : Type}
+    [Fintype σcf] [DecidableEq σcf] [Fintype σct] [DecidableEq σct]
+    [Fintype σv] [DecidableEq σv] [Fintype σn] [DecidableEq σn]
+    [Fintype σa] [DecidableEq σa] [Fintype σo] [DecidableEq σo]
+    (Mcf : DTM σcf) (Mct : DTM σct) (Mv : DTM σv) (Mn : DTM σn)
+    (Ma : DTM σa) (Mo : DTM σo)
+    (pre suffix out : Word) (wk : Nat → Bool) (wh : Nat) :
+    Drun (DDescDispatchTM Mcf Mct Mv Mn Ma Mo) (suffix.length + 1)
+      { state := DDescDispatchState.copyF, input := pre ++ suffix,
+        head := pre.length + 1, output := out, work := wk, workHead := wh } =
+      { state := DDescDispatchState.entryF, input := pre ++ suffix,
+        head := (pre ++ suffix).length + 1, output := out ++ suffix,
+        work := wk, workHead := wh } := by
+  apply Drun_copy_to_entry (DDescDispatchTM Mcf Mct Mv Mn Ma Mo)
+    DDescDispatchState.copyF DDescDispatchState.entryF
+  · intro b wsym
+    simp [DDescDispatchTM, DDescDispatchTM.copyAction,
+      DDescDispatchState.tag, DDescDispatchState.copyF,
+      DDescDispatchState.entryF]
+  · intro wsym
+    simp [DDescDispatchTM, DDescDispatchTM.copyAction,
+      DDescDispatchTM.idleAction, DDescDispatchState.tag,
+      DDescDispatchState.copyF, DDescDispatchState.entryF]
+  · simp [DDescDispatchTM, DDescDispatchState.tag, DDescDispatchState.copyF]
+  · simp [DDescDispatchTM, DDescDispatchState.tag, DDescDispatchState.copyF]
+  · simp [DDescDispatchTM, DDescDispatchState.tag, DDescDispatchState.copyF, DDescDispatchState.done]
+  · simp [DDescDispatchTM, DDescDispatchState.tag, DDescDispatchState.copyF, DDescDispatchState.reject]
+
+lemma Drun_DDescDispatchTM_copyT
+    {σcf σct σv σn σa σo : Type}
+    [Fintype σcf] [DecidableEq σcf] [Fintype σct] [DecidableEq σct]
+    [Fintype σv] [DecidableEq σv] [Fintype σn] [DecidableEq σn]
+    [Fintype σa] [DecidableEq σa] [Fintype σo] [DecidableEq σo]
+    (Mcf : DTM σcf) (Mct : DTM σct) (Mv : DTM σv) (Mn : DTM σn)
+    (Ma : DTM σa) (Mo : DTM σo)
+    (pre suffix out : Word) (wk : Nat → Bool) (wh : Nat) :
+    Drun (DDescDispatchTM Mcf Mct Mv Mn Ma Mo) (suffix.length + 1)
+      { state := DDescDispatchState.copyT, input := pre ++ suffix,
+        head := pre.length + 1, output := out, work := wk, workHead := wh } =
+      { state := DDescDispatchState.entryT, input := pre ++ suffix,
+        head := (pre ++ suffix).length + 1, output := out ++ suffix,
+        work := wk, workHead := wh } := by
+  apply Drun_copy_to_entry (DDescDispatchTM Mcf Mct Mv Mn Ma Mo)
+    DDescDispatchState.copyT DDescDispatchState.entryT
+  · intro b wsym
+    simp [DDescDispatchTM, DDescDispatchTM.copyAction,
+      DDescDispatchState.tag, DDescDispatchState.copyT,
+      DDescDispatchState.entryT]
+  · intro wsym
+    simp [DDescDispatchTM, DDescDispatchTM.copyAction,
+      DDescDispatchTM.idleAction, DDescDispatchState.tag,
+      DDescDispatchState.copyT, DDescDispatchState.entryT]
+  · simp [DDescDispatchTM, DDescDispatchState.tag, DDescDispatchState.copyT]
+  · simp [DDescDispatchTM, DDescDispatchState.tag, DDescDispatchState.copyT]
+  · simp [DDescDispatchTM, DDescDispatchState.tag, DDescDispatchState.copyT, DDescDispatchState.done]
+  · simp [DDescDispatchTM, DDescDispatchState.tag, DDescDispatchState.copyT, DDescDispatchState.reject]
+
+lemma Drun_DDescDispatchTM_copyV
+    {σcf σct σv σn σa σo : Type}
+    [Fintype σcf] [DecidableEq σcf] [Fintype σct] [DecidableEq σct]
+    [Fintype σv] [DecidableEq σv] [Fintype σn] [DecidableEq σn]
+    [Fintype σa] [DecidableEq σa] [Fintype σo] [DecidableEq σo]
+    (Mcf : DTM σcf) (Mct : DTM σct) (Mv : DTM σv) (Mn : DTM σn)
+    (Ma : DTM σa) (Mo : DTM σo)
+    (pre suffix out : Word) (wk : Nat → Bool) (wh : Nat) :
+    Drun (DDescDispatchTM Mcf Mct Mv Mn Ma Mo) (suffix.length + 1)
+      { state := DDescDispatchState.copyV, input := pre ++ suffix,
+        head := pre.length + 1, output := out, work := wk, workHead := wh } =
+      { state := DDescDispatchState.entryV, input := pre ++ suffix,
+        head := (pre ++ suffix).length + 1, output := out ++ suffix,
+        work := wk, workHead := wh } := by
+  apply Drun_copy_to_entry (DDescDispatchTM Mcf Mct Mv Mn Ma Mo)
+    DDescDispatchState.copyV DDescDispatchState.entryV
+  · intro b wsym
+    simp [DDescDispatchTM, DDescDispatchTM.copyAction,
+      DDescDispatchState.tag, DDescDispatchState.copyV,
+      DDescDispatchState.entryV]
+  · intro wsym
+    simp [DDescDispatchTM, DDescDispatchTM.copyAction,
+      DDescDispatchTM.idleAction, DDescDispatchState.tag,
+      DDescDispatchState.copyV, DDescDispatchState.entryV]
+  · simp [DDescDispatchTM, DDescDispatchState.tag, DDescDispatchState.copyV]
+  · simp [DDescDispatchTM, DDescDispatchState.tag, DDescDispatchState.copyV]
+  · simp [DDescDispatchTM, DDescDispatchState.tag, DDescDispatchState.copyV, DDescDispatchState.done]
+  · simp [DDescDispatchTM, DDescDispatchState.tag, DDescDispatchState.copyV, DDescDispatchState.reject]
+
+lemma Drun_DDescDispatchTM_copyN
+    {σcf σct σv σn σa σo : Type}
+    [Fintype σcf] [DecidableEq σcf] [Fintype σct] [DecidableEq σct]
+    [Fintype σv] [DecidableEq σv] [Fintype σn] [DecidableEq σn]
+    [Fintype σa] [DecidableEq σa] [Fintype σo] [DecidableEq σo]
+    (Mcf : DTM σcf) (Mct : DTM σct) (Mv : DTM σv) (Mn : DTM σn)
+    (Ma : DTM σa) (Mo : DTM σo)
+    (pre suffix out : Word) (wk : Nat → Bool) (wh : Nat) :
+    Drun (DDescDispatchTM Mcf Mct Mv Mn Ma Mo) (suffix.length + 1)
+      { state := DDescDispatchState.copyN, input := pre ++ suffix,
+        head := pre.length + 1, output := out, work := wk, workHead := wh } =
+      { state := DDescDispatchState.entryN, input := pre ++ suffix,
+        head := (pre ++ suffix).length + 1, output := out ++ suffix,
+        work := wk, workHead := wh } := by
+  apply Drun_copy_to_entry (DDescDispatchTM Mcf Mct Mv Mn Ma Mo)
+    DDescDispatchState.copyN DDescDispatchState.entryN
+  · intro b wsym
+    simp [DDescDispatchTM, DDescDispatchTM.copyAction,
+      DDescDispatchState.tag, DDescDispatchState.copyN,
+      DDescDispatchState.entryN]
+  · intro wsym
+    simp [DDescDispatchTM, DDescDispatchTM.copyAction,
+      DDescDispatchTM.idleAction, DDescDispatchState.tag,
+      DDescDispatchState.copyN, DDescDispatchState.entryN]
+  · simp [DDescDispatchTM, DDescDispatchState.tag, DDescDispatchState.copyN]
+  · simp [DDescDispatchTM, DDescDispatchState.tag, DDescDispatchState.copyN]
+  · simp [DDescDispatchTM, DDescDispatchState.tag, DDescDispatchState.copyN, DDescDispatchState.done]
+  · simp [DDescDispatchTM, DDescDispatchState.tag, DDescDispatchState.copyN, DDescDispatchState.reject]
+
+lemma Drun_DDescDispatchTM_copyA
+    {σcf σct σv σn σa σo : Type}
+    [Fintype σcf] [DecidableEq σcf] [Fintype σct] [DecidableEq σct]
+    [Fintype σv] [DecidableEq σv] [Fintype σn] [DecidableEq σn]
+    [Fintype σa] [DecidableEq σa] [Fintype σo] [DecidableEq σo]
+    (Mcf : DTM σcf) (Mct : DTM σct) (Mv : DTM σv) (Mn : DTM σn)
+    (Ma : DTM σa) (Mo : DTM σo)
+    (pre suffix out : Word) (wk : Nat → Bool) (wh : Nat) :
+    Drun (DDescDispatchTM Mcf Mct Mv Mn Ma Mo) (suffix.length + 1)
+      { state := DDescDispatchState.copyA, input := pre ++ suffix,
+        head := pre.length + 1, output := out, work := wk, workHead := wh } =
+      { state := DDescDispatchState.entryA, input := pre ++ suffix,
+        head := (pre ++ suffix).length + 1, output := out ++ suffix,
+        work := wk, workHead := wh } := by
+  apply Drun_copy_to_entry (DDescDispatchTM Mcf Mct Mv Mn Ma Mo)
+    DDescDispatchState.copyA DDescDispatchState.entryA
+  · intro b wsym
+    simp [DDescDispatchTM, DDescDispatchTM.copyAction,
+      DDescDispatchState.tag, DDescDispatchState.copyA,
+      DDescDispatchState.entryA]
+  · intro wsym
+    simp [DDescDispatchTM, DDescDispatchTM.copyAction,
+      DDescDispatchTM.idleAction, DDescDispatchState.tag,
+      DDescDispatchState.copyA, DDescDispatchState.entryA]
+  · simp [DDescDispatchTM, DDescDispatchState.tag, DDescDispatchState.copyA]
+  · simp [DDescDispatchTM, DDescDispatchState.tag, DDescDispatchState.copyA]
+  · simp [DDescDispatchTM, DDescDispatchState.tag, DDescDispatchState.copyA, DDescDispatchState.done]
+  · simp [DDescDispatchTM, DDescDispatchState.tag, DDescDispatchState.copyA, DDescDispatchState.reject]
+
+lemma Drun_DDescDispatchTM_copyO
+    {σcf σct σv σn σa σo : Type}
+    [Fintype σcf] [DecidableEq σcf] [Fintype σct] [DecidableEq σct]
+    [Fintype σv] [DecidableEq σv] [Fintype σn] [DecidableEq σn]
+    [Fintype σa] [DecidableEq σa] [Fintype σo] [DecidableEq σo]
+    (Mcf : DTM σcf) (Mct : DTM σct) (Mv : DTM σv) (Mn : DTM σn)
+    (Ma : DTM σa) (Mo : DTM σo)
+    (pre suffix out : Word) (wk : Nat → Bool) (wh : Nat) :
+    Drun (DDescDispatchTM Mcf Mct Mv Mn Ma Mo) (suffix.length + 1)
+      { state := DDescDispatchState.copyO, input := pre ++ suffix,
+        head := pre.length + 1, output := out, work := wk, workHead := wh } =
+      { state := DDescDispatchState.entryO, input := pre ++ suffix,
+        head := (pre ++ suffix).length + 1, output := out ++ suffix,
+        work := wk, workHead := wh } := by
+  apply Drun_copy_to_entry (DDescDispatchTM Mcf Mct Mv Mn Ma Mo)
+    DDescDispatchState.copyO DDescDispatchState.entryO
+  · intro b wsym
+    simp [DDescDispatchTM, DDescDispatchTM.copyAction,
+      DDescDispatchState.tag, DDescDispatchState.copyO,
+      DDescDispatchState.entryO]
+  · intro wsym
+    simp [DDescDispatchTM, DDescDispatchTM.copyAction,
+      DDescDispatchTM.idleAction, DDescDispatchState.tag,
+      DDescDispatchState.copyO, DDescDispatchState.entryO]
+  · simp [DDescDispatchTM, DDescDispatchState.tag, DDescDispatchState.copyO]
+  · simp [DDescDispatchTM, DDescDispatchState.tag, DDescDispatchState.copyO]
+  · simp [DDescDispatchTM, DDescDispatchState.tag, DDescDispatchState.copyO, DDescDispatchState.done]
+  · simp [DDescDispatchTM, DDescDispatchState.tag, DDescDispatchState.copyO, DDescDispatchState.reject]
+
+
+-- ---------------------------------------------------------------------------
+-- Start, tag-recognition, and copy-to-entry phases of the dispatcher
+-- ---------------------------------------------------------------------------
+
+-- ---------------------------------------------------------------------------
+-- Start, tag-recognition, and copy-to-entry phases of the dispatcher
+-- ---------------------------------------------------------------------------
+
+lemma Drun_DDescDispatchTM_start
+    {σcf σct σv σn σa σo : Type}
+    [Fintype σcf] [DecidableEq σcf] [Fintype σct] [DecidableEq σct]
+    [Fintype σv] [DecidableEq σv] [Fintype σn] [DecidableEq σn]
+    [Fintype σa] [DecidableEq σa] [Fintype σo] [DecidableEq σo]
+    (Mcf : DTM σcf) (Mct : DTM σct) (Mv : DTM σv) (Mn : DTM σn)
+    (Ma : DTM σa) (Mo : DTM σo) (z : Word) :
+    Drun (DDescDispatchTM Mcf Mct Mv Mn Ma Mo) 1
+        (Dinit (DDescDispatchTM Mcf Mct Mv Mn Ma Mo) z) =
+      { state := DDescDispatchState.start, input := z, head := 1,
+        output := [], work := fun i : Nat => if i = 0 then true else false,
+         workHead := 0 } := by
+  simp [Drun, Dhalted, Dinit, Dstep, Dread, Dmove, DDescDispatchTM,
+    DDescDispatchTM.rejectAction, DDescDispatchTM.idleAction,
+    DDescDispatchState.start, DDescDispatchState.done,
+    DDescDispatchState.reject, DDescDispatchState.tag, DwriteWork]
+  funext i
+  by_cases hi : i = 0 <;> simp [DwriteWork, hi]
+
+lemma Drun_DDescDispatchTM_tags_constFalse
+    {σcf σct σv σn σa σo : Type}
+    [Fintype σcf] [DecidableEq σcf] [Fintype σct] [DecidableEq σct]
+    [Fintype σv] [DecidableEq σv] [Fintype σn] [DecidableEq σn]
+    [Fintype σa] [DecidableEq σa] [Fintype σo] [DecidableEq σo]
+    (Mcf : DTM σcf) (Mct : DTM σct) (Mv : DTM σv) (Mn : DTM σn)
+    (Ma : DTM σa) (Mo : DTM σo) (rest : Word) :
+    Drun (DDescDispatchTM Mcf Mct Mv Mn Ma Mo) 4
+        (Dinit (DDescDispatchTM Mcf Mct Mv Mn Ma Mo)
+          (false :: false :: false :: rest)) =
+      { state := DDescDispatchState.copyF, input := false :: false :: false :: rest,
+        head := 4, output := [], work := fun _ : Nat => false, workHead := 0 } := by
+  simp [Drun, Dhalted, Dinit, Dstep, Dread, Dmove, DDescDispatchTM,
+    DDescDispatchTM.rejectAction, DDescDispatchTM.idleAction,
+    DDescDispatchState.start, DDescDispatchState.fSeen,
+    DDescDispatchState.ffSeen, DDescDispatchState.copyF, DDescDispatchState.done,
+    DDescDispatchState.reject, DDescDispatchState.tag, DwriteWork]
+  funext i
+  by_cases hi : i = 0 <;> simp [DwriteWork, hi]
+
+lemma Drun_DDescDispatchTM_tags_constTrue
+    {σcf σct σv σn σa σo : Type}
+    [Fintype σcf] [DecidableEq σcf] [Fintype σct] [DecidableEq σct]
+    [Fintype σv] [DecidableEq σv] [Fintype σn] [DecidableEq σn]
+    [Fintype σa] [DecidableEq σa] [Fintype σo] [DecidableEq σo]
+    (Mcf : DTM σcf) (Mct : DTM σct) (Mv : DTM σv) (Mn : DTM σn)
+    (Ma : DTM σa) (Mo : DTM σo) (rest : Word) :
+    Drun (DDescDispatchTM Mcf Mct Mv Mn Ma Mo) 4
+        (Dinit (DDescDispatchTM Mcf Mct Mv Mn Ma Mo)
+          (false :: false :: true :: rest)) =
+      { state := DDescDispatchState.copyT, input := false :: false :: true :: rest,
+        head := 4, output := [], work := fun _ : Nat => false, workHead := 0 } := by
+  simp [Drun, Dhalted, Dinit, Dstep, Dread, Dmove, DDescDispatchTM,
+    DDescDispatchTM.rejectAction, DDescDispatchTM.idleAction,
+    DDescDispatchState.start, DDescDispatchState.fSeen,
+    DDescDispatchState.ffSeen, DDescDispatchState.copyT, DDescDispatchState.done,
+    DDescDispatchState.reject, DDescDispatchState.tag, DwriteWork]
+  funext i
+  by_cases hi : i = 0 <;> simp [DwriteWork, hi]
+
+lemma Drun_DDescDispatchTM_tags_var
+    {σcf σct σv σn σa σo : Type}
+    [Fintype σcf] [DecidableEq σcf] [Fintype σct] [DecidableEq σct]
+    [Fintype σv] [DecidableEq σv] [Fintype σn] [DecidableEq σn]
+    [Fintype σa] [DecidableEq σa] [Fintype σo] [DecidableEq σo]
+    (Mcf : DTM σcf) (Mct : DTM σct) (Mv : DTM σv) (Mn : DTM σn)
+    (Ma : DTM σa) (Mo : DTM σo) (rest : Word) :
+    Drun (DDescDispatchTM Mcf Mct Mv Mn Ma Mo) 3
+        (Dinit (DDescDispatchTM Mcf Mct Mv Mn Ma Mo)
+          (false :: true :: rest)) =
+      { state := DDescDispatchState.copyV, input := false :: true :: rest,
+        head := 3, output := [], work := fun _ : Nat => false, workHead := 0 } := by
+  simp [Drun, Dhalted, Dinit, Dstep, Dread, Dmove, DDescDispatchTM,
+    DDescDispatchTM.rejectAction, DDescDispatchTM.idleAction,
+    DDescDispatchState.start, DDescDispatchState.fSeen,
+    DDescDispatchState.copyV, DDescDispatchState.done,
+    DDescDispatchState.reject, DDescDispatchState.tag, DwriteWork]
+  funext i
+  by_cases hi : i = 0 <;> simp [DwriteWork, hi]
+
+lemma Drun_DDescDispatchTM_tags_not
+    {σcf σct σv σn σa σo : Type}
+    [Fintype σcf] [DecidableEq σcf] [Fintype σct] [DecidableEq σct]
+    [Fintype σv] [DecidableEq σv] [Fintype σn] [DecidableEq σn]
+    [Fintype σa] [DecidableEq σa] [Fintype σo] [DecidableEq σo]
+    (Mcf : DTM σcf) (Mct : DTM σct) (Mv : DTM σv) (Mn : DTM σn)
+    (Ma : DTM σa) (Mo : DTM σo) (rest : Word) :
+    Drun (DDescDispatchTM Mcf Mct Mv Mn Ma Mo) 4
+        (Dinit (DDescDispatchTM Mcf Mct Mv Mn Ma Mo)
+          (true :: false :: false :: rest)) =
+      { state := DDescDispatchState.copyN, input := true :: false :: false :: rest,
+        head := 4, output := [], work := fun _ : Nat => false, workHead := 0 } := by
+  simp [Drun, Dhalted, Dinit, Dstep, Dread, Dmove, DDescDispatchTM,
+    DDescDispatchTM.rejectAction, DDescDispatchTM.idleAction,
+    DDescDispatchState.start, DDescDispatchState.tSeen,
+    DDescDispatchState.tfSeen, DDescDispatchState.copyN, DDescDispatchState.done,
+    DDescDispatchState.reject, DDescDispatchState.tag, DwriteWork]
+  funext i
+  by_cases hi : i = 0 <;> simp [DwriteWork, hi]
+
+lemma Drun_DDescDispatchTM_tags_and
+    {σcf σct σv σn σa σo : Type}
+    [Fintype σcf] [DecidableEq σcf] [Fintype σct] [DecidableEq σct]
+    [Fintype σv] [DecidableEq σv] [Fintype σn] [DecidableEq σn]
+    [Fintype σa] [DecidableEq σa] [Fintype σo] [DecidableEq σo]
+    (Mcf : DTM σcf) (Mct : DTM σct) (Mv : DTM σv) (Mn : DTM σn)
+    (Ma : DTM σa) (Mo : DTM σo) (rest : Word) :
+    Drun (DDescDispatchTM Mcf Mct Mv Mn Ma Mo) 4
+        (Dinit (DDescDispatchTM Mcf Mct Mv Mn Ma Mo)
+          (true :: false :: true :: rest)) =
+      { state := DDescDispatchState.copyA, input := true :: false :: true :: rest,
+        head := 4, output := [], work := fun _ : Nat => false, workHead := 0 } := by
+  simp [Drun, Dhalted, Dinit, Dstep, Dread, Dmove, DDescDispatchTM,
+    DDescDispatchTM.rejectAction, DDescDispatchTM.idleAction,
+    DDescDispatchState.start, DDescDispatchState.tSeen,
+    DDescDispatchState.tfSeen, DDescDispatchState.copyA, DDescDispatchState.done,
+    DDescDispatchState.reject, DDescDispatchState.tag, DwriteWork]
+  funext i
+  by_cases hi : i = 0 <;> simp [DwriteWork, hi]
+
+lemma Drun_DDescDispatchTM_tags_or
+    {σcf σct σv σn σa σo : Type}
+    [Fintype σcf] [DecidableEq σcf] [Fintype σct] [DecidableEq σct]
+    [Fintype σv] [DecidableEq σv] [Fintype σn] [DecidableEq σn]
+    [Fintype σa] [DecidableEq σa] [Fintype σo] [DecidableEq σo]
+    (Mcf : DTM σcf) (Mct : DTM σct) (Mv : DTM σv) (Mn : DTM σn)
+    (Ma : DTM σa) (Mo : DTM σo) (rest : Word) :
+    Drun (DDescDispatchTM Mcf Mct Mv Mn Ma Mo) 4
+        (Dinit (DDescDispatchTM Mcf Mct Mv Mn Ma Mo)
+          (true :: true :: true :: rest)) =
+      { state := DDescDispatchState.copyO, input := true :: true :: true :: rest,
+        head := 4, output := [], work := fun _ : Nat => false, workHead := 0 } := by
+  simp [Drun, Dhalted, Dinit, Dstep, Dread, Dmove, DDescDispatchTM,
+    DDescDispatchTM.rejectAction, DDescDispatchTM.idleAction,
+    DDescDispatchState.start, DDescDispatchState.tSeen,
+    DDescDispatchState.ttSeen, DDescDispatchState.copyO, DDescDispatchState.done,
+    DDescDispatchState.reject, DDescDispatchState.tag, DwriteWork]
+  funext i
+  by_cases hi : i = 0 <;> simp [DwriteWork, hi]
+
+
+
+-- ---------------------------------------------------------------------------
+-- Tag recognition followed by copy-to-entry, and the one-step entry handoff
+-- into each branch machine.
+-- ---------------------------------------------------------------------------
+
+lemma Drun_DDescDispatchTM_constFalse_toEntry
+    {σcf σct σv σn σa σo : Type}
+    [Fintype σcf] [DecidableEq σcf] [Fintype σct] [DecidableEq σct]
+    [Fintype σv] [DecidableEq σv] [Fintype σn] [DecidableEq σn]
+    [Fintype σa] [DecidableEq σa] [Fintype σo] [DecidableEq σo]
+    (Mcf : DTM σcf) (Mct : DTM σct) (Mv : DTM σv) (Mn : DTM σn)
+    (Ma : DTM σa) (Mo : DTM σo) (suffix : Word) :
+    Drun (DDescDispatchTM Mcf Mct Mv Mn Ma Mo) (4 + (suffix.length + 1))
+      (Dinit (DDescDispatchTM Mcf Mct Mv Mn Ma Mo)
+        (false :: false :: false :: suffix)) =
+      { state := DDescDispatchState.entryF,
+        input := false :: false :: false :: suffix,
+        head := (false :: false :: false :: suffix).length + 1,
+        output := suffix, work := fun _ : Nat => false, workHead := 0 } := by
+  rw [Drun_add_eq,
+    Drun_DDescDispatchTM_tags_constFalse Mcf Mct Mv Mn Ma Mo suffix]
+  simpa using
+    (Drun_DDescDispatchTM_copyF Mcf Mct Mv Mn Ma Mo
+      [false, false, false] suffix [] (fun _ : Nat => false) 0)
+
+lemma Drun_DDescDispatchTM_constTrue_toEntry
+    {σcf σct σv σn σa σo : Type}
+    [Fintype σcf] [DecidableEq σcf] [Fintype σct] [DecidableEq σct]
+    [Fintype σv] [DecidableEq σv] [Fintype σn] [DecidableEq σn]
+    [Fintype σa] [DecidableEq σa] [Fintype σo] [DecidableEq σo]
+    (Mcf : DTM σcf) (Mct : DTM σct) (Mv : DTM σv) (Mn : DTM σn)
+    (Ma : DTM σa) (Mo : DTM σo) (suffix : Word) :
+    Drun (DDescDispatchTM Mcf Mct Mv Mn Ma Mo) (4 + (suffix.length + 1))
+      (Dinit (DDescDispatchTM Mcf Mct Mv Mn Ma Mo)
+        (false :: false :: true :: suffix)) =
+      { state := DDescDispatchState.entryT,
+        input := false :: false :: true :: suffix,
+        head := (false :: false :: true :: suffix).length + 1,
+        output := suffix, work := fun _ : Nat => false, workHead := 0 } := by
+  rw [Drun_add_eq,
+    Drun_DDescDispatchTM_tags_constTrue Mcf Mct Mv Mn Ma Mo suffix]
+  simpa using
+    (Drun_DDescDispatchTM_copyT Mcf Mct Mv Mn Ma Mo
+      [false, false, true] suffix [] (fun _ : Nat => false) 0)
+
+lemma Drun_DDescDispatchTM_var_toEntry
+    {σcf σct σv σn σa σo : Type}
+    [Fintype σcf] [DecidableEq σcf] [Fintype σct] [DecidableEq σct]
+    [Fintype σv] [DecidableEq σv] [Fintype σn] [DecidableEq σn]
+    [Fintype σa] [DecidableEq σa] [Fintype σo] [DecidableEq σo]
+    (Mcf : DTM σcf) (Mct : DTM σct) (Mv : DTM σv) (Mn : DTM σn)
+    (Ma : DTM σa) (Mo : DTM σo) (suffix : Word) :
+    Drun (DDescDispatchTM Mcf Mct Mv Mn Ma Mo) (3 + (suffix.length + 1))
+      (Dinit (DDescDispatchTM Mcf Mct Mv Mn Ma Mo)
+        (false :: true :: suffix)) =
+      { state := DDescDispatchState.entryV,
+        input := false :: true :: suffix,
+        head := (false :: true :: suffix).length + 1,
+        output := suffix, work := fun _ : Nat => false, workHead := 0 } := by
+  rw [Drun_add_eq, Drun_DDescDispatchTM_tags_var Mcf Mct Mv Mn Ma Mo suffix]
+  simpa using
+    (Drun_DDescDispatchTM_copyV Mcf Mct Mv Mn Ma Mo
+      [false, true] suffix [] (fun _ : Nat => false) 0)
+
+lemma Drun_DDescDispatchTM_not_toEntry
+    {σcf σct σv σn σa σo : Type}
+    [Fintype σcf] [DecidableEq σcf] [Fintype σct] [DecidableEq σct]
+    [Fintype σv] [DecidableEq σv] [Fintype σn] [DecidableEq σn]
+    [Fintype σa] [DecidableEq σa] [Fintype σo] [DecidableEq σo]
+    (Mcf : DTM σcf) (Mct : DTM σct) (Mv : DTM σv) (Mn : DTM σn)
+    (Ma : DTM σa) (Mo : DTM σo) (suffix : Word) :
+    Drun (DDescDispatchTM Mcf Mct Mv Mn Ma Mo) (4 + (suffix.length + 1))
+      (Dinit (DDescDispatchTM Mcf Mct Mv Mn Ma Mo)
+        (true :: false :: false :: suffix)) =
+      { state := DDescDispatchState.entryN,
+        input := true :: false :: false :: suffix,
+        head := (true :: false :: false :: suffix).length + 1,
+        output := suffix, work := fun _ : Nat => false, workHead := 0 } := by
+  rw [Drun_add_eq, Drun_DDescDispatchTM_tags_not Mcf Mct Mv Mn Ma Mo suffix]
+  simpa using
+    (Drun_DDescDispatchTM_copyN Mcf Mct Mv Mn Ma Mo
+      [true, false, false] suffix [] (fun _ : Nat => false) 0)
+
+lemma Drun_DDescDispatchTM_and_toEntry
+    {σcf σct σv σn σa σo : Type}
+    [Fintype σcf] [DecidableEq σcf] [Fintype σct] [DecidableEq σct]
+    [Fintype σv] [DecidableEq σv] [Fintype σn] [DecidableEq σn]
+    [Fintype σa] [DecidableEq σa] [Fintype σo] [DecidableEq σo]
+    (Mcf : DTM σcf) (Mct : DTM σct) (Mv : DTM σv) (Mn : DTM σn)
+    (Ma : DTM σa) (Mo : DTM σo) (suffix : Word) :
+    Drun (DDescDispatchTM Mcf Mct Mv Mn Ma Mo) (4 + (suffix.length + 1))
+      (Dinit (DDescDispatchTM Mcf Mct Mv Mn Ma Mo)
+        (true :: false :: true :: suffix)) =
+      { state := DDescDispatchState.entryA,
+        input := true :: false :: true :: suffix,
+        head := (true :: false :: true :: suffix).length + 1,
+        output := suffix, work := fun _ : Nat => false, workHead := 0 } := by
+  rw [Drun_add_eq, Drun_DDescDispatchTM_tags_and Mcf Mct Mv Mn Ma Mo suffix]
+  simpa using
+    (Drun_DDescDispatchTM_copyA Mcf Mct Mv Mn Ma Mo
+      [true, false, true] suffix [] (fun _ : Nat => false) 0)
+
+lemma Drun_DDescDispatchTM_or_toEntry
+    {σcf σct σv σn σa σo : Type}
+    [Fintype σcf] [DecidableEq σcf] [Fintype σct] [DecidableEq σct]
+    [Fintype σv] [DecidableEq σv] [Fintype σn] [DecidableEq σn]
+    [Fintype σa] [DecidableEq σa] [Fintype σo] [DecidableEq σo]
+    (Mcf : DTM σcf) (Mct : DTM σct) (Mv : DTM σv) (Mn : DTM σn)
+    (Ma : DTM σa) (Mo : DTM σo) (suffix : Word) :
+    Drun (DDescDispatchTM Mcf Mct Mv Mn Ma Mo) (4 + (suffix.length + 1))
+      (Dinit (DDescDispatchTM Mcf Mct Mv Mn Ma Mo)
+        (true :: true :: true :: suffix)) =
+      { state := DDescDispatchState.entryO,
+        input := true :: true :: true :: suffix,
+        head := (true :: true :: true :: suffix).length + 1,
+        output := suffix, work := fun _ : Nat => false, workHead := 0 } := by
+  rw [Drun_add_eq, Drun_DDescDispatchTM_tags_or Mcf Mct Mv Mn Ma Mo suffix]
+  simpa using
+    (Drun_DDescDispatchTM_copyO Mcf Mct Mv Mn Ma Mo
+      [true, true, true] suffix [] (fun _ : Nat => false) 0)
+
+lemma Dstep_DDescDispatchTM_entryF
+    {σcf σct σv σn σa σo : Type}
+    [Fintype σcf] [DecidableEq σcf] [Fintype σct] [DecidableEq σct]
+    [Fintype σv] [DecidableEq σv] [Fintype σn] [DecidableEq σn]
+    [Fintype σa] [DecidableEq σa] [Fintype σo] [DecidableEq σo]
+    (Mcf : DTM σcf) (Mct : DTM σct) (Mv : DTM σv) (Mn : DTM σn)
+    (Ma : DTM σa) (Mo : DTM σo) (suffix : Word) :
+    Dstep (DDescDispatchTM Mcf Mct Mv Mn Ma Mo)
+      { state := DDescDispatchState.entryF, input := suffix,
+        head := suffix.length + 1, output := suffix,
+        work := fun _ : Nat => false, workHead := 0 } =
+      liftDispatch DDescDispatchState.cF (Dinit Mcf suffix) := by
+  simp [Dstep, Dinit, liftDispatch, DDescDispatchTM,
+    DDescDispatchTM.entryAction, DDescDispatchTM.idleAction,
+    DDescDispatchState.entryF, DDescDispatchState.entryT,
+    DDescDispatchState.entryV, DDescDispatchState.entryN,
+    DDescDispatchState.entryA, DDescDispatchState.entryO,
+    DDescDispatchState.cF, DDescDispatchState.cT,
+    DDescDispatchState.cV, DDescDispatchState.cN,
+    DDescDispatchState.cA, DDescDispatchState.cO,
+    DDescDispatchState.tag]
+
+lemma Dstep_DDescDispatchTM_entryT
+    {σcf σct σv σn σa σo : Type}
+    [Fintype σcf] [DecidableEq σcf] [Fintype σct] [DecidableEq σct]
+    [Fintype σv] [DecidableEq σv] [Fintype σn] [DecidableEq σn]
+    [Fintype σa] [DecidableEq σa] [Fintype σo] [DecidableEq σo]
+    (Mcf : DTM σcf) (Mct : DTM σct) (Mv : DTM σv) (Mn : DTM σn)
+    (Ma : DTM σa) (Mo : DTM σo) (suffix : Word) :
+    Dstep (DDescDispatchTM Mcf Mct Mv Mn Ma Mo)
+      { state := DDescDispatchState.entryT, input := suffix,
+        head := suffix.length + 1, output := suffix,
+        work := fun _ : Nat => false, workHead := 0 } =
+      liftDispatch DDescDispatchState.cT (Dinit Mct suffix) := by
+  simp [Dstep, Dinit, liftDispatch, DDescDispatchTM,
+    DDescDispatchTM.entryAction, DDescDispatchTM.idleAction,
+    DDescDispatchState.entryF, DDescDispatchState.entryT,
+    DDescDispatchState.entryV, DDescDispatchState.entryN,
+    DDescDispatchState.entryA, DDescDispatchState.entryO,
+    DDescDispatchState.cF, DDescDispatchState.cT,
+    DDescDispatchState.cV, DDescDispatchState.cN,
+    DDescDispatchState.cA, DDescDispatchState.cO,
+    DDescDispatchState.tag]
+
+lemma Dstep_DDescDispatchTM_entryV
+    {σcf σct σv σn σa σo : Type}
+    [Fintype σcf] [DecidableEq σcf] [Fintype σct] [DecidableEq σct]
+    [Fintype σv] [DecidableEq σv] [Fintype σn] [DecidableEq σn]
+    [Fintype σa] [DecidableEq σa] [Fintype σo] [DecidableEq σo]
+    (Mcf : DTM σcf) (Mct : DTM σct) (Mv : DTM σv) (Mn : DTM σn)
+    (Ma : DTM σa) (Mo : DTM σo) (suffix : Word) :
+    Dstep (DDescDispatchTM Mcf Mct Mv Mn Ma Mo)
+      { state := DDescDispatchState.entryV, input := suffix,
+        head := suffix.length + 1, output := suffix,
+        work := fun _ : Nat => false, workHead := 0 } =
+      liftDispatch DDescDispatchState.cV (Dinit Mv suffix) := by
+  simp [Dstep, Dinit, liftDispatch, DDescDispatchTM,
+    DDescDispatchTM.entryAction, DDescDispatchTM.idleAction,
+    DDescDispatchState.entryF, DDescDispatchState.entryT,
+    DDescDispatchState.entryV, DDescDispatchState.entryN,
+    DDescDispatchState.entryA, DDescDispatchState.entryO,
+    DDescDispatchState.cF, DDescDispatchState.cT,
+    DDescDispatchState.cV, DDescDispatchState.cN,
+    DDescDispatchState.cA, DDescDispatchState.cO,
+    DDescDispatchState.tag]
+
+lemma Dstep_DDescDispatchTM_entryN
+    {σcf σct σv σn σa σo : Type}
+    [Fintype σcf] [DecidableEq σcf] [Fintype σct] [DecidableEq σct]
+    [Fintype σv] [DecidableEq σv] [Fintype σn] [DecidableEq σn]
+    [Fintype σa] [DecidableEq σa] [Fintype σo] [DecidableEq σo]
+    (Mcf : DTM σcf) (Mct : DTM σct) (Mv : DTM σv) (Mn : DTM σn)
+    (Ma : DTM σa) (Mo : DTM σo) (suffix : Word) :
+    Dstep (DDescDispatchTM Mcf Mct Mv Mn Ma Mo)
+      { state := DDescDispatchState.entryN, input := suffix,
+        head := suffix.length + 1, output := suffix,
+        work := fun _ : Nat => false, workHead := 0 } =
+      liftDispatch DDescDispatchState.cN (Dinit Mn suffix) := by
+  simp [Dstep, Dinit, liftDispatch, DDescDispatchTM,
+    DDescDispatchTM.entryAction, DDescDispatchTM.idleAction,
+    DDescDispatchState.entryF, DDescDispatchState.entryT,
+    DDescDispatchState.entryV, DDescDispatchState.entryN,
+    DDescDispatchState.entryA, DDescDispatchState.entryO,
+    DDescDispatchState.cF, DDescDispatchState.cT,
+    DDescDispatchState.cV, DDescDispatchState.cN,
+    DDescDispatchState.cA, DDescDispatchState.cO,
+    DDescDispatchState.tag]
+
+lemma Dstep_DDescDispatchTM_entryA
+    {σcf σct σv σn σa σo : Type}
+    [Fintype σcf] [DecidableEq σcf] [Fintype σct] [DecidableEq σct]
+    [Fintype σv] [DecidableEq σv] [Fintype σn] [DecidableEq σn]
+    [Fintype σa] [DecidableEq σa] [Fintype σo] [DecidableEq σo]
+    (Mcf : DTM σcf) (Mct : DTM σct) (Mv : DTM σv) (Mn : DTM σn)
+    (Ma : DTM σa) (Mo : DTM σo) (suffix : Word) :
+    Dstep (DDescDispatchTM Mcf Mct Mv Mn Ma Mo)
+      { state := DDescDispatchState.entryA, input := suffix,
+        head := suffix.length + 1, output := suffix,
+        work := fun _ : Nat => false, workHead := 0 } =
+      liftDispatch DDescDispatchState.cA (Dinit Ma suffix) := by
+  simp [Dstep, Dinit, liftDispatch, DDescDispatchTM,
+    DDescDispatchTM.entryAction, DDescDispatchTM.idleAction,
+    DDescDispatchState.entryF, DDescDispatchState.entryT,
+    DDescDispatchState.entryV, DDescDispatchState.entryN,
+    DDescDispatchState.entryA, DDescDispatchState.entryO,
+    DDescDispatchState.cF, DDescDispatchState.cT,
+    DDescDispatchState.cV, DDescDispatchState.cN,
+    DDescDispatchState.cA, DDescDispatchState.cO,
+    DDescDispatchState.tag]
+
+lemma Dstep_DDescDispatchTM_entryO
+    {σcf σct σv σn σa σo : Type}
+    [Fintype σcf] [DecidableEq σcf] [Fintype σct] [DecidableEq σct]
+    [Fintype σv] [DecidableEq σv] [Fintype σn] [DecidableEq σn]
+    [Fintype σa] [DecidableEq σa] [Fintype σo] [DecidableEq σo]
+    (Mcf : DTM σcf) (Mct : DTM σct) (Mv : DTM σv) (Mn : DTM σn)
+    (Ma : DTM σa) (Mo : DTM σo) (suffix : Word) :
+    Dstep (DDescDispatchTM Mcf Mct Mv Mn Ma Mo)
+      { state := DDescDispatchState.entryO, input := suffix,
+        head := suffix.length + 1, output := suffix,
+        work := fun _ : Nat => false, workHead := 0 } =
+      liftDispatch DDescDispatchState.cO (Dinit Mo suffix) := by
+  simp [Dstep, Dinit, liftDispatch, DDescDispatchTM,
+    DDescDispatchTM.entryAction, DDescDispatchTM.idleAction,
+    DDescDispatchState.entryF, DDescDispatchState.entryT,
+    DDescDispatchState.entryV, DDescDispatchState.entryN,
+    DDescDispatchState.entryA, DDescDispatchState.entryO,
+    DDescDispatchState.cF, DDescDispatchState.cT,
+    DDescDispatchState.cV, DDescDispatchState.cN,
+    DDescDispatchState.cA, DDescDispatchState.cO,
+    DDescDispatchState.tag]
+
+
+
+-- ---------------------------------------------------------------------------
+-- Running a dispatcher branch after entry handoff.
+--
+-- All facts below are proved from the definitions of `DDescDispatchTM` and
+-- `DDescDispatchBranchAction`; no machine internals are used.  The generic
+-- lemmas simply feed the constructor facts into the already verified
+-- `Drun_DDescDispatchTM_branch`.
+-- ---------------------------------------------------------------------------
+
+lemma Dinit_not_halted_of_start_ne {σ : Type} [Fintype σ] [DecidableEq σ]
+    (M : DTM σ) (x : Word)
+    (hacc : M.start ≠ M.accept) (hrej : M.start ≠ M.reject) :
+    Dhalted M (Dinit M x) = false := by
+  simp [Dhalted, Dinit, hacc, hrej]
+
+lemma DDescDispatchTM_step_cF
+    {σcf σct σv σn σa σo : Type}
+    [Fintype σcf] [DecidableEq σcf] [Fintype σct] [DecidableEq σct]
+    [Fintype σv] [DecidableEq σv] [Fintype σn] [DecidableEq σn]
+    [Fintype σa] [DecidableEq σa] [Fintype σo] [DecidableEq σo]
+    (Mcf : DTM σcf) (Mct : DTM σct) (Mv : DTM σv) (Mn : DTM σn)
+    (Ma : DTM σa) (Mo : DTM σo) :
+    ∀ q sym wsym,
+      (DDescDispatchTM Mcf Mct Mv Mn Ma Mo).step (DDescDispatchState.cF q) sym wsym =
+        DDescDispatchBranchAction Mcf DDescDispatchState.cF
+          DDescDispatchState.done DDescDispatchState.reject q sym wsym := by
+  intro q sym wsym
+  rfl
+
+lemma DDescDispatchTM_step_cT
+    {σcf σct σv σn σa σo : Type}
+    [Fintype σcf] [DecidableEq σcf] [Fintype σct] [DecidableEq σct]
+    [Fintype σv] [DecidableEq σv] [Fintype σn] [DecidableEq σn]
+    [Fintype σa] [DecidableEq σa] [Fintype σo] [DecidableEq σo]
+    (Mcf : DTM σcf) (Mct : DTM σct) (Mv : DTM σv) (Mn : DTM σn)
+    (Ma : DTM σa) (Mo : DTM σo) :
+    ∀ q sym wsym,
+      (DDescDispatchTM Mcf Mct Mv Mn Ma Mo).step (DDescDispatchState.cT q) sym wsym =
+        DDescDispatchBranchAction Mct DDescDispatchState.cT
+          DDescDispatchState.done DDescDispatchState.reject q sym wsym := by
+  intro q sym wsym
+  rfl
+
+lemma DDescDispatchTM_step_cV
+    {σcf σct σv σn σa σo : Type}
+    [Fintype σcf] [DecidableEq σcf] [Fintype σct] [DecidableEq σct]
+    [Fintype σv] [DecidableEq σv] [Fintype σn] [DecidableEq σn]
+    [Fintype σa] [DecidableEq σa] [Fintype σo] [DecidableEq σo]
+    (Mcf : DTM σcf) (Mct : DTM σct) (Mv : DTM σv) (Mn : DTM σn)
+    (Ma : DTM σa) (Mo : DTM σo) :
+    ∀ q sym wsym,
+      (DDescDispatchTM Mcf Mct Mv Mn Ma Mo).step (DDescDispatchState.cV q) sym wsym =
+        DDescDispatchBranchAction Mv DDescDispatchState.cV
+          DDescDispatchState.done DDescDispatchState.reject q sym wsym := by
+  intro q sym wsym
+  rfl
+
+lemma DDescDispatchTM_step_cN
+    {σcf σct σv σn σa σo : Type}
+    [Fintype σcf] [DecidableEq σcf] [Fintype σct] [DecidableEq σct]
+    [Fintype σv] [DecidableEq σv] [Fintype σn] [DecidableEq σn]
+    [Fintype σa] [DecidableEq σa] [Fintype σo] [DecidableEq σo]
+    (Mcf : DTM σcf) (Mct : DTM σct) (Mv : DTM σv) (Mn : DTM σn)
+    (Ma : DTM σa) (Mo : DTM σo) :
+    ∀ q sym wsym,
+      (DDescDispatchTM Mcf Mct Mv Mn Ma Mo).step (DDescDispatchState.cN q) sym wsym =
+        DDescDispatchBranchAction Mn DDescDispatchState.cN
+          DDescDispatchState.done DDescDispatchState.reject q sym wsym := by
+  intro q sym wsym
+  rfl
+
+lemma DDescDispatchTM_step_cA
+    {σcf σct σv σn σa σo : Type}
+    [Fintype σcf] [DecidableEq σcf] [Fintype σct] [DecidableEq σct]
+    [Fintype σv] [DecidableEq σv] [Fintype σn] [DecidableEq σn]
+    [Fintype σa] [DecidableEq σa] [Fintype σo] [DecidableEq σo]
+    (Mcf : DTM σcf) (Mct : DTM σct) (Mv : DTM σv) (Mn : DTM σn)
+    (Ma : DTM σa) (Mo : DTM σo) :
+    ∀ q sym wsym,
+      (DDescDispatchTM Mcf Mct Mv Mn Ma Mo).step (DDescDispatchState.cA q) sym wsym =
+        DDescDispatchBranchAction Ma DDescDispatchState.cA
+          DDescDispatchState.done DDescDispatchState.reject q sym wsym := by
+  intro q sym wsym
+  rfl
+
+lemma DDescDispatchTM_step_cO
+    {σcf σct σv σn σa σo : Type}
+    [Fintype σcf] [DecidableEq σcf] [Fintype σct] [DecidableEq σct]
+    [Fintype σv] [DecidableEq σv] [Fintype σn] [DecidableEq σn]
+    [Fintype σa] [DecidableEq σa] [Fintype σo] [DecidableEq σo]
+    (Mcf : DTM σcf) (Mct : DTM σct) (Mv : DTM σv) (Mn : DTM σn)
+    (Ma : DTM σa) (Mo : DTM σo) :
+    ∀ q sym wsym,
+      (DDescDispatchTM Mcf Mct Mv Mn Ma Mo).step (DDescDispatchState.cO q) sym wsym =
+        DDescDispatchBranchAction Mo DDescDispatchState.cO
+          DDescDispatchState.done DDescDispatchState.reject q sym wsym := by
+  intro q sym wsym
+  rfl
+
+lemma DDescDispatchTM_handoff_cF
+    {σcf σct σv σn σa σo : Type}
+    [Fintype σcf] [DecidableEq σcf] [Fintype σct] [DecidableEq σct]
+    [Fintype σv] [DecidableEq σv] [Fintype σn] [DecidableEq σn]
+    [Fintype σa] [DecidableEq σa] [Fintype σo] [DecidableEq σo]
+    (Mcf : DTM σcf) (Mct : DTM σct) (Mv : DTM σv) (Mn : DTM σn)
+    (Ma : DTM σa) (Mo : DTM σo) :
+    ∀ q, (DDescDispatchTM Mcf Mct Mv Mn Ma Mo).handoff (DDescDispatchState.cF q) = false := by
+  intro q
+  rfl
+
+lemma DDescDispatchTM_handoff_cT
+    {σcf σct σv σn σa σo : Type}
+    [Fintype σcf] [DecidableEq σcf] [Fintype σct] [DecidableEq σct]
+    [Fintype σv] [DecidableEq σv] [Fintype σn] [DecidableEq σn]
+    [Fintype σa] [DecidableEq σa] [Fintype σo] [DecidableEq σo]
+    (Mcf : DTM σcf) (Mct : DTM σct) (Mv : DTM σv) (Mn : DTM σn)
+    (Ma : DTM σa) (Mo : DTM σo) :
+    ∀ q, (DDescDispatchTM Mcf Mct Mv Mn Ma Mo).handoff (DDescDispatchState.cT q) = false := by
+  intro q
+  rfl
+
+lemma DDescDispatchTM_handoff_cV
+    {σcf σct σv σn σa σo : Type}
+    [Fintype σcf] [DecidableEq σcf] [Fintype σct] [DecidableEq σct]
+    [Fintype σv] [DecidableEq σv] [Fintype σn] [DecidableEq σn]
+    [Fintype σa] [DecidableEq σa] [Fintype σo] [DecidableEq σo]
+    (Mcf : DTM σcf) (Mct : DTM σct) (Mv : DTM σv) (Mn : DTM σn)
+    (Ma : DTM σa) (Mo : DTM σo) :
+    ∀ q, (DDescDispatchTM Mcf Mct Mv Mn Ma Mo).handoff (DDescDispatchState.cV q) = false := by
+  intro q
+  rfl
+
+lemma DDescDispatchTM_handoff_cN
+    {σcf σct σv σn σa σo : Type}
+    [Fintype σcf] [DecidableEq σcf] [Fintype σct] [DecidableEq σct]
+    [Fintype σv] [DecidableEq σv] [Fintype σn] [DecidableEq σn]
+    [Fintype σa] [DecidableEq σa] [Fintype σo] [DecidableEq σo]
+    (Mcf : DTM σcf) (Mct : DTM σct) (Mv : DTM σv) (Mn : DTM σn)
+    (Ma : DTM σa) (Mo : DTM σo) :
+    ∀ q, (DDescDispatchTM Mcf Mct Mv Mn Ma Mo).handoff (DDescDispatchState.cN q) = false := by
+  intro q
+  rfl
+
+lemma DDescDispatchTM_handoff_cA
+    {σcf σct σv σn σa σo : Type}
+    [Fintype σcf] [DecidableEq σcf] [Fintype σct] [DecidableEq σct]
+    [Fintype σv] [DecidableEq σv] [Fintype σn] [DecidableEq σn]
+    [Fintype σa] [DecidableEq σa] [Fintype σo] [DecidableEq σo]
+    (Mcf : DTM σcf) (Mct : DTM σct) (Mv : DTM σv) (Mn : DTM σn)
+    (Ma : DTM σa) (Mo : DTM σo) :
+    ∀ q, (DDescDispatchTM Mcf Mct Mv Mn Ma Mo).handoff (DDescDispatchState.cA q) = false := by
+  intro q
+  rfl
+
+lemma DDescDispatchTM_handoff_cO
+    {σcf σct σv σn σa σo : Type}
+    [Fintype σcf] [DecidableEq σcf] [Fintype σct] [DecidableEq σct]
+    [Fintype σv] [DecidableEq σv] [Fintype σn] [DecidableEq σn]
+    [Fintype σa] [DecidableEq σa] [Fintype σo] [DecidableEq σo]
+    (Mcf : DTM σcf) (Mct : DTM σct) (Mv : DTM σv) (Mn : DTM σn)
+    (Ma : DTM σa) (Mo : DTM σo) :
+    ∀ q, (DDescDispatchTM Mcf Mct Mv Mn Ma Mo).handoff (DDescDispatchState.cO q) = false := by
+  intro q
+  rfl
+
+lemma DDescDispatchTM_headReset_cF
+    {σcf σct σv σn σa σo : Type}
+    [Fintype σcf] [DecidableEq σcf] [Fintype σct] [DecidableEq σct]
+    [Fintype σv] [DecidableEq σv] [Fintype σn] [DecidableEq σn]
+    [Fintype σa] [DecidableEq σa] [Fintype σo] [DecidableEq σo]
+    (Mcf : DTM σcf) (Mct : DTM σct) (Mv : DTM σv) (Mn : DTM σn)
+    (Ma : DTM σa) (Mo : DTM σo) :
+    ∀ q, (DDescDispatchTM Mcf Mct Mv Mn Ma Mo).headReset (DDescDispatchState.cF q) =
+      Mcf.headReset q := by
+  intro q
+  rfl
+
+lemma DDescDispatchTM_headReset_cT
+    {σcf σct σv σn σa σo : Type}
+    [Fintype σcf] [DecidableEq σcf] [Fintype σct] [DecidableEq σct]
+    [Fintype σv] [DecidableEq σv] [Fintype σn] [DecidableEq σn]
+    [Fintype σa] [DecidableEq σa] [Fintype σo] [DecidableEq σo]
+    (Mcf : DTM σcf) (Mct : DTM σct) (Mv : DTM σv) (Mn : DTM σn)
+    (Ma : DTM σa) (Mo : DTM σo) :
+    ∀ q, (DDescDispatchTM Mcf Mct Mv Mn Ma Mo).headReset (DDescDispatchState.cT q) =
+      Mct.headReset q := by
+  intro q
+  rfl
+
+lemma DDescDispatchTM_headReset_cV
+    {σcf σct σv σn σa σo : Type}
+    [Fintype σcf] [DecidableEq σcf] [Fintype σct] [DecidableEq σct]
+    [Fintype σv] [DecidableEq σv] [Fintype σn] [DecidableEq σn]
+    [Fintype σa] [DecidableEq σa] [Fintype σo] [DecidableEq σo]
+    (Mcf : DTM σcf) (Mct : DTM σct) (Mv : DTM σv) (Mn : DTM σn)
+    (Ma : DTM σa) (Mo : DTM σo) :
+    ∀ q, (DDescDispatchTM Mcf Mct Mv Mn Ma Mo).headReset (DDescDispatchState.cV q) =
+      Mv.headReset q := by
+  intro q
+  rfl
+
+lemma DDescDispatchTM_headReset_cN
+    {σcf σct σv σn σa σo : Type}
+    [Fintype σcf] [DecidableEq σcf] [Fintype σct] [DecidableEq σct]
+    [Fintype σv] [DecidableEq σv] [Fintype σn] [DecidableEq σn]
+    [Fintype σa] [DecidableEq σa] [Fintype σo] [DecidableEq σo]
+    (Mcf : DTM σcf) (Mct : DTM σct) (Mv : DTM σv) (Mn : DTM σn)
+    (Ma : DTM σa) (Mo : DTM σo) :
+    ∀ q, (DDescDispatchTM Mcf Mct Mv Mn Ma Mo).headReset (DDescDispatchState.cN q) =
+      Mn.headReset q := by
+  intro q
+  rfl
+
+lemma DDescDispatchTM_headReset_cA
+    {σcf σct σv σn σa σo : Type}
+    [Fintype σcf] [DecidableEq σcf] [Fintype σct] [DecidableEq σct]
+    [Fintype σv] [DecidableEq σv] [Fintype σn] [DecidableEq σn]
+    [Fintype σa] [DecidableEq σa] [Fintype σo] [DecidableEq σo]
+    (Mcf : DTM σcf) (Mct : DTM σct) (Mv : DTM σv) (Mn : DTM σn)
+    (Ma : DTM σa) (Mo : DTM σo) :
+    ∀ q, (DDescDispatchTM Mcf Mct Mv Mn Ma Mo).headReset (DDescDispatchState.cA q) =
+      Ma.headReset q := by
+  intro q
+  rfl
+
+lemma DDescDispatchTM_headReset_cO
+    {σcf σct σv σn σa σo : Type}
+    [Fintype σcf] [DecidableEq σcf] [Fintype σct] [DecidableEq σct]
+    [Fintype σv] [DecidableEq σv] [Fintype σn] [DecidableEq σn]
+    [Fintype σa] [DecidableEq σa] [Fintype σo] [DecidableEq σo]
+    (Mcf : DTM σcf) (Mct : DTM σct) (Mv : DTM σv) (Mn : DTM σn)
+    (Ma : DTM σa) (Mo : DTM σo) :
+    ∀ q, (DDescDispatchTM Mcf Mct Mv Mn Ma Mo).headReset (DDescDispatchState.cO q) =
+      Mo.headReset q := by
+  intro q
+  rfl
+
+lemma DDescDispatchTM_cF_ne_done_reject
+    {σcf σct σv σn σa σo : Type} (q : σcf) :
+    (DDescDispatchState.cF q :
+      DDescDispatchState σcf σct σv σn σa σo) ≠ DDescDispatchState.done ∧
+    (DDescDispatchState.cF q :
+      DDescDispatchState σcf σct σv σn σa σo) ≠ DDescDispatchState.reject := by
+  constructor <;> intro h <;> cases h
+
+lemma DDescDispatchTM_cT_ne_done_reject
+    {σcf σct σv σn σa σo : Type} (q : σct) :
+    (DDescDispatchState.cT q :
+      DDescDispatchState σcf σct σv σn σa σo) ≠ DDescDispatchState.done ∧
+    (DDescDispatchState.cT q :
+      DDescDispatchState σcf σct σv σn σa σo) ≠ DDescDispatchState.reject := by
+  constructor <;> intro h <;> cases h
+
+lemma DDescDispatchTM_cV_ne_done_reject
+    {σcf σct σv σn σa σo : Type} (q : σv) :
+    (DDescDispatchState.cV q :
+      DDescDispatchState σcf σct σv σn σa σo) ≠ DDescDispatchState.done ∧
+    (DDescDispatchState.cV q :
+      DDescDispatchState σcf σct σv σn σa σo) ≠ DDescDispatchState.reject := by
+  constructor <;> intro h <;> cases h
+
+lemma DDescDispatchTM_cN_ne_done_reject
+    {σcf σct σv σn σa σo : Type} (q : σn) :
+    (DDescDispatchState.cN q :
+      DDescDispatchState σcf σct σv σn σa σo) ≠ DDescDispatchState.done ∧
+    (DDescDispatchState.cN q :
+      DDescDispatchState σcf σct σv σn σa σo) ≠ DDescDispatchState.reject := by
+  constructor <;> intro h <;> cases h
+
+lemma DDescDispatchTM_cA_ne_done_reject
+    {σcf σct σv σn σa σo : Type} (q : σa) :
+    (DDescDispatchState.cA q :
+      DDescDispatchState σcf σct σv σn σa σo) ≠ DDescDispatchState.done ∧
+    (DDescDispatchState.cA q :
+      DDescDispatchState σcf σct σv σn σa σo) ≠ DDescDispatchState.reject := by
+  constructor <;> intro h <;> cases h
+
+lemma DDescDispatchTM_cO_ne_done_reject
+    {σcf σct σv σn σa σo : Type} (q : σo) :
+    (DDescDispatchState.cO q :
+      DDescDispatchState σcf σct σv σn σa σo) ≠ DDescDispatchState.done ∧
+    (DDescDispatchState.cO q :
+      DDescDispatchState σcf σct σv σn σa σo) ≠ DDescDispatchState.reject := by
+  constructor <;> intro h <;> cases h
+
+lemma DDescDispatchTM_accept_eq
+    {σcf σct σv σn σa σo : Type}
+    [Fintype σcf] [DecidableEq σcf] [Fintype σct] [DecidableEq σct]
+    [Fintype σv] [DecidableEq σv] [Fintype σn] [DecidableEq σn]
+    [Fintype σa] [DecidableEq σa] [Fintype σo] [DecidableEq σo]
+    (Mcf : DTM σcf) (Mct : DTM σct) (Mv : DTM σv) (Mn : DTM σn)
+    (Ma : DTM σa) (Mo : DTM σo) :
+    (DDescDispatchTM Mcf Mct Mv Mn Ma Mo).accept = DDescDispatchState.done := by
+  rfl
+
+lemma DDescDispatchTM_reject_eq
+    {σcf σct σv σn σa σo : Type}
+    [Fintype σcf] [DecidableEq σcf] [Fintype σct] [DecidableEq σct]
+    [Fintype σv] [DecidableEq σv] [Fintype σn] [DecidableEq σn]
+    [Fintype σa] [DecidableEq σa] [Fintype σo] [DecidableEq σo]
+    (Mcf : DTM σcf) (Mct : DTM σct) (Mv : DTM σv) (Mn : DTM σn)
+    (Ma : DTM σa) (Mo : DTM σo) :
+    (DDescDispatchTM Mcf Mct Mv Mn Ma Mo).reject = DDescDispatchState.reject := by
+  rfl
+
+lemma haltLiftDispatch_output_eq {σ S : Type} [Fintype σ] [DecidableEq σ]
+    (M : DTM σ) (doneS rejectS : S) (c : DConfig σ) :
+    (haltLiftDispatch M doneS rejectS c).output = c.output := by
+  rfl
+
+lemma Dhalted_haltLiftDispatch {σ S : Type} [Fintype σ] [DecidableEq σ]
+    [Fintype S] [DecidableEq S]
+    (M : DTM σ) (doneS rejectS : S) (D : DTM S)
+    (hDacc : D.accept = doneS) (hDrej : D.reject = rejectS)
+    (c : DConfig σ) (hc : Dhalted M c = true) :
+    Dhalted D (haltLiftDispatch M doneS rejectS c) = true := by
+  have hstate : c.state = M.accept ∨ c.state = M.reject := by
+    have hh := hc
+    simp [Dhalted] at hh
+    exact hh
+  rcases hstate with hacc | hrej
+  · simp [haltLiftDispatch, Dhalted, hacc, hDacc, hDrej]
+  · by_cases heq : M.reject = M.accept
+    · have hsacc : c.state = M.accept := by
+        simpa [heq] using hrej
+      simp [haltLiftDispatch, Dhalted, hsacc, hDacc, hDrej]
+    · simp [haltLiftDispatch, Dhalted, heq, hrej, hDrej]
+
+lemma Drun_liftDispatch_of_halted {σ S : Type}
+    [Fintype σ] [DecidableEq σ] [Fintype S] [DecidableEq S]
+    (D : DTM S) (M : DTM σ) (ctor : σ → S) (doneS rejectS : S)
+    (hstep : ∀ q sym wsym, D.step (ctor q) sym wsym =
+      DDescDispatchBranchAction M ctor doneS rejectS q sym wsym)
+    (hhand : ∀ q, D.handoff (ctor q) = false)
+    (hreset : ∀ q, D.headReset (ctor q) = M.headReset q)
+    (hno : ∀ q, M.handoff q = false)
+    (hcf : ∀ q, ctor q ≠ doneS) (hcr : ∀ q, ctor q ≠ rejectS)
+    (hDacc : D.accept = doneS) (hDrej : D.reject = rejectS)
+    (t : Nat) (c : DConfig σ)
+    (hc0 : Dhalted M c = false) (hct : Dhalted M (Drun M t c) = true) :
+    Drun D t (liftDispatch ctor c) =
+      haltLiftDispatch M doneS rejectS (Drun M t c) := by
+  rw [Drun_DDescDispatchTM_branch D M ctor doneS rejectS
+    hstep hhand hreset hno hcf hcr hDacc hDrej t c hc0]
+  simp [hct]
+
+lemma Drun_liftDispatch_of_haltsWithin {σ S : Type}
+    [Fintype σ] [DecidableEq σ] [Fintype S] [DecidableEq S]
+    (D : DTM S) (M : DTM σ) (ctor : σ → S) (doneS rejectS : S)
+    (hstep : ∀ q sym wsym, D.step (ctor q) sym wsym =
+      DDescDispatchBranchAction M ctor doneS rejectS q sym wsym)
+    (hhand : ∀ q, D.handoff (ctor q) = false)
+    (hreset : ∀ q, D.headReset (ctor q) = M.headReset q)
+    (hno : ∀ q, M.handoff q = false)
+    (hcf : ∀ q, ctor q ≠ doneS) (hcr : ∀ q, ctor q ≠ rejectS)
+    (hDacc : D.accept = doneS) (hDrej : D.reject = rejectS)
+    {s t : Nat} (hst : s ≤ t) (c : DConfig σ)
+    (hc0 : Dhalted M c = false)
+    (hs : Dhalted M (Drun M s c) = true) :
+    Drun D t (liftDispatch ctor c) =
+      haltLiftDispatch M doneS rejectS (Drun M t c) := by
+  apply Drun_liftDispatch_of_halted D M ctor doneS rejectS
+    hstep hhand hreset hno hcf hcr hDacc hDrej t c hc0
+  rw [Drun_eq_of_halted_within M c hst hs]
+  exact hs
+
+lemma Drun_liftDispatch_haltsWithin_halted_and_output {σ S : Type}
+    [Fintype σ] [DecidableEq σ] [Fintype S] [DecidableEq S]
+    (D : DTM S) (M : DTM σ) (ctor : σ → S) (doneS rejectS : S)
+    (hstep : ∀ q sym wsym, D.step (ctor q) sym wsym =
+      DDescDispatchBranchAction M ctor doneS rejectS q sym wsym)
+    (hhand : ∀ q, D.handoff (ctor q) = false)
+    (hreset : ∀ q, D.headReset (ctor q) = M.headReset q)
+    (hno : ∀ q, M.handoff q = false)
+    (hcf : ∀ q, ctor q ≠ doneS) (hcr : ∀ q, ctor q ≠ rejectS)
+    (hDacc : D.accept = doneS) (hDrej : D.reject = rejectS)
+    {s t : Nat} (hst : s ≤ t) (c : DConfig σ)
+    (hc0 : Dhalted M c = false)
+    (hs : Dhalted M (Drun M s c) = true) :
+    Dhalted D (Drun D t (liftDispatch ctor c)) = true ∧
+    (Drun D t (liftDispatch ctor c)).output = (Drun M t c).output := by
+  have hct : Dhalted M (Drun M t c) = true := by
+    rw [Drun_eq_of_halted_within M c hst hs]
+    exact hs
+  rw [Drun_liftDispatch_of_halted D M ctor doneS rejectS
+    hstep hhand hreset hno hcf hcr hDacc hDrej t c hc0 hct]
+  constructor
+  · exact Dhalted_haltLiftDispatch M doneS rejectS D hDacc hDrej (Drun M t c) hct
+  · rfl
+
+-- Six specialized wrappers, one per branch constructor.  `hno` is the
+-- `handoff = false` field of `DPolyTimeComputableClean` for the branch machine.
+-- Each wrapper assumes the branch starts unhalted and halts by time `t`.
+
+lemma Drun_DDescDispatchTM_cF_of_halted
+    {σcf σct σv σn σa σo : Type}
+    [Fintype σcf] [DecidableEq σcf] [Fintype σct] [DecidableEq σct]
+    [Fintype σv] [DecidableEq σv] [Fintype σn] [DecidableEq σn]
+    [Fintype σa] [DecidableEq σa] [Fintype σo] [DecidableEq σo]
+    (Mcf : DTM σcf) (Mct : DTM σct) (Mv : DTM σv) (Mn : DTM σn)
+    (Ma : DTM σa) (Mo : DTM σo)
+    (hno : ∀ q, Mcf.handoff q = false)
+    (suffix : Word) (t : Nat)
+    (hstart : Dhalted Mcf (Dinit Mcf suffix) = false)
+    (hhalt : Dhalted Mcf (Drun Mcf t (Dinit Mcf suffix)) = true) :
+    Drun (DDescDispatchTM Mcf Mct Mv Mn Ma Mo) t
+        (liftDispatch DDescDispatchState.cF (Dinit Mcf suffix)) =
+      haltLiftDispatch Mcf DDescDispatchState.done DDescDispatchState.reject
+        (Drun Mcf t (Dinit Mcf suffix)) := by
+  exact Drun_liftDispatch_of_halted (DDescDispatchTM Mcf Mct Mv Mn Ma Mo)
+    Mcf DDescDispatchState.cF DDescDispatchState.done DDescDispatchState.reject
+    (DDescDispatchTM_step_cF Mcf Mct Mv Mn Ma Mo)
+    (DDescDispatchTM_handoff_cF Mcf Mct Mv Mn Ma Mo)
+    (DDescDispatchTM_headReset_cF Mcf Mct Mv Mn Ma Mo) hno
+    (fun q => (DDescDispatchTM_cF_ne_done_reject q).1)
+    (fun q => (DDescDispatchTM_cF_ne_done_reject q).2)
+    (DDescDispatchTM_accept_eq Mcf Mct Mv Mn Ma Mo)
+    (DDescDispatchTM_reject_eq Mcf Mct Mv Mn Ma Mo)
+    t (Dinit Mcf suffix) hstart hhalt
+
+lemma Drun_DDescDispatchTM_cT_of_halted
+    {σcf σct σv σn σa σo : Type}
+    [Fintype σcf] [DecidableEq σcf] [Fintype σct] [DecidableEq σct]
+    [Fintype σv] [DecidableEq σv] [Fintype σn] [DecidableEq σn]
+    [Fintype σa] [DecidableEq σa] [Fintype σo] [DecidableEq σo]
+    (Mcf : DTM σcf) (Mct : DTM σct) (Mv : DTM σv) (Mn : DTM σn)
+    (Ma : DTM σa) (Mo : DTM σo)
+    (hno : ∀ q, Mct.handoff q = false)
+    (suffix : Word) (t : Nat)
+    (hstart : Dhalted Mct (Dinit Mct suffix) = false)
+    (hhalt : Dhalted Mct (Drun Mct t (Dinit Mct suffix)) = true) :
+    Drun (DDescDispatchTM Mcf Mct Mv Mn Ma Mo) t
+        (liftDispatch DDescDispatchState.cT (Dinit Mct suffix)) =
+      haltLiftDispatch Mct DDescDispatchState.done DDescDispatchState.reject
+        (Drun Mct t (Dinit Mct suffix)) := by
+  exact Drun_liftDispatch_of_halted (DDescDispatchTM Mcf Mct Mv Mn Ma Mo)
+    Mct DDescDispatchState.cT DDescDispatchState.done DDescDispatchState.reject
+    (DDescDispatchTM_step_cT Mcf Mct Mv Mn Ma Mo)
+    (DDescDispatchTM_handoff_cT Mcf Mct Mv Mn Ma Mo)
+    (DDescDispatchTM_headReset_cT Mcf Mct Mv Mn Ma Mo) hno
+    (fun q => (DDescDispatchTM_cT_ne_done_reject q).1)
+    (fun q => (DDescDispatchTM_cT_ne_done_reject q).2)
+    (DDescDispatchTM_accept_eq Mcf Mct Mv Mn Ma Mo)
+    (DDescDispatchTM_reject_eq Mcf Mct Mv Mn Ma Mo)
+    t (Dinit Mct suffix) hstart hhalt
+
+lemma Drun_DDescDispatchTM_cV_of_halted
+    {σcf σct σv σn σa σo : Type}
+    [Fintype σcf] [DecidableEq σcf] [Fintype σct] [DecidableEq σct]
+    [Fintype σv] [DecidableEq σv] [Fintype σn] [DecidableEq σn]
+    [Fintype σa] [DecidableEq σa] [Fintype σo] [DecidableEq σo]
+    (Mcf : DTM σcf) (Mct : DTM σct) (Mv : DTM σv) (Mn : DTM σn)
+    (Ma : DTM σa) (Mo : DTM σo)
+    (hno : ∀ q, Mv.handoff q = false)
+    (suffix : Word) (t : Nat)
+    (hstart : Dhalted Mv (Dinit Mv suffix) = false)
+    (hhalt : Dhalted Mv (Drun Mv t (Dinit Mv suffix)) = true) :
+    Drun (DDescDispatchTM Mcf Mct Mv Mn Ma Mo) t
+        (liftDispatch DDescDispatchState.cV (Dinit Mv suffix)) =
+      haltLiftDispatch Mv DDescDispatchState.done DDescDispatchState.reject
+        (Drun Mv t (Dinit Mv suffix)) := by
+  exact Drun_liftDispatch_of_halted (DDescDispatchTM Mcf Mct Mv Mn Ma Mo)
+    Mv DDescDispatchState.cV DDescDispatchState.done DDescDispatchState.reject
+    (DDescDispatchTM_step_cV Mcf Mct Mv Mn Ma Mo)
+    (DDescDispatchTM_handoff_cV Mcf Mct Mv Mn Ma Mo)
+    (DDescDispatchTM_headReset_cV Mcf Mct Mv Mn Ma Mo) hno
+    (fun q => (DDescDispatchTM_cV_ne_done_reject q).1)
+    (fun q => (DDescDispatchTM_cV_ne_done_reject q).2)
+    (DDescDispatchTM_accept_eq Mcf Mct Mv Mn Ma Mo)
+    (DDescDispatchTM_reject_eq Mcf Mct Mv Mn Ma Mo)
+    t (Dinit Mv suffix) hstart hhalt
+
+lemma Drun_DDescDispatchTM_cN_of_halted
+    {σcf σct σv σn σa σo : Type}
+    [Fintype σcf] [DecidableEq σcf] [Fintype σct] [DecidableEq σct]
+    [Fintype σv] [DecidableEq σv] [Fintype σn] [DecidableEq σn]
+    [Fintype σa] [DecidableEq σa] [Fintype σo] [DecidableEq σo]
+    (Mcf : DTM σcf) (Mct : DTM σct) (Mv : DTM σv) (Mn : DTM σn)
+    (Ma : DTM σa) (Mo : DTM σo)
+    (hno : ∀ q, Mn.handoff q = false)
+    (suffix : Word) (t : Nat)
+    (hstart : Dhalted Mn (Dinit Mn suffix) = false)
+    (hhalt : Dhalted Mn (Drun Mn t (Dinit Mn suffix)) = true) :
+    Drun (DDescDispatchTM Mcf Mct Mv Mn Ma Mo) t
+        (liftDispatch DDescDispatchState.cN (Dinit Mn suffix)) =
+      haltLiftDispatch Mn DDescDispatchState.done DDescDispatchState.reject
+        (Drun Mn t (Dinit Mn suffix)) := by
+  exact Drun_liftDispatch_of_halted (DDescDispatchTM Mcf Mct Mv Mn Ma Mo)
+    Mn DDescDispatchState.cN DDescDispatchState.done DDescDispatchState.reject
+    (DDescDispatchTM_step_cN Mcf Mct Mv Mn Ma Mo)
+    (DDescDispatchTM_handoff_cN Mcf Mct Mv Mn Ma Mo)
+    (DDescDispatchTM_headReset_cN Mcf Mct Mv Mn Ma Mo) hno
+    (fun q => (DDescDispatchTM_cN_ne_done_reject q).1)
+    (fun q => (DDescDispatchTM_cN_ne_done_reject q).2)
+    (DDescDispatchTM_accept_eq Mcf Mct Mv Mn Ma Mo)
+    (DDescDispatchTM_reject_eq Mcf Mct Mv Mn Ma Mo)
+    t (Dinit Mn suffix) hstart hhalt
+
+lemma Drun_DDescDispatchTM_cA_of_halted
+    {σcf σct σv σn σa σo : Type}
+    [Fintype σcf] [DecidableEq σcf] [Fintype σct] [DecidableEq σct]
+    [Fintype σv] [DecidableEq σv] [Fintype σn] [DecidableEq σn]
+    [Fintype σa] [DecidableEq σa] [Fintype σo] [DecidableEq σo]
+    (Mcf : DTM σcf) (Mct : DTM σct) (Mv : DTM σv) (Mn : DTM σn)
+    (Ma : DTM σa) (Mo : DTM σo)
+    (hno : ∀ q, Ma.handoff q = false)
+    (suffix : Word) (t : Nat)
+    (hstart : Dhalted Ma (Dinit Ma suffix) = false)
+    (hhalt : Dhalted Ma (Drun Ma t (Dinit Ma suffix)) = true) :
+    Drun (DDescDispatchTM Mcf Mct Mv Mn Ma Mo) t
+        (liftDispatch DDescDispatchState.cA (Dinit Ma suffix)) =
+      haltLiftDispatch Ma DDescDispatchState.done DDescDispatchState.reject
+        (Drun Ma t (Dinit Ma suffix)) := by
+  exact Drun_liftDispatch_of_halted (DDescDispatchTM Mcf Mct Mv Mn Ma Mo)
+    Ma DDescDispatchState.cA DDescDispatchState.done DDescDispatchState.reject
+    (DDescDispatchTM_step_cA Mcf Mct Mv Mn Ma Mo)
+    (DDescDispatchTM_handoff_cA Mcf Mct Mv Mn Ma Mo)
+    (DDescDispatchTM_headReset_cA Mcf Mct Mv Mn Ma Mo) hno
+    (fun q => (DDescDispatchTM_cA_ne_done_reject q).1)
+    (fun q => (DDescDispatchTM_cA_ne_done_reject q).2)
+    (DDescDispatchTM_accept_eq Mcf Mct Mv Mn Ma Mo)
+    (DDescDispatchTM_reject_eq Mcf Mct Mv Mn Ma Mo)
+    t (Dinit Ma suffix) hstart hhalt
+
+lemma Drun_DDescDispatchTM_cO_of_halted
+    {σcf σct σv σn σa σo : Type}
+    [Fintype σcf] [DecidableEq σcf] [Fintype σct] [DecidableEq σct]
+    [Fintype σv] [DecidableEq σv] [Fintype σn] [DecidableEq σn]
+    [Fintype σa] [DecidableEq σa] [Fintype σo] [DecidableEq σo]
+    (Mcf : DTM σcf) (Mct : DTM σct) (Mv : DTM σv) (Mn : DTM σn)
+    (Ma : DTM σa) (Mo : DTM σo)
+    (hno : ∀ q, Mo.handoff q = false)
+    (suffix : Word) (t : Nat)
+    (hstart : Dhalted Mo (Dinit Mo suffix) = false)
+    (hhalt : Dhalted Mo (Drun Mo t (Dinit Mo suffix)) = true) :
+    Drun (DDescDispatchTM Mcf Mct Mv Mn Ma Mo) t
+        (liftDispatch DDescDispatchState.cO (Dinit Mo suffix)) =
+      haltLiftDispatch Mo DDescDispatchState.done DDescDispatchState.reject
+        (Drun Mo t (Dinit Mo suffix)) := by
+  exact Drun_liftDispatch_of_halted (DDescDispatchTM Mcf Mct Mv Mn Ma Mo)
+    Mo DDescDispatchState.cO DDescDispatchState.done DDescDispatchState.reject
+    (DDescDispatchTM_step_cO Mcf Mct Mv Mn Ma Mo)
+    (DDescDispatchTM_handoff_cO Mcf Mct Mv Mn Ma Mo)
+    (DDescDispatchTM_headReset_cO Mcf Mct Mv Mn Ma Mo) hno
+    (fun q => (DDescDispatchTM_cO_ne_done_reject q).1)
+    (fun q => (DDescDispatchTM_cO_ne_done_reject q).2)
+    (DDescDispatchTM_accept_eq Mcf Mct Mv Mn Ma Mo)
+    (DDescDispatchTM_reject_eq Mcf Mct Mv Mn Ma Mo)
+    t (Dinit Mo suffix) hstart hhalt
+
+lemma Drun_DDescDispatchTM_cF_of_haltsWithin
+    {σcf σct σv σn σa σo : Type}
+    [Fintype σcf] [DecidableEq σcf] [Fintype σct] [DecidableEq σct]
+    [Fintype σv] [DecidableEq σv] [Fintype σn] [DecidableEq σn]
+    [Fintype σa] [DecidableEq σa] [Fintype σo] [DecidableEq σo]
+    (Mcf : DTM σcf) (Mct : DTM σct) (Mv : DTM σv) (Mn : DTM σn)
+    (Ma : DTM σa) (Mo : DTM σo)
+    (hno : ∀ q, Mcf.handoff q = false)
+    {s t : Nat} (hst : s ≤ t) (suffix : Word)
+    (hstart : Dhalted Mcf (Dinit Mcf suffix) = false)
+    (hs : Dhalted Mcf (Drun Mcf s (Dinit Mcf suffix)) = true) :
+    Drun (DDescDispatchTM Mcf Mct Mv Mn Ma Mo) t
+        (liftDispatch DDescDispatchState.cF (Dinit Mcf suffix)) =
+      haltLiftDispatch Mcf DDescDispatchState.done DDescDispatchState.reject
+        (Drun Mcf t (Dinit Mcf suffix)) := by
+  exact Drun_liftDispatch_of_haltsWithin (DDescDispatchTM Mcf Mct Mv Mn Ma Mo)
+    Mcf DDescDispatchState.cF DDescDispatchState.done DDescDispatchState.reject
+    (DDescDispatchTM_step_cF Mcf Mct Mv Mn Ma Mo)
+    (DDescDispatchTM_handoff_cF Mcf Mct Mv Mn Ma Mo)
+    (DDescDispatchTM_headReset_cF Mcf Mct Mv Mn Ma Mo) hno
+    (fun q => (DDescDispatchTM_cF_ne_done_reject q).1)
+    (fun q => (DDescDispatchTM_cF_ne_done_reject q).2)
+    (DDescDispatchTM_accept_eq Mcf Mct Mv Mn Ma Mo)
+    (DDescDispatchTM_reject_eq Mcf Mct Mv Mn Ma Mo)
+    hst (Dinit Mcf suffix) hstart hs
+
+lemma Drun_DDescDispatchTM_cT_of_haltsWithin
+    {σcf σct σv σn σa σo : Type}
+    [Fintype σcf] [DecidableEq σcf] [Fintype σct] [DecidableEq σct]
+    [Fintype σv] [DecidableEq σv] [Fintype σn] [DecidableEq σn]
+    [Fintype σa] [DecidableEq σa] [Fintype σo] [DecidableEq σo]
+    (Mcf : DTM σcf) (Mct : DTM σct) (Mv : DTM σv) (Mn : DTM σn)
+    (Ma : DTM σa) (Mo : DTM σo)
+    (hno : ∀ q, Mct.handoff q = false)
+    {s t : Nat} (hst : s ≤ t) (suffix : Word)
+    (hstart : Dhalted Mct (Dinit Mct suffix) = false)
+    (hs : Dhalted Mct (Drun Mct s (Dinit Mct suffix)) = true) :
+    Drun (DDescDispatchTM Mcf Mct Mv Mn Ma Mo) t
+        (liftDispatch DDescDispatchState.cT (Dinit Mct suffix)) =
+      haltLiftDispatch Mct DDescDispatchState.done DDescDispatchState.reject
+        (Drun Mct t (Dinit Mct suffix)) := by
+  exact Drun_liftDispatch_of_haltsWithin (DDescDispatchTM Mcf Mct Mv Mn Ma Mo)
+    Mct DDescDispatchState.cT DDescDispatchState.done DDescDispatchState.reject
+    (DDescDispatchTM_step_cT Mcf Mct Mv Mn Ma Mo)
+    (DDescDispatchTM_handoff_cT Mcf Mct Mv Mn Ma Mo)
+    (DDescDispatchTM_headReset_cT Mcf Mct Mv Mn Ma Mo) hno
+    (fun q => (DDescDispatchTM_cT_ne_done_reject q).1)
+    (fun q => (DDescDispatchTM_cT_ne_done_reject q).2)
+    (DDescDispatchTM_accept_eq Mcf Mct Mv Mn Ma Mo)
+    (DDescDispatchTM_reject_eq Mcf Mct Mv Mn Ma Mo)
+    hst (Dinit Mct suffix) hstart hs
+
+lemma Drun_DDescDispatchTM_cV_of_haltsWithin
+    {σcf σct σv σn σa σo : Type}
+    [Fintype σcf] [DecidableEq σcf] [Fintype σct] [DecidableEq σct]
+    [Fintype σv] [DecidableEq σv] [Fintype σn] [DecidableEq σn]
+    [Fintype σa] [DecidableEq σa] [Fintype σo] [DecidableEq σo]
+    (Mcf : DTM σcf) (Mct : DTM σct) (Mv : DTM σv) (Mn : DTM σn)
+    (Ma : DTM σa) (Mo : DTM σo)
+    (hno : ∀ q, Mv.handoff q = false)
+    {s t : Nat} (hst : s ≤ t) (suffix : Word)
+    (hstart : Dhalted Mv (Dinit Mv suffix) = false)
+    (hs : Dhalted Mv (Drun Mv s (Dinit Mv suffix)) = true) :
+    Drun (DDescDispatchTM Mcf Mct Mv Mn Ma Mo) t
+        (liftDispatch DDescDispatchState.cV (Dinit Mv suffix)) =
+      haltLiftDispatch Mv DDescDispatchState.done DDescDispatchState.reject
+        (Drun Mv t (Dinit Mv suffix)) := by
+  exact Drun_liftDispatch_of_haltsWithin (DDescDispatchTM Mcf Mct Mv Mn Ma Mo)
+    Mv DDescDispatchState.cV DDescDispatchState.done DDescDispatchState.reject
+    (DDescDispatchTM_step_cV Mcf Mct Mv Mn Ma Mo)
+    (DDescDispatchTM_handoff_cV Mcf Mct Mv Mn Ma Mo)
+    (DDescDispatchTM_headReset_cV Mcf Mct Mv Mn Ma Mo) hno
+    (fun q => (DDescDispatchTM_cV_ne_done_reject q).1)
+    (fun q => (DDescDispatchTM_cV_ne_done_reject q).2)
+    (DDescDispatchTM_accept_eq Mcf Mct Mv Mn Ma Mo)
+    (DDescDispatchTM_reject_eq Mcf Mct Mv Mn Ma Mo)
+    hst (Dinit Mv suffix) hstart hs
+
+lemma Drun_DDescDispatchTM_cN_of_haltsWithin
+    {σcf σct σv σn σa σo : Type}
+    [Fintype σcf] [DecidableEq σcf] [Fintype σct] [DecidableEq σct]
+    [Fintype σv] [DecidableEq σv] [Fintype σn] [DecidableEq σn]
+    [Fintype σa] [DecidableEq σa] [Fintype σo] [DecidableEq σo]
+    (Mcf : DTM σcf) (Mct : DTM σct) (Mv : DTM σv) (Mn : DTM σn)
+    (Ma : DTM σa) (Mo : DTM σo)
+    (hno : ∀ q, Mn.handoff q = false)
+    {s t : Nat} (hst : s ≤ t) (suffix : Word)
+    (hstart : Dhalted Mn (Dinit Mn suffix) = false)
+    (hs : Dhalted Mn (Drun Mn s (Dinit Mn suffix)) = true) :
+    Drun (DDescDispatchTM Mcf Mct Mv Mn Ma Mo) t
+        (liftDispatch DDescDispatchState.cN (Dinit Mn suffix)) =
+      haltLiftDispatch Mn DDescDispatchState.done DDescDispatchState.reject
+        (Drun Mn t (Dinit Mn suffix)) := by
+  exact Drun_liftDispatch_of_haltsWithin (DDescDispatchTM Mcf Mct Mv Mn Ma Mo)
+    Mn DDescDispatchState.cN DDescDispatchState.done DDescDispatchState.reject
+    (DDescDispatchTM_step_cN Mcf Mct Mv Mn Ma Mo)
+    (DDescDispatchTM_handoff_cN Mcf Mct Mv Mn Ma Mo)
+    (DDescDispatchTM_headReset_cN Mcf Mct Mv Mn Ma Mo) hno
+    (fun q => (DDescDispatchTM_cN_ne_done_reject q).1)
+    (fun q => (DDescDispatchTM_cN_ne_done_reject q).2)
+    (DDescDispatchTM_accept_eq Mcf Mct Mv Mn Ma Mo)
+    (DDescDispatchTM_reject_eq Mcf Mct Mv Mn Ma Mo)
+    hst (Dinit Mn suffix) hstart hs
+
+lemma Drun_DDescDispatchTM_cA_of_haltsWithin
+    {σcf σct σv σn σa σo : Type}
+    [Fintype σcf] [DecidableEq σcf] [Fintype σct] [DecidableEq σct]
+    [Fintype σv] [DecidableEq σv] [Fintype σn] [DecidableEq σn]
+    [Fintype σa] [DecidableEq σa] [Fintype σo] [DecidableEq σo]
+    (Mcf : DTM σcf) (Mct : DTM σct) (Mv : DTM σv) (Mn : DTM σn)
+    (Ma : DTM σa) (Mo : DTM σo)
+    (hno : ∀ q, Ma.handoff q = false)
+    {s t : Nat} (hst : s ≤ t) (suffix : Word)
+    (hstart : Dhalted Ma (Dinit Ma suffix) = false)
+    (hs : Dhalted Ma (Drun Ma s (Dinit Ma suffix)) = true) :
+    Drun (DDescDispatchTM Mcf Mct Mv Mn Ma Mo) t
+        (liftDispatch DDescDispatchState.cA (Dinit Ma suffix)) =
+      haltLiftDispatch Ma DDescDispatchState.done DDescDispatchState.reject
+        (Drun Ma t (Dinit Ma suffix)) := by
+  exact Drun_liftDispatch_of_haltsWithin (DDescDispatchTM Mcf Mct Mv Mn Ma Mo)
+    Ma DDescDispatchState.cA DDescDispatchState.done DDescDispatchState.reject
+    (DDescDispatchTM_step_cA Mcf Mct Mv Mn Ma Mo)
+    (DDescDispatchTM_handoff_cA Mcf Mct Mv Mn Ma Mo)
+    (DDescDispatchTM_headReset_cA Mcf Mct Mv Mn Ma Mo) hno
+    (fun q => (DDescDispatchTM_cA_ne_done_reject q).1)
+    (fun q => (DDescDispatchTM_cA_ne_done_reject q).2)
+    (DDescDispatchTM_accept_eq Mcf Mct Mv Mn Ma Mo)
+    (DDescDispatchTM_reject_eq Mcf Mct Mv Mn Ma Mo)
+    hst (Dinit Ma suffix) hstart hs
+
+lemma Drun_DDescDispatchTM_cO_of_haltsWithin
+    {σcf σct σv σn σa σo : Type}
+    [Fintype σcf] [DecidableEq σcf] [Fintype σct] [DecidableEq σct]
+    [Fintype σv] [DecidableEq σv] [Fintype σn] [DecidableEq σn]
+    [Fintype σa] [DecidableEq σa] [Fintype σo] [DecidableEq σo]
+    (Mcf : DTM σcf) (Mct : DTM σct) (Mv : DTM σv) (Mn : DTM σn)
+    (Ma : DTM σa) (Mo : DTM σo)
+    (hno : ∀ q, Mo.handoff q = false)
+    {s t : Nat} (hst : s ≤ t) (suffix : Word)
+    (hstart : Dhalted Mo (Dinit Mo suffix) = false)
+    (hs : Dhalted Mo (Drun Mo s (Dinit Mo suffix)) = true) :
+    Drun (DDescDispatchTM Mcf Mct Mv Mn Ma Mo) t
+        (liftDispatch DDescDispatchState.cO (Dinit Mo suffix)) =
+      haltLiftDispatch Mo DDescDispatchState.done DDescDispatchState.reject
+        (Drun Mo t (Dinit Mo suffix)) := by
+  exact Drun_liftDispatch_of_haltsWithin (DDescDispatchTM Mcf Mct Mv Mn Ma Mo)
+    Mo DDescDispatchState.cO DDescDispatchState.done DDescDispatchState.reject
+    (DDescDispatchTM_step_cO Mcf Mct Mv Mn Ma Mo)
+    (DDescDispatchTM_handoff_cO Mcf Mct Mv Mn Ma Mo)
+    (DDescDispatchTM_headReset_cO Mcf Mct Mv Mn Ma Mo) hno
+    (fun q => (DDescDispatchTM_cO_ne_done_reject q).1)
+    (fun q => (DDescDispatchTM_cO_ne_done_reject q).2)
+    (DDescDispatchTM_accept_eq Mcf Mct Mv Mn Ma Mo)
+    (DDescDispatchTM_reject_eq Mcf Mct Mv Mn Ma Mo)
+    hst (Dinit Mo suffix) hstart hs
+
+
+-- ---------------------------------------------------------------------------
+-- A uniform length bound for encoded node constraints
+-- ---------------------------------------------------------------------------
+
+lemma nodeConstraintFormula_encode_length_le (d : NodeDesc) :
+    ((nodeConstraintFormula d).encode).length ≤ 100 * (d.maxIndex + 1) := by
+  cases d with
+  | const b a =>
+      cases b <;>
+        simp [nodeConstraintFormula, NodeDesc.maxIndex,
+          Formula.encode_var_eq, Formula.encode_not_eq,
+          Formula.encodeNat_length] <;> omega
+  | var a i =>
+      by_cases hai : a ≤ i
+      · have hm : max a i = i := max_eq_right hai
+        simp [nodeConstraintFormula, NodeDesc.maxIndex, hm,
+          Formula.encode_and_eq, Formula.encode_or_eq,
+          Formula.encode_not_eq, Formula.encode_var_eq,
+          Formula.encodeNat_length]
+        omega
+      · have hia : i ≤ a := by omega
+        have hm : max a i = a := max_eq_left hia
+        simp [nodeConstraintFormula, NodeDesc.maxIndex, hm,
+          Formula.encode_and_eq, Formula.encode_or_eq,
+          Formula.encode_not_eq, Formula.encode_var_eq,
+          Formula.encodeNat_length]
+        omega
+  | not a b =>
+      by_cases hab : a ≤ b
+      · have hm : max a b = b := max_eq_right hab
+        simp [nodeConstraintFormula, NodeDesc.maxIndex, hm,
+          Formula.encode_and_eq, Formula.encode_or_eq,
+          Formula.encode_not_eq, Formula.encode_var_eq,
+          Formula.encodeNat_length]
+        omega
+      · have hba : b ≤ a := by omega
+        have hm : max a b = a := max_eq_left hba
+        simp [nodeConstraintFormula, NodeDesc.maxIndex, hm,
+          Formula.encode_and_eq, Formula.encode_or_eq,
+          Formula.encode_not_eq, Formula.encode_var_eq,
+          Formula.encodeNat_length]
+        omega
+  | and a b c =>
+      by_cases hmc : max a b ≤ c
+      · have hm : max (max a b) c = c := max_eq_right hmc
+        simp [nodeConstraintFormula, NodeDesc.maxIndex, hm,
+          Formula.encode_and_eq, Formula.encode_or_eq,
+          Formula.encode_not_eq, Formula.encode_var_eq,
+          Formula.encodeNat_length]
+        omega
+      · have hcm : c ≤ max a b := by omega
+        have hm : max (max a b) c = max a b := max_eq_left hcm
+        by_cases hab : a ≤ b
+        · have hmab : max a b = b := max_eq_right hab
+          simp [nodeConstraintFormula, NodeDesc.maxIndex, hm, hmab,
+            Formula.encode_and_eq, Formula.encode_or_eq,
+            Formula.encode_not_eq, Formula.encode_var_eq,
+            Formula.encodeNat_length]
+          omega
+        · have hba : b ≤ a := by omega
+          have hmab : max a b = a := max_eq_left hba
+          simp [nodeConstraintFormula, NodeDesc.maxIndex, hm, hmab,
+            Formula.encode_and_eq, Formula.encode_or_eq,
+            Formula.encode_not_eq, Formula.encode_var_eq,
+            Formula.encodeNat_length]
+          omega
+  | or a b c =>
+      by_cases hmc : max a b ≤ c
+      · have hm : max (max a b) c = c := max_eq_right hmc
+        simp [nodeConstraintFormula, NodeDesc.maxIndex, hm,
+          Formula.encode_and_eq, Formula.encode_or_eq,
+          Formula.encode_not_eq, Formula.encode_var_eq,
+          Formula.encodeNat_length]
+        omega
+      · have hcm : c ≤ max a b := by omega
+        have hm : max (max a b) c = max a b := max_eq_left hcm
+        by_cases hab : a ≤ b
+        · have hmab : max a b = b := max_eq_right hab
+          simp [nodeConstraintFormula, NodeDesc.maxIndex, hm, hmab,
+            Formula.encode_and_eq, Formula.encode_or_eq,
+            Formula.encode_not_eq, Formula.encode_var_eq,
+            Formula.encodeNat_length]
+          omega
+        · have hba : b ≤ a := by omega
+          have hmab : max a b = a := max_eq_left hba
+          simp [nodeConstraintFormula, NodeDesc.maxIndex, hm, hmab,
+            Formula.encode_and_eq, Formula.encode_or_eq,
+            Formula.encode_not_eq, Formula.encode_var_eq,
+            Formula.encodeNat_length]
+          omega
+
+lemma NodeDesc.maxIndex_add_one_le_encode_length (d : NodeDesc) :
+    d.maxIndex + 1 ≤ d.encode.length := by
+  cases d <;>
+    simp [NodeDesc.maxIndex, NodeDesc.encode, Formula.encodeNat_length] <;> omega
+
+lemma nodeConstraintFormula_encode_length_le_encode_length (d : NodeDesc) :
+    ((nodeConstraintFormula d).encode).length ≤ 100 * d.encode.length := by
+  have h1 := nodeConstraintFormula_encode_length_le d
+  have h2 := NodeDesc.maxIndex_add_one_le_encode_length d
+  have h3 : 100 * (d.maxIndex + 1) ≤ 100 * d.encode.length := Nat.mul_le_mul_left 100 h2
+  exact h1.trans h3
+
+
+
+-- ---------------------------------------------------------------------------
+-- Helpers for computing `nodeConstraintEncode` with the dispatcher
+-- ---------------------------------------------------------------------------
+
+lemma DPolyTimeComputableClean_nonempty_start_false
+    {f : Word → Word} {σ : Type} [Fintype σ] [DecidableEq σ]
+    (M : DTM σ) (p r : TimeBound)
+    (_hhalt : ∀ x : Word, Dhalted M (Drun M (p.eval x.length) (Dinit M x)) = true)
+    (hout : ∀ x : Word,
+      Dboutput M (p.eval x.length) x = f x ∧ (f x).length ≤ r.eval x.length)
+    (hfne : f [] ≠ []) :
+    Dhalted M (Dinit M []) = false := by
+  by_cases hst : Dhalted M (Dinit M []) = true
+  · have hfrz := Drun_halted M (Dinit M []) (p.eval 0) hst
+    have ho := (hout []).1
+    dsimp [Dboutput] at ho
+    rw [hfrz] at ho
+    simp [Dinit] at ho
+    exact False.elim (hfne ho)
+  · cases hb : Dhalted M (Dinit M []) <;> simp_all
+
+lemma Dinit_not_halted_of_start_false {σ : Type} [Fintype σ] [DecidableEq σ]
+    (M : DTM σ) (x : Word) (h0 : Dhalted M (Dinit M []) = false) :
+    Dhalted M (Dinit M x) = false := by
+  have hacc : M.start ≠ M.accept := by
+    intro h
+    have := h0
+    simp [Dinit, Dhalted, h] at this
+  have hrej : M.start ≠ M.reject := by
+    intro h
+    have := h0
+    simp [Dinit, Dhalted, h] at this
+  exact Dinit_not_halted_of_start_ne M x hacc hrej
+
+lemma Drun_dispatcher_entry_then_branch
+    {σ S : Type} [Fintype σ] [DecidableEq σ] [Fintype S] [DecidableEq S]
+    (D : DTM S) (M : DTM σ) (ctor : σ → S) (doneS rejectS : S)
+    (hstep : ∀ q sym wsym, D.step (ctor q) sym wsym =
+      DDescDispatchBranchAction M ctor doneS rejectS q sym wsym)
+    (hhand : ∀ q, D.handoff (ctor q) = false)
+    (hreset : ∀ q, D.headReset (ctor q) = M.headReset q)
+    (hno : ∀ q, M.handoff q = false)
+    (hcf : ∀ q, ctor q ≠ doneS) (hcr : ∀ q, ctor q ≠ rejectS)
+    (hDacc : D.accept = doneS) (hDrej : D.reject = rejectS)
+    (suffix : Word) (t : Nat) (cfg : DConfig S)
+    (hnot : Dhalted D cfg = false)
+    (hentry : Dstep D cfg = liftDispatch ctor (Dinit M suffix))
+    (hstart : Dhalted M (Dinit M suffix) = false)
+    (hhalt : Dhalted M (Drun M t (Dinit M suffix)) = true) :
+    Drun D (1 + t) cfg =
+      haltLiftDispatch M doneS rejectS (Drun M t (Dinit M suffix)) := by
+  rw [Drun_add_eq]
+  rw [show Drun D 1 cfg = Dstep D cfg by simp [Drun, hnot], hentry]
+  exact Drun_liftDispatch_of_halted D M ctor doneS rejectS
+    hstep hhand hreset hno hcf hcr hDacc hDrej t (Dinit M suffix) hstart hhalt
+
+
+
+-- ---------------------------------------------------------------------------
+-- Rejecting malformed descriptor prefixes
+-- ---------------------------------------------------------------------------
+
+lemma Drun_DDescDispatchTM_reject_empty
+    {σcf σct σv σn σa σo : Type}
+    [Fintype σcf] [DecidableEq σcf] [Fintype σct] [DecidableEq σct]
+    [Fintype σv] [DecidableEq σv] [Fintype σn] [DecidableEq σn]
+    [Fintype σa] [DecidableEq σa] [Fintype σo] [DecidableEq σo]
+    (Mcf : DTM σcf) (Mct : DTM σct) (Mv : DTM σv) (Mn : DTM σn)
+    (Ma : DTM σa) (Mo : DTM σo) :
+    Drun (DDescDispatchTM Mcf Mct Mv Mn Ma Mo) 2
+        (Dinit (DDescDispatchTM Mcf Mct Mv Mn Ma Mo) []) =
+      { state := DDescDispatchState.reject, input := [], head := 1,
+        output := [], work := fun _ : Nat => false, workHead := 0 } := by
+  simp [Drun, Dhalted, Dinit, Dstep, Dread, Dmove, DwriteWork,
+    DDescDispatchTM, DDescDispatchTM.rejectAction,
+    DDescDispatchTM.idleAction, DDescDispatchState.start,
+    DDescDispatchState.fSeen, DDescDispatchState.tSeen,
+    DDescDispatchState.reject, DDescDispatchState.done,
+    DDescDispatchState.tag]
+  funext i
+  by_cases hi : i = 0 <;> simp [DwriteWork, hi]
+
+lemma Drun_DDescDispatchTM_reject_false_nil
+    {σcf σct σv σn σa σo : Type}
+    [Fintype σcf] [DecidableEq σcf] [Fintype σct] [DecidableEq σct]
+    [Fintype σv] [DecidableEq σv] [Fintype σn] [DecidableEq σn]
+    [Fintype σa] [DecidableEq σa] [Fintype σo] [DecidableEq σo]
+    (Mcf : DTM σcf) (Mct : DTM σct) (Mv : DTM σv) (Mn : DTM σn)
+    (Ma : DTM σa) (Mo : DTM σo) :
+    Drun (DDescDispatchTM Mcf Mct Mv Mn Ma Mo) 3
+        (Dinit (DDescDispatchTM Mcf Mct Mv Mn Ma Mo) [false]) =
+      { state := DDescDispatchState.reject, input := [false], head := 2,
+        output := [], work := fun _ : Nat => false, workHead := 0 } := by
+  simp [Drun, Dhalted, Dinit, Dstep, Dread, Dmove, DwriteWork,
+    DDescDispatchTM, DDescDispatchTM.rejectAction,
+    DDescDispatchTM.idleAction, DDescDispatchState.start,
+    DDescDispatchState.fSeen, DDescDispatchState.ffSeen,
+    DDescDispatchState.tSeen, DDescDispatchState.reject,
+    DDescDispatchState.done, DDescDispatchState.tag]
+  funext i
+  by_cases hi : i = 0 <;> simp [DwriteWork, hi]
+
+lemma Drun_DDescDispatchTM_reject_false_false_nil
+    {σcf σct σv σn σa σo : Type}
+    [Fintype σcf] [DecidableEq σcf] [Fintype σct] [DecidableEq σct]
+    [Fintype σv] [DecidableEq σv] [Fintype σn] [DecidableEq σn]
+    [Fintype σa] [DecidableEq σa] [Fintype σo] [DecidableEq σo]
+    (Mcf : DTM σcf) (Mct : DTM σct) (Mv : DTM σv) (Mn : DTM σn)
+    (Ma : DTM σa) (Mo : DTM σo) :
+    Drun (DDescDispatchTM Mcf Mct Mv Mn Ma Mo) 4
+        (Dinit (DDescDispatchTM Mcf Mct Mv Mn Ma Mo) [false, false]) =
+      { state := DDescDispatchState.reject, input := [false, false], head := 3,
+        output := [], work := fun _ : Nat => false, workHead := 0 } := by
+  simp [Drun, Dhalted, Dinit, Dstep, Dread, Dmove, DwriteWork,
+    DDescDispatchTM, DDescDispatchTM.rejectAction,
+    DDescDispatchTM.idleAction, DDescDispatchState.start,
+    DDescDispatchState.fSeen, DDescDispatchState.ffSeen,
+    DDescDispatchState.tSeen, DDescDispatchState.copyT,
+    DDescDispatchState.reject, DDescDispatchState.done,
+    DDescDispatchState.tag]
+  funext i
+  by_cases hi : i = 0 <;> simp [DwriteWork, hi]
+
+lemma Drun_DDescDispatchTM_reject_true_nil
+    {σcf σct σv σn σa σo : Type}
+    [Fintype σcf] [DecidableEq σcf] [Fintype σct] [DecidableEq σct]
+    [Fintype σv] [DecidableEq σv] [Fintype σn] [DecidableEq σn]
+    [Fintype σa] [DecidableEq σa] [Fintype σo] [DecidableEq σo]
+    (Mcf : DTM σcf) (Mct : DTM σct) (Mv : DTM σv) (Mn : DTM σn)
+    (Ma : DTM σa) (Mo : DTM σo) :
+    Drun (DDescDispatchTM Mcf Mct Mv Mn Ma Mo) 3
+        (Dinit (DDescDispatchTM Mcf Mct Mv Mn Ma Mo) [true]) =
+      { state := DDescDispatchState.reject, input := [true], head := 2,
+        output := [], work := fun _ : Nat => false, workHead := 0 } := by
+  simp [Drun, Dhalted, Dinit, Dstep, Dread, Dmove, DwriteWork,
+    DDescDispatchTM, DDescDispatchTM.rejectAction,
+    DDescDispatchTM.idleAction, DDescDispatchState.start,
+    DDescDispatchState.fSeen, DDescDispatchState.tSeen,
+    DDescDispatchState.tfSeen, DDescDispatchState.ttSeen,
+    DDescDispatchState.reject, DDescDispatchState.done,
+    DDescDispatchState.tag]
+  funext i
+  by_cases hi : i = 0 <;> simp [DwriteWork, hi]
+
+lemma Drun_DDescDispatchTM_reject_true_false_nil
+    {σcf σct σv σn σa σo : Type}
+    [Fintype σcf] [DecidableEq σcf] [Fintype σct] [DecidableEq σct]
+    [Fintype σv] [DecidableEq σv] [Fintype σn] [DecidableEq σn]
+    [Fintype σa] [DecidableEq σa] [Fintype σo] [DecidableEq σo]
+    (Mcf : DTM σcf) (Mct : DTM σct) (Mv : DTM σv) (Mn : DTM σn)
+    (Ma : DTM σa) (Mo : DTM σo) :
+    Drun (DDescDispatchTM Mcf Mct Mv Mn Ma Mo) 4
+        (Dinit (DDescDispatchTM Mcf Mct Mv Mn Ma Mo) [true, false]) =
+      { state := DDescDispatchState.reject, input := [true, false], head := 3,
+        output := [], work := fun _ : Nat => false, workHead := 0 } := by
+  simp [Drun, Dhalted, Dinit, Dstep, Dread, Dmove, DwriteWork,
+    DDescDispatchTM, DDescDispatchTM.rejectAction,
+    DDescDispatchTM.idleAction, DDescDispatchState.start,
+    DDescDispatchState.fSeen, DDescDispatchState.tSeen,
+    DDescDispatchState.tfSeen, DDescDispatchState.copyN,
+    DDescDispatchState.reject, DDescDispatchState.done,
+    DDescDispatchState.tag]
+  funext i
+  by_cases hi : i = 0 <;> simp [DwriteWork, hi]
+
+lemma Drun_DDescDispatchTM_reject_true_true_nil
+    {σcf σct σv σn σa σo : Type}
+    [Fintype σcf] [DecidableEq σcf] [Fintype σct] [DecidableEq σct]
+    [Fintype σv] [DecidableEq σv] [Fintype σn] [DecidableEq σn]
+    [Fintype σa] [DecidableEq σa] [Fintype σo] [DecidableEq σo]
+    (Mcf : DTM σcf) (Mct : DTM σct) (Mv : DTM σv) (Mn : DTM σn)
+    (Ma : DTM σa) (Mo : DTM σo) :
+    Drun (DDescDispatchTM Mcf Mct Mv Mn Ma Mo) 4
+        (Dinit (DDescDispatchTM Mcf Mct Mv Mn Ma Mo) [true, true]) =
+      { state := DDescDispatchState.reject, input := [true, true], head := 3,
+        output := [], work := fun _ : Nat => false, workHead := 0 } := by
+  simp [Drun, Dhalted, Dinit, Dstep, Dread, Dmove, DwriteWork,
+    DDescDispatchTM, DDescDispatchTM.rejectAction,
+    DDescDispatchTM.idleAction, DDescDispatchState.start,
+    DDescDispatchState.fSeen, DDescDispatchState.tSeen,
+    DDescDispatchState.tfSeen, DDescDispatchState.ttSeen,
+    DDescDispatchState.reject, DDescDispatchState.done,
+    DDescDispatchState.tag]
+  funext i
+  by_cases hi : i = 0 <;> simp [DwriteWork, hi]
+
+lemma Drun_DDescDispatchTM_reject_true_true_false
+    {σcf σct σv σn σa σo : Type}
+    [Fintype σcf] [DecidableEq σcf] [Fintype σct] [DecidableEq σct]
+    [Fintype σv] [DecidableEq σv] [Fintype σn] [DecidableEq σn]
+    [Fintype σa] [DecidableEq σa] [Fintype σo] [DecidableEq σo]
+    (Mcf : DTM σcf) (Mct : DTM σct) (Mv : DTM σv) (Mn : DTM σn)
+    (Ma : DTM σa) (Mo : DTM σo) (rest : Word) :
+    Drun (DDescDispatchTM Mcf Mct Mv Mn Ma Mo) 4
+        (Dinit (DDescDispatchTM Mcf Mct Mv Mn Ma Mo)
+          (true :: true :: false :: rest)) =
+      { state := DDescDispatchState.reject, input := true :: true :: false :: rest,
+        head := 3, output := [], work := fun _ : Nat => false, workHead := 0 } := by
+  simp [Drun, Dhalted, Dinit, Dstep, Dread, Dmove, DwriteWork,
+    DDescDispatchTM, DDescDispatchTM.rejectAction,
+    DDescDispatchTM.idleAction, DDescDispatchState.start,
+    DDescDispatchState.fSeen, DDescDispatchState.tSeen,
+    DDescDispatchState.tfSeen, DDescDispatchState.ttSeen,
+    DDescDispatchState.reject, DDescDispatchState.done,
+    DDescDispatchState.tag]
+  funext i
+  by_cases hi : i = 0 <;> simp [DwriteWork, hi]
+
+
+
+-- ---------------------------------------------------------------------------
+-- Polynomial-time computability of the node-constraint dispatcher
+-- ---------------------------------------------------------------------------
+
+def DispatchEntryConfig {S : Type} (entryS : S) (pre suffix : Word) : DConfig S :=
+  { state := entryS, input := pre ++ suffix,
+    head := (pre ++ suffix).length + 1, output := suffix,
+    work := fun _ : Nat => false, workHead := 0 }
+
+lemma Drun_dispatcher_entry_then_branch_full
+    {σ S : Type} [Fintype σ] [DecidableEq σ] [Fintype S] [DecidableEq S]
+    (D : DTM S) (M : DTM σ) (ctor : σ → S) (doneS rejectS : S)
+    (hstep : ∀ q sym wsym, D.step (ctor q) sym wsym =
+      DDescDispatchBranchAction M ctor doneS rejectS q sym wsym)
+    (hhand : ∀ q, D.handoff (ctor q) = false)
+    (hreset : ∀ q, D.headReset (ctor q) = M.headReset q)
+    (hno : ∀ q, M.handoff q = false)
+    (hcf : ∀ q, ctor q ≠ doneS) (hcr : ∀ q, ctor q ≠ rejectS)
+    (hDacc : D.accept = doneS) (hDrej : D.reject = rejectS)
+    (entryS : S) (hentryDone : entryS ≠ doneS) (hentryRej : entryS ≠ rejectS)
+    (pre : Word) (k : Nat)
+    (hto : ∀ suffix : Word,
+      Drun D (k + (suffix.length + 1)) (Dinit D (pre ++ suffix)) =
+        DispatchEntryConfig entryS pre suffix)
+    (hentry : ∀ suffix : Word,
+      Dstep D (DispatchEntryConfig entryS pre suffix) =
+        liftDispatch ctor (Dinit M suffix))
+    (p : TimeBound)
+    (hstart : ∀ x : Word, Dhalted M (Dinit M x) = false)
+    (hhalt : ∀ x : Word, Dhalted M (Drun M (p.eval x.length) (Dinit M x)) = true)
+    (suffix : Word) :
+    Drun D (k + (suffix.length + 1) + (1 + p.eval suffix.length))
+        (Dinit D (pre ++ suffix)) =
+      haltLiftDispatch M doneS rejectS
+        (Drun M (p.eval suffix.length) (Dinit M suffix)) := by
+  rw [Drun_add_eq, hto suffix]
+  apply Drun_dispatcher_entry_then_branch D M ctor doneS rejectS
+    hstep hhand hreset hno hcf hcr hDacc hDrej
+  · simp [DispatchEntryConfig, Dhalted, hDacc, hDrej, hentryDone, hentryRej]
+  · exact hentry suffix
+  · exact hstart suffix
+  · exact hhalt suffix
+
+lemma Dhalted_and_output_of_reject_run
+    {S : Type} [Fintype S] [DecidableEq S]
+    (D : DTM S) (T N : Nat) (x : Word) (c : DConfig S)
+    (hTN : T ≤ N) (hr : Drun D T (Dinit D x) = c)
+    (hcstate : c.state = D.reject) (hcout : c.output = []) :
+    Dhalted D (Drun D N (Dinit D x)) = true ∧
+      (Drun D N (Dinit D x)).output = [] := by
+  have hhaltT : Dhalted D (Drun D T (Dinit D x)) = true := by
+    rw [hr, Dhalted]
+    simp [hcstate]
+  constructor
+  · rw [Drun_eq_of_halted_within D (Dinit D x) hTN hhaltT]
+    exact hhaltT
+  · rw [Drun_eq_of_halted_within D (Dinit D x) hTN hhaltT, hr, hcout]
+
+lemma Dhalted_and_output_of_branch_run
+    {σ S : Type} [Fintype σ] [DecidableEq σ] [Fintype S] [DecidableEq S]
+    (D : DTM S) (M : DTM σ) (doneS rejectS : S)
+    (hDacc : D.accept = doneS) (hDrej : D.reject = rejectS)
+    (T N t : Nat) (x : Word) (c : DConfig σ) (out : Word)
+    (hTN : T ≤ N)
+    (hr : Drun D T (Dinit D x) =
+      haltLiftDispatch M doneS rejectS c)
+    (hh : Dhalted M c = true) (hout : c.output = out) :
+    Dhalted D (Drun D N (Dinit D x)) = true ∧
+      (Drun D N (Dinit D x)).output = out := by
+  have hhaltT : Dhalted D (Drun D T (Dinit D x)) = true := by
+    rw [hr]
+    exact Dhalted_haltLiftDispatch M doneS rejectS D hDacc hDrej c hh
+  constructor
+  · rw [Drun_eq_of_halted_within D (Dinit D x) hTN hhaltT]
+    exact hhaltT
+  · rw [Drun_eq_of_halted_within D (Dinit D x) hTN hhaltT, hr,
+      haltLiftDispatch_output_eq, hout]
+
+
+lemma Dstep_DDescDispatchTM_entry_cF_full
+    {σcf σct σv σn σa σo : Type}
+    [Fintype σcf] [DecidableEq σcf] [Fintype σct] [DecidableEq σct]
+    [Fintype σv] [DecidableEq σv] [Fintype σn] [DecidableEq σn]
+    [Fintype σa] [DecidableEq σa] [Fintype σo] [DecidableEq σo]
+    (Mcf : DTM σcf) (Mct : DTM σct) (Mv : DTM σv) (Mn : DTM σn)
+    (Ma : DTM σa) (Mo : DTM σo) (pre suffix : Word) :
+    Dstep (DDescDispatchTM Mcf Mct Mv Mn Ma Mo)
+      (DispatchEntryConfig DDescDispatchState.entryF pre suffix) =
+      liftDispatch DDescDispatchState.cF (Dinit Mcf suffix) := by
+  simp [DispatchEntryConfig, Dstep, Dinit, liftDispatch, DDescDispatchTM,
+    DDescDispatchTM.entryAction, DDescDispatchTM.idleAction,
+    DDescDispatchState.entryF, DDescDispatchState.entryT,
+    DDescDispatchState.entryV, DDescDispatchState.entryN,
+    DDescDispatchState.entryA, DDescDispatchState.entryO,
+    DDescDispatchState.cF, DDescDispatchState.cT,
+    DDescDispatchState.cV, DDescDispatchState.cN,
+    DDescDispatchState.cA, DDescDispatchState.cO,
+    DDescDispatchState.tag]
+
+
+lemma Dstep_DDescDispatchTM_entry_cT_full
+    {σcf σct σv σn σa σo : Type}
+    [Fintype σcf] [DecidableEq σcf] [Fintype σct] [DecidableEq σct]
+    [Fintype σv] [DecidableEq σv] [Fintype σn] [DecidableEq σn]
+    [Fintype σa] [DecidableEq σa] [Fintype σo] [DecidableEq σo]
+    (Mcf : DTM σcf) (Mct : DTM σct) (Mv : DTM σv) (Mn : DTM σn)
+    (Ma : DTM σa) (Mo : DTM σo) (pre suffix : Word) :
+    Dstep (DDescDispatchTM Mcf Mct Mv Mn Ma Mo)
+      (DispatchEntryConfig DDescDispatchState.entryT pre suffix) =
+      liftDispatch DDescDispatchState.cT (Dinit Mct suffix) := by
+  simp [DispatchEntryConfig, Dstep, Dinit, liftDispatch, DDescDispatchTM,
+    DDescDispatchTM.entryAction, DDescDispatchTM.idleAction,
+    DDescDispatchState.entryF, DDescDispatchState.entryT,
+    DDescDispatchState.entryV, DDescDispatchState.entryN,
+    DDescDispatchState.entryA, DDescDispatchState.entryO,
+    DDescDispatchState.cF, DDescDispatchState.cT,
+    DDescDispatchState.cV, DDescDispatchState.cN,
+    DDescDispatchState.cA, DDescDispatchState.cO,
+    DDescDispatchState.tag]
+
+
+lemma Dstep_DDescDispatchTM_entry_cV_full
+    {σcf σct σv σn σa σo : Type}
+    [Fintype σcf] [DecidableEq σcf] [Fintype σct] [DecidableEq σct]
+    [Fintype σv] [DecidableEq σv] [Fintype σn] [DecidableEq σn]
+    [Fintype σa] [DecidableEq σa] [Fintype σo] [DecidableEq σo]
+    (Mcf : DTM σcf) (Mct : DTM σct) (Mv : DTM σv) (Mn : DTM σn)
+    (Ma : DTM σa) (Mo : DTM σo) (pre suffix : Word) :
+    Dstep (DDescDispatchTM Mcf Mct Mv Mn Ma Mo)
+      (DispatchEntryConfig DDescDispatchState.entryV pre suffix) =
+      liftDispatch DDescDispatchState.cV (Dinit Mv suffix) := by
+  simp [DispatchEntryConfig, Dstep, Dinit, liftDispatch, DDescDispatchTM,
+    DDescDispatchTM.entryAction, DDescDispatchTM.idleAction,
+    DDescDispatchState.entryF, DDescDispatchState.entryT,
+    DDescDispatchState.entryV, DDescDispatchState.entryN,
+    DDescDispatchState.entryA, DDescDispatchState.entryO,
+    DDescDispatchState.cF, DDescDispatchState.cT,
+    DDescDispatchState.cV, DDescDispatchState.cN,
+    DDescDispatchState.cA, DDescDispatchState.cO,
+    DDescDispatchState.tag]
+
+
+lemma Dstep_DDescDispatchTM_entry_cN_full
+    {σcf σct σv σn σa σo : Type}
+    [Fintype σcf] [DecidableEq σcf] [Fintype σct] [DecidableEq σct]
+    [Fintype σv] [DecidableEq σv] [Fintype σn] [DecidableEq σn]
+    [Fintype σa] [DecidableEq σa] [Fintype σo] [DecidableEq σo]
+    (Mcf : DTM σcf) (Mct : DTM σct) (Mv : DTM σv) (Mn : DTM σn)
+    (Ma : DTM σa) (Mo : DTM σo) (pre suffix : Word) :
+    Dstep (DDescDispatchTM Mcf Mct Mv Mn Ma Mo)
+      (DispatchEntryConfig DDescDispatchState.entryN pre suffix) =
+      liftDispatch DDescDispatchState.cN (Dinit Mn suffix) := by
+  simp [DispatchEntryConfig, Dstep, Dinit, liftDispatch, DDescDispatchTM,
+    DDescDispatchTM.entryAction, DDescDispatchTM.idleAction,
+    DDescDispatchState.entryF, DDescDispatchState.entryT,
+    DDescDispatchState.entryV, DDescDispatchState.entryN,
+    DDescDispatchState.entryA, DDescDispatchState.entryO,
+    DDescDispatchState.cF, DDescDispatchState.cT,
+    DDescDispatchState.cV, DDescDispatchState.cN,
+    DDescDispatchState.cA, DDescDispatchState.cO,
+    DDescDispatchState.tag]
+
+
+lemma Dstep_DDescDispatchTM_entry_cA_full
+    {σcf σct σv σn σa σo : Type}
+    [Fintype σcf] [DecidableEq σcf] [Fintype σct] [DecidableEq σct]
+    [Fintype σv] [DecidableEq σv] [Fintype σn] [DecidableEq σn]
+    [Fintype σa] [DecidableEq σa] [Fintype σo] [DecidableEq σo]
+    (Mcf : DTM σcf) (Mct : DTM σct) (Mv : DTM σv) (Mn : DTM σn)
+    (Ma : DTM σa) (Mo : DTM σo) (pre suffix : Word) :
+    Dstep (DDescDispatchTM Mcf Mct Mv Mn Ma Mo)
+      (DispatchEntryConfig DDescDispatchState.entryA pre suffix) =
+      liftDispatch DDescDispatchState.cA (Dinit Ma suffix) := by
+  simp [DispatchEntryConfig, Dstep, Dinit, liftDispatch, DDescDispatchTM,
+    DDescDispatchTM.entryAction, DDescDispatchTM.idleAction,
+    DDescDispatchState.entryF, DDescDispatchState.entryT,
+    DDescDispatchState.entryV, DDescDispatchState.entryN,
+    DDescDispatchState.entryA, DDescDispatchState.entryO,
+    DDescDispatchState.cF, DDescDispatchState.cT,
+    DDescDispatchState.cV, DDescDispatchState.cN,
+    DDescDispatchState.cA, DDescDispatchState.cO,
+    DDescDispatchState.tag]
+
+
+lemma Dstep_DDescDispatchTM_entry_cO_full
+    {σcf σct σv σn σa σo : Type}
+    [Fintype σcf] [DecidableEq σcf] [Fintype σct] [DecidableEq σct]
+    [Fintype σv] [DecidableEq σv] [Fintype σn] [DecidableEq σn]
+    [Fintype σa] [DecidableEq σa] [Fintype σo] [DecidableEq σo]
+    (Mcf : DTM σcf) (Mct : DTM σct) (Mv : DTM σv) (Mn : DTM σn)
+    (Ma : DTM σa) (Mo : DTM σo) (pre suffix : Word) :
+    Dstep (DDescDispatchTM Mcf Mct Mv Mn Ma Mo)
+      (DispatchEntryConfig DDescDispatchState.entryO pre suffix) =
+      liftDispatch DDescDispatchState.cO (Dinit Mo suffix) := by
+  simp [DispatchEntryConfig, Dstep, Dinit, liftDispatch, DDescDispatchTM,
+    DDescDispatchTM.entryAction, DDescDispatchTM.idleAction,
+    DDescDispatchState.entryF, DDescDispatchState.entryT,
+    DDescDispatchState.entryV, DDescDispatchState.entryN,
+    DDescDispatchState.entryA, DDescDispatchState.entryO,
+    DDescDispatchState.cF, DDescDispatchState.cT,
+    DDescDispatchState.cV, DDescDispatchState.cN,
+    DDescDispatchState.cA, DDescDispatchState.cO,
+    DDescDispatchState.tag]
+
+
+lemma Drun_DDescDispatchTM_cF_complete
+    {σcf σct σv σn σa σo : Type}
+    [Fintype σcf] [DecidableEq σcf] [Fintype σct] [DecidableEq σct]
+    [Fintype σv] [DecidableEq σv] [Fintype σn] [DecidableEq σn]
+    [Fintype σa] [DecidableEq σa] [Fintype σo] [DecidableEq σo]
+    (Mcf : DTM σcf) (Mct : DTM σct) (Mv : DTM σv) (Mn : DTM σn)
+    (Ma : DTM σa) (Mo : DTM σo) (pcf : TimeBound)
+    (hnocf : ∀ q, Mcf.handoff q = false)
+    (hstartcf : ∀ x : Word, Dhalted Mcf (Dinit Mcf x) = false)
+    (hhaltcf : ∀ x : Word,
+      Dhalted Mcf (Drun Mcf (pcf.eval x.length) (Dinit Mcf x)) = true)
+    (suffix : Word) :
+    Drun (DDescDispatchTM Mcf Mct Mv Mn Ma Mo)
+        (4 + (suffix.length + 1) + (1 + pcf.eval suffix.length))
+        (Dinit (DDescDispatchTM Mcf Mct Mv Mn Ma Mo) (false :: false :: false :: suffix)) =
+      haltLiftDispatch Mcf DDescDispatchState.done DDescDispatchState.reject
+        (Drun Mcf (pcf.eval suffix.length) (Dinit Mcf suffix)) := by
+  apply Drun_dispatcher_entry_then_branch_full
+    (DDescDispatchTM Mcf Mct Mv Mn Ma Mo) Mcf DDescDispatchState.cF
+    DDescDispatchState.done DDescDispatchState.reject
+    (entryS := DDescDispatchState.entryF) (pre := [false, false, false]) (k := 4)
+    (p := pcf)
+  · exact DDescDispatchTM_step_cF Mcf Mct Mv Mn Ma Mo
+  · exact DDescDispatchTM_handoff_cF Mcf Mct Mv Mn Ma Mo
+  · exact DDescDispatchTM_headReset_cF Mcf Mct Mv Mn Ma Mo
+  · exact hnocf
+  · exact fun q => (DDescDispatchTM_cF_ne_done_reject q).1
+  · exact fun q => (DDescDispatchTM_cF_ne_done_reject q).2
+  · exact DDescDispatchTM_accept_eq Mcf Mct Mv Mn Ma Mo
+  · exact DDescDispatchTM_reject_eq Mcf Mct Mv Mn Ma Mo
+  · simp [DDescDispatchState.entryF, DDescDispatchState.done,
+      DDescDispatchState.reject, DDescDispatchState.tag]
+  · simp [DDescDispatchState.entryF, DDescDispatchState.reject,
+      DDescDispatchState.tag]
+  · intro s
+    simpa [DispatchEntryConfig] using (Drun_DDescDispatchTM_constFalse_toEntry Mcf Mct Mv Mn Ma Mo s)
+  · intro s
+    exact Dstep_DDescDispatchTM_entry_cF_full Mcf Mct Mv Mn Ma Mo
+      [false, false, false] s
+  · exact hstartcf
+  · exact hhaltcf
+
+
+lemma Drun_DDescDispatchTM_cT_complete
+    {σcf σct σv σn σa σo : Type}
+    [Fintype σcf] [DecidableEq σcf] [Fintype σct] [DecidableEq σct]
+    [Fintype σv] [DecidableEq σv] [Fintype σn] [DecidableEq σn]
+    [Fintype σa] [DecidableEq σa] [Fintype σo] [DecidableEq σo]
+    (Mcf : DTM σcf) (Mct : DTM σct) (Mv : DTM σv) (Mn : DTM σn)
+    (Ma : DTM σa) (Mo : DTM σo) (pct : TimeBound)
+    (hnoct : ∀ q, Mct.handoff q = false)
+    (hstartct : ∀ x : Word, Dhalted Mct (Dinit Mct x) = false)
+    (hhaltct : ∀ x : Word,
+      Dhalted Mct (Drun Mct (pct.eval x.length) (Dinit Mct x)) = true)
+    (suffix : Word) :
+    Drun (DDescDispatchTM Mcf Mct Mv Mn Ma Mo)
+        (4 + (suffix.length + 1) + (1 + pct.eval suffix.length))
+        (Dinit (DDescDispatchTM Mcf Mct Mv Mn Ma Mo) (false :: false :: true :: suffix)) =
+      haltLiftDispatch Mct DDescDispatchState.done DDescDispatchState.reject
+        (Drun Mct (pct.eval suffix.length) (Dinit Mct suffix)) := by
+  apply Drun_dispatcher_entry_then_branch_full
+    (DDescDispatchTM Mcf Mct Mv Mn Ma Mo) Mct DDescDispatchState.cT
+    DDescDispatchState.done DDescDispatchState.reject
+    (entryS := DDescDispatchState.entryT) (pre := [false, false, true]) (k := 4)
+    (p := pct)
+  · exact DDescDispatchTM_step_cT Mcf Mct Mv Mn Ma Mo
+  · exact DDescDispatchTM_handoff_cT Mcf Mct Mv Mn Ma Mo
+  · exact DDescDispatchTM_headReset_cT Mcf Mct Mv Mn Ma Mo
+  · exact hnoct
+  · exact fun q => (DDescDispatchTM_cT_ne_done_reject q).1
+  · exact fun q => (DDescDispatchTM_cT_ne_done_reject q).2
+  · exact DDescDispatchTM_accept_eq Mcf Mct Mv Mn Ma Mo
+  · exact DDescDispatchTM_reject_eq Mcf Mct Mv Mn Ma Mo
+  · simp [DDescDispatchState.entryT, DDescDispatchState.done,
+      DDescDispatchState.reject, DDescDispatchState.tag]
+  · simp [DDescDispatchState.entryT, DDescDispatchState.reject,
+      DDescDispatchState.tag]
+  · intro s
+    simpa [DispatchEntryConfig] using (Drun_DDescDispatchTM_constTrue_toEntry Mcf Mct Mv Mn Ma Mo s)
+  · intro s
+    exact Dstep_DDescDispatchTM_entry_cT_full Mcf Mct Mv Mn Ma Mo
+      [false, false, true] s
+  · exact hstartct
+  · exact hhaltct
+
+
+lemma Drun_DDescDispatchTM_cV_complete
+    {σcf σct σv σn σa σo : Type}
+    [Fintype σcf] [DecidableEq σcf] [Fintype σct] [DecidableEq σct]
+    [Fintype σv] [DecidableEq σv] [Fintype σn] [DecidableEq σn]
+    [Fintype σa] [DecidableEq σa] [Fintype σo] [DecidableEq σo]
+    (Mcf : DTM σcf) (Mct : DTM σct) (Mv : DTM σv) (Mn : DTM σn)
+    (Ma : DTM σa) (Mo : DTM σo) (pv : TimeBound)
+    (hnov : ∀ q, Mv.handoff q = false)
+    (hstartv : ∀ x : Word, Dhalted Mv (Dinit Mv x) = false)
+    (hhaltv : ∀ x : Word,
+      Dhalted Mv (Drun Mv (pv.eval x.length) (Dinit Mv x)) = true)
+    (suffix : Word) :
+    Drun (DDescDispatchTM Mcf Mct Mv Mn Ma Mo)
+        (3 + (suffix.length + 1) + (1 + pv.eval suffix.length))
+        (Dinit (DDescDispatchTM Mcf Mct Mv Mn Ma Mo) (false :: true :: suffix)) =
+      haltLiftDispatch Mv DDescDispatchState.done DDescDispatchState.reject
+        (Drun Mv (pv.eval suffix.length) (Dinit Mv suffix)) := by
+  apply Drun_dispatcher_entry_then_branch_full
+    (DDescDispatchTM Mcf Mct Mv Mn Ma Mo) Mv DDescDispatchState.cV
+    DDescDispatchState.done DDescDispatchState.reject
+    (entryS := DDescDispatchState.entryV) (pre := [false, true]) (k := 3)
+    (p := pv)
+  · exact DDescDispatchTM_step_cV Mcf Mct Mv Mn Ma Mo
+  · exact DDescDispatchTM_handoff_cV Mcf Mct Mv Mn Ma Mo
+  · exact DDescDispatchTM_headReset_cV Mcf Mct Mv Mn Ma Mo
+  · exact hnov
+  · exact fun q => (DDescDispatchTM_cV_ne_done_reject q).1
+  · exact fun q => (DDescDispatchTM_cV_ne_done_reject q).2
+  · exact DDescDispatchTM_accept_eq Mcf Mct Mv Mn Ma Mo
+  · exact DDescDispatchTM_reject_eq Mcf Mct Mv Mn Ma Mo
+  · simp [DDescDispatchState.entryV, DDescDispatchState.done,
+      DDescDispatchState.reject, DDescDispatchState.tag]
+  · simp [DDescDispatchState.entryV, DDescDispatchState.reject,
+      DDescDispatchState.tag]
+  · intro s
+    simpa [DispatchEntryConfig] using (Drun_DDescDispatchTM_var_toEntry Mcf Mct Mv Mn Ma Mo s)
+  · intro s
+    exact Dstep_DDescDispatchTM_entry_cV_full Mcf Mct Mv Mn Ma Mo
+      [false, true] s
+  · exact hstartv
+  · exact hhaltv
+
+
+lemma Drun_DDescDispatchTM_cN_complete
+    {σcf σct σv σn σa σo : Type}
+    [Fintype σcf] [DecidableEq σcf] [Fintype σct] [DecidableEq σct]
+    [Fintype σv] [DecidableEq σv] [Fintype σn] [DecidableEq σn]
+    [Fintype σa] [DecidableEq σa] [Fintype σo] [DecidableEq σo]
+    (Mcf : DTM σcf) (Mct : DTM σct) (Mv : DTM σv) (Mn : DTM σn)
+    (Ma : DTM σa) (Mo : DTM σo) (pn : TimeBound)
+    (hnon : ∀ q, Mn.handoff q = false)
+    (hstartn : ∀ x : Word, Dhalted Mn (Dinit Mn x) = false)
+    (hhaltn : ∀ x : Word,
+      Dhalted Mn (Drun Mn (pn.eval x.length) (Dinit Mn x)) = true)
+    (suffix : Word) :
+    Drun (DDescDispatchTM Mcf Mct Mv Mn Ma Mo)
+        (4 + (suffix.length + 1) + (1 + pn.eval suffix.length))
+        (Dinit (DDescDispatchTM Mcf Mct Mv Mn Ma Mo) (true :: false :: false :: suffix)) =
+      haltLiftDispatch Mn DDescDispatchState.done DDescDispatchState.reject
+        (Drun Mn (pn.eval suffix.length) (Dinit Mn suffix)) := by
+  apply Drun_dispatcher_entry_then_branch_full
+    (DDescDispatchTM Mcf Mct Mv Mn Ma Mo) Mn DDescDispatchState.cN
+    DDescDispatchState.done DDescDispatchState.reject
+    (entryS := DDescDispatchState.entryN) (pre := [true, false, false]) (k := 4)
+    (p := pn)
+  · exact DDescDispatchTM_step_cN Mcf Mct Mv Mn Ma Mo
+  · exact DDescDispatchTM_handoff_cN Mcf Mct Mv Mn Ma Mo
+  · exact DDescDispatchTM_headReset_cN Mcf Mct Mv Mn Ma Mo
+  · exact hnon
+  · exact fun q => (DDescDispatchTM_cN_ne_done_reject q).1
+  · exact fun q => (DDescDispatchTM_cN_ne_done_reject q).2
+  · exact DDescDispatchTM_accept_eq Mcf Mct Mv Mn Ma Mo
+  · exact DDescDispatchTM_reject_eq Mcf Mct Mv Mn Ma Mo
+  · simp [DDescDispatchState.entryN, DDescDispatchState.done,
+      DDescDispatchState.reject, DDescDispatchState.tag]
+  · simp [DDescDispatchState.entryN, DDescDispatchState.reject,
+      DDescDispatchState.tag]
+  · intro s
+    simpa [DispatchEntryConfig] using (Drun_DDescDispatchTM_not_toEntry Mcf Mct Mv Mn Ma Mo s)
+  · intro s
+    exact Dstep_DDescDispatchTM_entry_cN_full Mcf Mct Mv Mn Ma Mo
+      [true, false, false] s
+  · exact hstartn
+  · exact hhaltn
+
+
+lemma Drun_DDescDispatchTM_cA_complete
+    {σcf σct σv σn σa σo : Type}
+    [Fintype σcf] [DecidableEq σcf] [Fintype σct] [DecidableEq σct]
+    [Fintype σv] [DecidableEq σv] [Fintype σn] [DecidableEq σn]
+    [Fintype σa] [DecidableEq σa] [Fintype σo] [DecidableEq σo]
+    (Mcf : DTM σcf) (Mct : DTM σct) (Mv : DTM σv) (Mn : DTM σn)
+    (Ma : DTM σa) (Mo : DTM σo) (pa : TimeBound)
+    (hnoa : ∀ q, Ma.handoff q = false)
+    (hstarta : ∀ x : Word, Dhalted Ma (Dinit Ma x) = false)
+    (hhalta : ∀ x : Word,
+      Dhalted Ma (Drun Ma (pa.eval x.length) (Dinit Ma x)) = true)
+    (suffix : Word) :
+    Drun (DDescDispatchTM Mcf Mct Mv Mn Ma Mo)
+        (4 + (suffix.length + 1) + (1 + pa.eval suffix.length))
+        (Dinit (DDescDispatchTM Mcf Mct Mv Mn Ma Mo) (true :: false :: true :: suffix)) =
+      haltLiftDispatch Ma DDescDispatchState.done DDescDispatchState.reject
+        (Drun Ma (pa.eval suffix.length) (Dinit Ma suffix)) := by
+  apply Drun_dispatcher_entry_then_branch_full
+    (DDescDispatchTM Mcf Mct Mv Mn Ma Mo) Ma DDescDispatchState.cA
+    DDescDispatchState.done DDescDispatchState.reject
+    (entryS := DDescDispatchState.entryA) (pre := [true, false, true]) (k := 4)
+    (p := pa)
+  · exact DDescDispatchTM_step_cA Mcf Mct Mv Mn Ma Mo
+  · exact DDescDispatchTM_handoff_cA Mcf Mct Mv Mn Ma Mo
+  · exact DDescDispatchTM_headReset_cA Mcf Mct Mv Mn Ma Mo
+  · exact hnoa
+  · exact fun q => (DDescDispatchTM_cA_ne_done_reject q).1
+  · exact fun q => (DDescDispatchTM_cA_ne_done_reject q).2
+  · exact DDescDispatchTM_accept_eq Mcf Mct Mv Mn Ma Mo
+  · exact DDescDispatchTM_reject_eq Mcf Mct Mv Mn Ma Mo
+  · simp [DDescDispatchState.entryA, DDescDispatchState.done,
+      DDescDispatchState.reject, DDescDispatchState.tag]
+  · simp [DDescDispatchState.entryA, DDescDispatchState.reject,
+      DDescDispatchState.tag]
+  · intro s
+    simpa [DispatchEntryConfig] using (Drun_DDescDispatchTM_and_toEntry Mcf Mct Mv Mn Ma Mo s)
+  · intro s
+    exact Dstep_DDescDispatchTM_entry_cA_full Mcf Mct Mv Mn Ma Mo
+      [true, false, true] s
+  · exact hstarta
+  · exact hhalta
+
+
+lemma Drun_DDescDispatchTM_cO_complete
+    {σcf σct σv σn σa σo : Type}
+    [Fintype σcf] [DecidableEq σcf] [Fintype σct] [DecidableEq σct]
+    [Fintype σv] [DecidableEq σv] [Fintype σn] [DecidableEq σn]
+    [Fintype σa] [DecidableEq σa] [Fintype σo] [DecidableEq σo]
+    (Mcf : DTM σcf) (Mct : DTM σct) (Mv : DTM σv) (Mn : DTM σn)
+    (Ma : DTM σa) (Mo : DTM σo) (po : TimeBound)
+    (hnoo : ∀ q, Mo.handoff q = false)
+    (hstarto : ∀ x : Word, Dhalted Mo (Dinit Mo x) = false)
+    (hhalto : ∀ x : Word,
+      Dhalted Mo (Drun Mo (po.eval x.length) (Dinit Mo x)) = true)
+    (suffix : Word) :
+    Drun (DDescDispatchTM Mcf Mct Mv Mn Ma Mo)
+        (4 + (suffix.length + 1) + (1 + po.eval suffix.length))
+        (Dinit (DDescDispatchTM Mcf Mct Mv Mn Ma Mo) (true :: true :: true :: suffix)) =
+      haltLiftDispatch Mo DDescDispatchState.done DDescDispatchState.reject
+        (Drun Mo (po.eval suffix.length) (Dinit Mo suffix)) := by
+  apply Drun_dispatcher_entry_then_branch_full
+    (DDescDispatchTM Mcf Mct Mv Mn Ma Mo) Mo DDescDispatchState.cO
+    DDescDispatchState.done DDescDispatchState.reject
+    (entryS := DDescDispatchState.entryO) (pre := [true, true, true]) (k := 4)
+    (p := po)
+  · exact DDescDispatchTM_step_cO Mcf Mct Mv Mn Ma Mo
+  · exact DDescDispatchTM_handoff_cO Mcf Mct Mv Mn Ma Mo
+  · exact DDescDispatchTM_headReset_cO Mcf Mct Mv Mn Ma Mo
+  · exact hnoo
+  · exact fun q => (DDescDispatchTM_cO_ne_done_reject q).1
+  · exact fun q => (DDescDispatchTM_cO_ne_done_reject q).2
+  · exact DDescDispatchTM_accept_eq Mcf Mct Mv Mn Ma Mo
+  · exact DDescDispatchTM_reject_eq Mcf Mct Mv Mn Ma Mo
+  · simp [DDescDispatchState.entryO, DDescDispatchState.done,
+      DDescDispatchState.reject, DDescDispatchState.tag]
+  · simp [DDescDispatchState.entryO, DDescDispatchState.reject,
+      DDescDispatchState.tag]
+  · intro s
+    simpa [DispatchEntryConfig] using (Drun_DDescDispatchTM_or_toEntry Mcf Mct Mv Mn Ma Mo s)
+  · intro s
+    exact Dstep_DDescDispatchTM_entry_cO_full Mcf Mct Mv Mn Ma Mo
+      [true, true, true] s
+  · exact hstarto
+  · exact hhalto
+
+lemma nodeConstraintBranch_nonempty_cf : (fun z : Word => constFalseConstraintEncode (firstUnaryCode z)) [] ≠ [] := by simp [constFalseConstraintEncode, firstUnaryCode]
+
+lemma nodeConstraintBranch_nonempty_ct : (fun z : Word => constTrueConstraintEncode (firstUnaryCode z)) [] ≠ [] := by simp [constTrueConstraintEncode, firstUnaryCode]
+
+lemma nodeConstraintBranch_nonempty_v : (varNodeConstraintEncodeFromPair) [] ≠ [] := by simp [varNodeConstraintEncodeFromPair]
+
+lemma nodeConstraintBranch_nonempty_n : (notNodeConstraintEncodeFromPair) [] ≠ [] := by simp [notNodeConstraintEncodeFromPair]
+
+lemma nodeConstraintBranch_nonempty_a : (andNodeConstraintEncodeFromTriple) [] ≠ [] := by simp [andNodeConstraintEncodeFromTriple]
+
+lemma nodeConstraintBranch_nonempty_o : (orNodeConstraintEncodeFromTriple) [] ≠ [] := by simp [orNodeConstraintEncodeFromTriple]
+
+theorem dPolyTimeComputable_nodeConstraintEncode :
+    DPolyTimeComputable nodeConstraintEncode := by
+  rcases dPolyTimeComputableClean_constFalseConstraintEncode_firstUnary with
+    ⟨σcf, instcf, deccf, Mcf, pcf, rcf, hnocf, _hworkcf, hhaltcf, houtcf⟩
+  rcases dPolyTimeComputableClean_constTrueConstraintEncode_firstUnary with
+    ⟨σct, instct, decct, Mct, pct, rct, hnoct, _hworkct, hhaltct, houtct⟩
+  rcases dPolyTimeComputableClean_varNodeConstraintEncodeFromPair with
+    ⟨σv, instv, decv, Mv, pv, rv, hnov, _hworkv, hhaltv, houtv⟩
+  rcases dPolyTimeComputableClean_notNodeConstraintEncodeFromPair with
+    ⟨σn, instn, decn, Mn, pn, rn, hnon, _hworkn, hhaltn, houtn⟩
+  rcases dPolyTimeComputableClean_andNodeConstraintEncodeFromTriple with
+    ⟨σa, insta, deca, Ma, pa, ra, hnoa, _hworka, hhalta, houta⟩
+  rcases dPolyTimeComputableClean_orNodeConstraintEncodeFromTriple with
+    ⟨σo, insto, deco, Mo, po, ro, hnoo, _hworko, hhalto, houto⟩
+  letI := instcf
+  letI := deccf
+  letI := instct
+  letI := decct
+  letI := instv
+  letI := decv
+  letI := instn
+  letI := decn
+  letI := insta
+  letI := deca
+  letI := insto
+  letI := deco
+  let P : TimeBound := X + C 30 + pcf + pct + pv + pn + pa + po
+  let R : TimeBound := rcf + rct + rv + rn + ra + ro
+  let D := DDescDispatchTM Mcf Mct Mv Mn Ma Mo
+  have hDacc : D.accept = DDescDispatchState.done :=
+    DDescDispatchTM_accept_eq Mcf Mct Mv Mn Ma Mo
+  have hDrej : D.reject = DDescDispatchState.reject :=
+    DDescDispatchTM_reject_eq Mcf Mct Mv Mn Ma Mo
+  have hstartcf : ∀ x : Word, Dhalted Mcf (Dinit Mcf x) = false := by
+    intro x
+    exact Dinit_not_halted_of_start_false Mcf x
+      (DPolyTimeComputableClean_nonempty_start_false Mcf pcf rcf hhaltcf houtcf
+        (nodeConstraintBranch_nonempty_cf))
+  have hstartct : ∀ x : Word, Dhalted Mct (Dinit Mct x) = false := by
+    intro x
+    exact Dinit_not_halted_of_start_false Mct x
+      (DPolyTimeComputableClean_nonempty_start_false Mct pct rct hhaltct houtct
+        (nodeConstraintBranch_nonempty_ct))
+  have hstartv : ∀ x : Word, Dhalted Mv (Dinit Mv x) = false := by
+    intro x
+    exact Dinit_not_halted_of_start_false Mv x
+      (DPolyTimeComputableClean_nonempty_start_false Mv pv rv hhaltv houtv
+        (nodeConstraintBranch_nonempty_v))
+  have hstartn : ∀ x : Word, Dhalted Mn (Dinit Mn x) = false := by
+    intro x
+    exact Dinit_not_halted_of_start_false Mn x
+      (DPolyTimeComputableClean_nonempty_start_false Mn pn rn hhaltn houtn
+        (nodeConstraintBranch_nonempty_n))
+  have hstarta : ∀ x : Word, Dhalted Ma (Dinit Ma x) = false := by
+    intro x
+    exact Dinit_not_halted_of_start_false Ma x
+      (DPolyTimeComputableClean_nonempty_start_false Ma pa ra hhalta houta
+        (nodeConstraintBranch_nonempty_a))
+  have hstarto : ∀ x : Word, Dhalted Mo (Dinit Mo x) = false := by
+    intro x
+    exact Dinit_not_halted_of_start_false Mo x
+      (DPolyTimeComputableClean_nonempty_start_false Mo po ro hhalto houto
+        (nodeConstraintBranch_nonempty_o))
+  refine ⟨_, inferInstance, inferInstance, D, P, R, ?_, ?_⟩
+  · intro z
+    cases z with
+    | nil =>
+        have hr := Drun_DDescDispatchTM_reject_empty Mcf Mct Mv Mn Ma Mo
+        have hle : 2 ≤ P.eval ([] : Word).length := by
+          simp [P]
+          omega
+        exact (Dhalted_and_output_of_reject_run D 2 (P.eval [].length) []
+          _ hle hr rfl rfl).1
+    | cons b1 z =>
+        cases b1
+        · cases z with
+          | nil =>
+              have hr := Drun_DDescDispatchTM_reject_false_nil Mcf Mct Mv Mn Ma Mo
+              have hle : 3 ≤ P.eval [false].length := by
+                simp [P]
+                omega
+              exact (Dhalted_and_output_of_reject_run D 3 (P.eval [false].length)
+                [false] _ hle hr rfl rfl).1
+          | cons b2 z =>
+              cases b2
+              · cases z with
+                | nil =>
+                    have hr := Drun_DDescDispatchTM_reject_false_false_nil Mcf Mct Mv Mn Ma Mo
+                    have hle : 4 ≤ P.eval [false, false].length := by
+                      simp [P]
+                      omega
+                    exact (Dhalted_and_output_of_reject_run D 4
+                      (P.eval [false, false].length) [false, false] _ hle hr rfl rfl).1
+                | cons b3 suffix =>
+                    cases b3
+                    · -- const false branch
+                      have hrun := Drun_DDescDispatchTM_cF_complete
+                        Mcf Mct Mv Mn Ma Mo pcf hnocf hstartcf hhaltcf suffix
+                      have hmono : pcf.eval suffix.length ≤
+                          pcf.eval (false :: false :: false :: suffix).length :=
+                        timeBound_eval_monotone pcf (by simp; omega)
+                      have hTi :
+                          4 + (suffix.length + 1) + (1 + pcf.eval suffix.length) ≤
+                            P.eval (false :: false :: false :: suffix).length := by
+                        simp [P] at hmono ⊢
+                        omega
+                      have hres := Dhalted_and_output_of_branch_run D Mcf
+                        DDescDispatchState.done DDescDispatchState.reject hDacc hDrej
+                        (4 + (suffix.length + 1) + (1 + pcf.eval suffix.length))
+                        (P.eval (false :: false :: false :: suffix).length)
+                        (pcf.eval suffix.length)
+                        (false :: false :: false :: suffix)
+                        (Drun Mcf (pcf.eval suffix.length) (Dinit Mcf suffix))
+                        (constFalseConstraintEncode (firstUnaryCode suffix))
+                        hTi hrun (hhaltcf suffix) (houtcf suffix).1
+                      exact hres.1
+                    · -- const true branch
+                      have hrun := Drun_DDescDispatchTM_cT_complete
+                        Mcf Mct Mv Mn Ma Mo pct hnoct hstartct hhaltct suffix
+                      have hmono : pct.eval suffix.length ≤
+                          pct.eval (false :: false :: true :: suffix).length :=
+                        timeBound_eval_monotone pct (by simp; omega)
+                      have hTi :
+                          4 + (suffix.length + 1) + (1 + pct.eval suffix.length) ≤
+                            P.eval (false :: false :: true :: suffix).length := by
+                        simp [P] at hmono ⊢
+                        omega
+                      have hres := Dhalted_and_output_of_branch_run D Mct
+                        DDescDispatchState.done DDescDispatchState.reject hDacc hDrej
+                        (4 + (suffix.length + 1) + (1 + pct.eval suffix.length))
+                        (P.eval (false :: false :: true :: suffix).length)
+                        (pct.eval suffix.length)
+                        (false :: false :: true :: suffix)
+                        (Drun Mct (pct.eval suffix.length) (Dinit Mct suffix))
+                        (constTrueConstraintEncode (firstUnaryCode suffix))
+                        hTi hrun (hhaltct suffix) (houtct suffix).1
+                      exact hres.1
+              · -- var branch
+                have hrun := Drun_DDescDispatchTM_cV_complete
+                  Mcf Mct Mv Mn Ma Mo pv hnov hstartv hhaltv z
+                have hmono : pv.eval z.length ≤ pv.eval (false :: true :: z).length :=
+                  timeBound_eval_monotone pv (by simp; omega)
+                have hTi :
+                    3 + (z.length + 1) + (1 + pv.eval z.length) ≤
+                      P.eval (false :: true :: z).length := by
+                  simp [P] at hmono ⊢
+                  omega
+                have hres := Dhalted_and_output_of_branch_run D Mv
+                  DDescDispatchState.done DDescDispatchState.reject hDacc hDrej
+                  (3 + (z.length + 1) + (1 + pv.eval z.length))
+                  (P.eval (false :: true :: z).length) (pv.eval z.length)
+                  (false :: true :: z)
+                  (Drun Mv (pv.eval z.length) (Dinit Mv z))
+                  (varNodeConstraintEncodeFromPair z)
+                  hTi hrun (hhaltv z) (houtv z).1
+                exact hres.1
+        · cases z with
+          | nil =>
+              have hr := Drun_DDescDispatchTM_reject_true_nil Mcf Mct Mv Mn Ma Mo
+              have hle : 3 ≤ P.eval [true].length := by
+                simp [P]
+                omega
+              exact (Dhalted_and_output_of_reject_run D 3 (P.eval [true].length)
+                [true] _ hle hr rfl rfl).1
+          | cons b2 z =>
+              cases b2
+              · cases z with
+                | nil =>
+                    have hr := Drun_DDescDispatchTM_reject_true_false_nil Mcf Mct Mv Mn Ma Mo
+                    have hle : 4 ≤ P.eval [true, false].length := by
+                      simp [P]
+                      omega
+                    exact (Dhalted_and_output_of_reject_run D 4
+                      (P.eval [true, false].length) [true, false] _ hle hr rfl rfl).1
+                | cons b3 suffix =>
+                    cases b3
+                    · -- not branch
+                      have hrun := Drun_DDescDispatchTM_cN_complete
+                        Mcf Mct Mv Mn Ma Mo pn hnon hstartn hhaltn suffix
+                      have hmono : pn.eval suffix.length ≤
+                          pn.eval (true :: false :: false :: suffix).length :=
+                        timeBound_eval_monotone pn (by simp; omega)
+                      have hTi :
+                          4 + (suffix.length + 1) + (1 + pn.eval suffix.length) ≤
+                            P.eval (true :: false :: false :: suffix).length := by
+                        simp [P] at hmono ⊢
+                        omega
+                      have hres := Dhalted_and_output_of_branch_run D Mn
+                        DDescDispatchState.done DDescDispatchState.reject hDacc hDrej
+                        (4 + (suffix.length + 1) + (1 + pn.eval suffix.length))
+                        (P.eval (true :: false :: false :: suffix).length)
+                        (pn.eval suffix.length) (true :: false :: false :: suffix)
+                        (Drun Mn (pn.eval suffix.length) (Dinit Mn suffix))
+                        (notNodeConstraintEncodeFromPair suffix)
+                        hTi hrun (hhaltn suffix) (houtn suffix).1
+                      exact hres.1
+                    · -- and branch
+                      have hrun := Drun_DDescDispatchTM_cA_complete
+                        Mcf Mct Mv Mn Ma Mo pa hnoa hstarta hhalta suffix
+                      have hmono : pa.eval suffix.length ≤
+                          pa.eval (true :: false :: true :: suffix).length :=
+                        timeBound_eval_monotone pa (by simp; omega)
+                      have hTi :
+                          4 + (suffix.length + 1) + (1 + pa.eval suffix.length) ≤
+                            P.eval (true :: false :: true :: suffix).length := by
+                        simp [P] at hmono ⊢
+                        omega
+                      have hres := Dhalted_and_output_of_branch_run D Ma
+                        DDescDispatchState.done DDescDispatchState.reject hDacc hDrej
+                        (4 + (suffix.length + 1) + (1 + pa.eval suffix.length))
+                        (P.eval (true :: false :: true :: suffix).length)
+                        (pa.eval suffix.length) (true :: false :: true :: suffix)
+                        (Drun Ma (pa.eval suffix.length) (Dinit Ma suffix))
+                        (andNodeConstraintEncodeFromTriple suffix)
+                        hTi hrun (hhalta suffix) (houta suffix).1
+                      exact hres.1
+              · cases z with
+                | nil =>
+                    have hr := Drun_DDescDispatchTM_reject_true_true_nil Mcf Mct Mv Mn Ma Mo
+                    have hle : 4 ≤ P.eval [true, true].length := by
+                      simp [P]
+                      omega
+                    exact (Dhalted_and_output_of_reject_run D 4
+                      (P.eval [true, true].length) [true, true] _ hle hr rfl rfl).1
+                | cons b3 suffix =>
+                    cases b3
+                    · have hr := Drun_DDescDispatchTM_reject_true_true_false
+                          Mcf Mct Mv Mn Ma Mo suffix
+                      have hle : 4 ≤ P.eval (true :: true :: false :: suffix).length := by
+                        simp [P]
+                        omega
+                      exact (Dhalted_and_output_of_reject_run D 4
+                        (P.eval (true :: true :: false :: suffix).length)
+                        (true :: true :: false :: suffix) _ hle hr rfl rfl).1
+                    · -- or branch
+                      have hrun := Drun_DDescDispatchTM_cO_complete
+                        Mcf Mct Mv Mn Ma Mo po hnoo hstarto hhalto suffix
+                      have hmono : po.eval suffix.length ≤
+                          po.eval (true :: true :: true :: suffix).length :=
+                        timeBound_eval_monotone po (by simp; omega)
+                      have hTi :
+                          4 + (suffix.length + 1) + (1 + po.eval suffix.length) ≤
+                            P.eval (true :: true :: true :: suffix).length := by
+                        simp [P] at hmono ⊢
+                        omega
+                      have hres := Dhalted_and_output_of_branch_run D Mo
+                        DDescDispatchState.done DDescDispatchState.reject hDacc hDrej
+                        (4 + (suffix.length + 1) + (1 + po.eval suffix.length))
+                        (P.eval (true :: true :: true :: suffix).length)
+                        (po.eval suffix.length) (true :: true :: true :: suffix)
+                        (Drun Mo (po.eval suffix.length) (Dinit Mo suffix))
+                        (orNodeConstraintEncodeFromTriple suffix)
+                        hTi hrun (hhalto suffix) (houto suffix).1
+                      exact hres.1
+  · intro z
+    constructor
+    · cases z with
+      | nil =>
+          have hr := Drun_DDescDispatchTM_reject_empty Mcf Mct Mv Mn Ma Mo
+          have hle : 2 ≤ P.eval ([] : Word).length := by
+            simp [P]
+            omega
+          exact (Dhalted_and_output_of_reject_run D 2 (P.eval [].length) []
+            _ hle hr rfl rfl).2
+      | cons b1 z =>
+          cases b1
+          · cases z with
+            | nil =>
+                have hr := Drun_DDescDispatchTM_reject_false_nil Mcf Mct Mv Mn Ma Mo
+                have hle : 3 ≤ P.eval [false].length := by
+                  simp [P]
+                  omega
+                exact (Dhalted_and_output_of_reject_run D 3 (P.eval [false].length)
+                  [false] _ hle hr rfl rfl).2
+            | cons b2 z =>
+                cases b2
+                · cases z with
+                  | nil =>
+                      have hr := Drun_DDescDispatchTM_reject_false_false_nil Mcf Mct Mv Mn Ma Mo
+                      have hle : 4 ≤ P.eval [false, false].length := by
+                        simp [P]
+                        omega
+                      exact (Dhalted_and_output_of_reject_run D 4
+                        (P.eval [false, false].length) [false, false] _ hle hr rfl rfl).2
+                  | cons b3 suffix =>
+                      cases b3
+                      · -- const false output
+                        have hrun := Drun_DDescDispatchTM_cF_complete
+                          Mcf Mct Mv Mn Ma Mo pcf hnocf hstartcf hhaltcf suffix
+                        have hmono : pcf.eval suffix.length ≤
+                            pcf.eval (false :: false :: false :: suffix).length :=
+                          timeBound_eval_monotone pcf (by simp; omega)
+                        have hTi :
+                            4 + (suffix.length + 1) + (1 + pcf.eval suffix.length) ≤
+                              P.eval (false :: false :: false :: suffix).length := by
+                          simp [P] at hmono ⊢
+                          omega
+                        have hres := Dhalted_and_output_of_branch_run D Mcf
+                          DDescDispatchState.done DDescDispatchState.reject hDacc hDrej
+                          (4 + (suffix.length + 1) + (1 + pcf.eval suffix.length))
+                          (P.eval (false :: false :: false :: suffix).length)
+                          (pcf.eval suffix.length) (false :: false :: false :: suffix)
+                          (Drun Mcf (pcf.eval suffix.length) (Dinit Mcf suffix))
+                          (constFalseConstraintEncode (firstUnaryCode suffix))
+                          hTi hrun (hhaltcf suffix) (houtcf suffix).1
+                        simpa [Dboutput, nodeConstraintEncode] using hres.2
+                      · -- const true output
+                        have hrun := Drun_DDescDispatchTM_cT_complete
+                          Mcf Mct Mv Mn Ma Mo pct hnoct hstartct hhaltct suffix
+                        have hmono : pct.eval suffix.length ≤
+                            pct.eval (false :: false :: true :: suffix).length :=
+                          timeBound_eval_monotone pct (by simp; omega)
+                        have hTi :
+                            4 + (suffix.length + 1) + (1 + pct.eval suffix.length) ≤
+                              P.eval (false :: false :: true :: suffix).length := by
+                          simp [P] at hmono ⊢
+                          omega
+                        have hres := Dhalted_and_output_of_branch_run D Mct
+                          DDescDispatchState.done DDescDispatchState.reject hDacc hDrej
+                          (4 + (suffix.length + 1) + (1 + pct.eval suffix.length))
+                          (P.eval (false :: false :: true :: suffix).length)
+                          (pct.eval suffix.length) (false :: false :: true :: suffix)
+                          (Drun Mct (pct.eval suffix.length) (Dinit Mct suffix))
+                          (constTrueConstraintEncode (firstUnaryCode suffix))
+                          hTi hrun (hhaltct suffix) (houtct suffix).1
+                        simpa [Dboutput, nodeConstraintEncode] using hres.2
+                · -- var output
+                  have hrun := Drun_DDescDispatchTM_cV_complete
+                    Mcf Mct Mv Mn Ma Mo pv hnov hstartv hhaltv z
+                  have hmono : pv.eval z.length ≤ pv.eval (false :: true :: z).length :=
+                    timeBound_eval_monotone pv (by simp; omega)
+                  have hTi :
+                      3 + (z.length + 1) + (1 + pv.eval z.length) ≤
+                        P.eval (false :: true :: z).length := by
+                    simp [P] at hmono ⊢
+                    omega
+                  have hres := Dhalted_and_output_of_branch_run D Mv
+                    DDescDispatchState.done DDescDispatchState.reject hDacc hDrej
+                    (3 + (z.length + 1) + (1 + pv.eval z.length))
+                    (P.eval (false :: true :: z).length) (pv.eval z.length)
+                    (false :: true :: z)
+                    (Drun Mv (pv.eval z.length) (Dinit Mv z))
+                    (varNodeConstraintEncodeFromPair z)
+                    hTi hrun (hhaltv z) (houtv z).1
+                  simpa [Dboutput, nodeConstraintEncode] using hres.2
+          · cases z with
+            | nil =>
+                have hr := Drun_DDescDispatchTM_reject_true_nil Mcf Mct Mv Mn Ma Mo
+                have hle : 3 ≤ P.eval [true].length := by
+                  simp [P]
+                  omega
+                exact (Dhalted_and_output_of_reject_run D 3 (P.eval [true].length)
+                  [true] _ hle hr rfl rfl).2
+            | cons b2 z =>
+                cases b2
+                · cases z with
+                  | nil =>
+                      have hr := Drun_DDescDispatchTM_reject_true_false_nil Mcf Mct Mv Mn Ma Mo
+                      have hle : 4 ≤ P.eval [true, false].length := by
+                        simp [P]
+                        omega
+                      exact (Dhalted_and_output_of_reject_run D 4
+                        (P.eval [true, false].length) [true, false] _ hle hr rfl rfl).2
+                  | cons b3 suffix =>
+                      cases b3
+                      · -- not output
+                        have hrun := Drun_DDescDispatchTM_cN_complete
+                          Mcf Mct Mv Mn Ma Mo pn hnon hstartn hhaltn suffix
+                        have hmono : pn.eval suffix.length ≤
+                            pn.eval (true :: false :: false :: suffix).length :=
+                          timeBound_eval_monotone pn (by simp; omega)
+                        have hTi :
+                            4 + (suffix.length + 1) + (1 + pn.eval suffix.length) ≤
+                              P.eval (true :: false :: false :: suffix).length := by
+                          simp [P] at hmono ⊢
+                          omega
+                        have hres := Dhalted_and_output_of_branch_run D Mn
+                          DDescDispatchState.done DDescDispatchState.reject hDacc hDrej
+                          (4 + (suffix.length + 1) + (1 + pn.eval suffix.length))
+                          (P.eval (true :: false :: false :: suffix).length)
+                          (pn.eval suffix.length) (true :: false :: false :: suffix)
+                          (Drun Mn (pn.eval suffix.length) (Dinit Mn suffix))
+                          (notNodeConstraintEncodeFromPair suffix)
+                          hTi hrun (hhaltn suffix) (houtn suffix).1
+                        simpa [Dboutput, nodeConstraintEncode] using hres.2
+                      · -- and output
+                        have hrun := Drun_DDescDispatchTM_cA_complete
+                          Mcf Mct Mv Mn Ma Mo pa hnoa hstarta hhalta suffix
+                        have hmono : pa.eval suffix.length ≤
+                            pa.eval (true :: false :: true :: suffix).length :=
+                          timeBound_eval_monotone pa (by simp; omega)
+                        have hTi :
+                            4 + (suffix.length + 1) + (1 + pa.eval suffix.length) ≤
+                              P.eval (true :: false :: true :: suffix).length := by
+                          simp [P] at hmono ⊢
+                          omega
+                        have hres := Dhalted_and_output_of_branch_run D Ma
+                          DDescDispatchState.done DDescDispatchState.reject hDacc hDrej
+                          (4 + (suffix.length + 1) + (1 + pa.eval suffix.length))
+                          (P.eval (true :: false :: true :: suffix).length)
+                          (pa.eval suffix.length) (true :: false :: true :: suffix)
+                          (Drun Ma (pa.eval suffix.length) (Dinit Ma suffix))
+                          (andNodeConstraintEncodeFromTriple suffix)
+                          hTi hrun (hhalta suffix) (houta suffix).1
+                        simpa [Dboutput, nodeConstraintEncode] using hres.2
+                · cases z with
+                  | nil =>
+                      have hr := Drun_DDescDispatchTM_reject_true_true_nil Mcf Mct Mv Mn Ma Mo
+                      have hle : 4 ≤ P.eval [true, true].length := by
+                        simp [P]
+                        omega
+                      exact (Dhalted_and_output_of_reject_run D 4
+                        (P.eval [true, true].length) [true, true] _ hle hr rfl rfl).2
+                  | cons b3 suffix =>
+                      cases b3
+                      · have hr := Drun_DDescDispatchTM_reject_true_true_false
+                            Mcf Mct Mv Mn Ma Mo suffix
+                        have hle : 4 ≤ P.eval (true :: true :: false :: suffix).length := by
+                          simp [P]
+                          omega
+                        exact (Dhalted_and_output_of_reject_run D 4
+                          (P.eval (true :: true :: false :: suffix).length)
+                          (true :: true :: false :: suffix) _ hle hr rfl rfl).2
+                      · -- or output
+                        have hrun := Drun_DDescDispatchTM_cO_complete
+                          Mcf Mct Mv Mn Ma Mo po hnoo hstarto hhalto suffix
+                        have hmono : po.eval suffix.length ≤
+                            po.eval (true :: true :: true :: suffix).length :=
+                          timeBound_eval_monotone po (by simp; omega)
+                        have hTi :
+                            4 + (suffix.length + 1) + (1 + po.eval suffix.length) ≤
+                              P.eval (true :: true :: true :: suffix).length := by
+                          simp [P] at hmono ⊢
+                          omega
+                        have hres := Dhalted_and_output_of_branch_run D Mo
+                          DDescDispatchState.done DDescDispatchState.reject hDacc hDrej
+                          (4 + (suffix.length + 1) + (1 + po.eval suffix.length))
+                          (P.eval (true :: true :: true :: suffix).length)
+                          (po.eval suffix.length) (true :: true :: true :: suffix)
+                          (Drun Mo (po.eval suffix.length) (Dinit Mo suffix))
+                          (orNodeConstraintEncodeFromTriple suffix)
+                          hTi hrun (hhalto suffix) (houto suffix).1
+                        simpa [Dboutput, nodeConstraintEncode] using hres.2
+    · cases z with
+      | nil => simp [nodeConstraintEncode, R]
+      | cons b1 z =>
+          cases b1
+          · cases z with
+            | nil => simp [nodeConstraintEncode, R]
+            | cons b2 z =>
+                cases b2
+                · cases z with
+                  | nil => simp [nodeConstraintEncode, R]
+                  | cons b3 suffix =>
+                      cases b3
+                      · -- const false length
+                        have hlen := (houtcf suffix).2
+                        have hmono : rcf.eval suffix.length ≤
+                            rcf.eval (false :: false :: false :: suffix).length :=
+                          timeBound_eval_monotone rcf (by simp; omega)
+                        have hleR : rcf.eval (false :: false :: false :: suffix).length ≤
+                            R.eval (false :: false :: false :: suffix).length := by
+                          simp [R]
+                          omega
+                        calc
+                          (nodeConstraintEncode
+                              (false :: false :: false :: suffix)).length =
+                              (constFalseConstraintEncode (firstUnaryCode suffix)).length := by
+                                simp [nodeConstraintEncode]
+                          _ ≤ rcf.eval suffix.length := hlen
+                          _ ≤ rcf.eval (false :: false :: false :: suffix).length := hmono
+                          _ ≤ R.eval (false :: false :: false :: suffix).length := hleR
+                      · -- const true length
+                        have hlen := (houtct suffix).2
+                        have hmono : rct.eval suffix.length ≤
+                            rct.eval (false :: false :: true :: suffix).length :=
+                          timeBound_eval_monotone rct (by simp; omega)
+                        have hleR : rct.eval (false :: false :: true :: suffix).length ≤
+                            R.eval (false :: false :: true :: suffix).length := by
+                          simp [R]
+                          omega
+                        calc
+                          (nodeConstraintEncode
+                              (false :: false :: true :: suffix)).length =
+                              (constTrueConstraintEncode (firstUnaryCode suffix)).length := by
+                                simp [nodeConstraintEncode]
+                          _ ≤ rct.eval suffix.length := hlen
+                          _ ≤ rct.eval (false :: false :: true :: suffix).length := hmono
+                          _ ≤ R.eval (false :: false :: true :: suffix).length := hleR
+                · -- var length
+                  have hlen := (houtv z).2
+                  have hmono : rv.eval z.length ≤ rv.eval (false :: true :: z).length :=
+                    timeBound_eval_monotone rv (by simp; omega)
+                  have hleR : rv.eval (false :: true :: z).length ≤
+                      R.eval (false :: true :: z).length := by
+                    simp [R]
+                    omega
+                  calc
+                    (nodeConstraintEncode (false :: true :: z)).length =
+                        (varNodeConstraintEncodeFromPair z).length := by
+                          simp [nodeConstraintEncode]
+                    _ ≤ rv.eval z.length := hlen
+                    _ ≤ rv.eval (false :: true :: z).length := hmono
+                    _ ≤ R.eval (false :: true :: z).length := hleR
+          · cases z with
+            | nil => simp [nodeConstraintEncode, R]
+            | cons b2 z =>
+                cases b2
+                · cases z with
+                  | nil => simp [nodeConstraintEncode, R]
+                  | cons b3 suffix =>
+                      cases b3
+                      · -- not length
+                        have hlen := (houtn suffix).2
+                        have hmono : rn.eval suffix.length ≤
+                            rn.eval (true :: false :: false :: suffix).length :=
+                          timeBound_eval_monotone rn (by simp; omega)
+                        have hleR : rn.eval (true :: false :: false :: suffix).length ≤
+                            R.eval (true :: false :: false :: suffix).length := by
+                          simp [R]
+                          omega
+                        calc
+                          (nodeConstraintEncode
+                              (true :: false :: false :: suffix)).length =
+                              (notNodeConstraintEncodeFromPair suffix).length := by
+                                simp [nodeConstraintEncode]
+                          _ ≤ rn.eval suffix.length := hlen
+                          _ ≤ rn.eval (true :: false :: false :: suffix).length := hmono
+                          _ ≤ R.eval (true :: false :: false :: suffix).length := hleR
+                      · -- and length
+                        have hlen := (houta suffix).2
+                        have hmono : ra.eval suffix.length ≤
+                            ra.eval (true :: false :: true :: suffix).length :=
+                          timeBound_eval_monotone ra (by simp; omega)
+                        have hleR : ra.eval (true :: false :: true :: suffix).length ≤
+                            R.eval (true :: false :: true :: suffix).length := by
+                          simp [R]
+                          omega
+                        calc
+                          (nodeConstraintEncode
+                              (true :: false :: true :: suffix)).length =
+                              (andNodeConstraintEncodeFromTriple suffix).length := by
+                                simp [nodeConstraintEncode]
+                          _ ≤ ra.eval suffix.length := hlen
+                          _ ≤ ra.eval (true :: false :: true :: suffix).length := hmono
+                          _ ≤ R.eval (true :: false :: true :: suffix).length := hleR
+                · cases z with
+                  | nil => simp [nodeConstraintEncode, R]
+                  | cons b3 suffix =>
+                      cases b3
+                      · simp [nodeConstraintEncode, R]
+                      · -- or length
+                        have hlen := (houto suffix).2
+                        have hmono : ro.eval suffix.length ≤
+                            ro.eval (true :: true :: true :: suffix).length :=
+                          timeBound_eval_monotone ro (by simp; omega)
+                        have hleR : ro.eval (true :: true :: true :: suffix).length ≤
+                            R.eval (true :: true :: true :: suffix).length := by
+                          simp [R]
+                        calc
+                          (nodeConstraintEncode
+                              (true :: true :: true :: suffix)).length =
+                              (orNodeConstraintEncodeFromTriple suffix).length := by
+                                simp [nodeConstraintEncode]
+                          _ ≤ ro.eval suffix.length := hlen
+                          _ ≤ ro.eval (true :: true :: true :: suffix).length := hmono
+                          _ ≤ R.eval (true :: true :: true :: suffix).length := hleR
+
+
+
+-- ---------------------------------------------------------------------------
+-- Converse parser lemmas for unary codes, node descriptors, and descriptor
+-- sequences.  These record that every successful parse identifies a canonical
+-- prefix, which is the pure-data counterpart of the machine-realization work.
+-- ---------------------------------------------------------------------------
+
+namespace Circuit
+
+lemma parseNat_spec {w : Word} {n : Nat} {rest : Word}
+    (h : parseNat w = some (n, rest)) : w = Formula.encodeNat n ++ rest := by
+  induction w generalizing n rest with
+  | nil => simp [parseNat] at h
+  | cons b w ih =>
+      cases b with
+      | false =>
+          simp [parseNat] at h
+          rcases h with ⟨hn, hr⟩
+          subst n
+          subst rest
+          simp [Formula.encodeNat]
+      | true =>
+          cases ho : parseNat w with
+          | none => simp [parseNat, ho] at h
+          | some p =>
+              rcases p with ⟨n', rest'⟩
+              have hw : w = Formula.encodeNat n' ++ rest' := ih ho
+              simp [parseNat, ho] at h
+              rcases h with ⟨hn, hr⟩
+              subst n
+              subst rest
+              simp [Formula.encodeNat, List.replicate_succ, hw]
+
+end Circuit
+
+lemma parseNat2_spec {w : Word} {a b : Nat} {rest : Word}
+    (h : parseNat2 w = some (a, b, rest)) :
+    w = Formula.encodeNat a ++ Formula.encodeNat b ++ rest := by
+  unfold parseNat2 at h
+  cases ho1 : Circuit.parseNat w with
+  | none => simp [ho1] at h
+  | some p1 =>
+      rcases p1 with ⟨a1, r1⟩
+      cases ho2 : Circuit.parseNat r1 with
+      | none => simp [ho1, ho2] at h
+      | some p2 =>
+          rcases p2 with ⟨b1, r2⟩
+          simp [ho1, ho2] at h
+          rcases h with ⟨rfl, rfl, rfl⟩
+          rw [Circuit.parseNat_spec ho1, Circuit.parseNat_spec ho2]
+          simp [List.append_assoc]
+
+lemma parseNat3_spec {w : Word} {a b c : Nat} {rest : Word}
+    (h : parseNat3 w = some (a, b, c, rest)) :
+    w = Formula.encodeNat a ++ Formula.encodeNat b ++ Formula.encodeNat c ++ rest := by
+  unfold parseNat3 at h
+  cases ho1 : Circuit.parseNat w with
+  | none => simp [ho1] at h
+  | some p1 =>
+      rcases p1 with ⟨a1, r1⟩
+      cases ho2 : Circuit.parseNat r1 with
+      | none => simp [ho1, ho2] at h
+      | some p2 =>
+          rcases p2 with ⟨b1, r2⟩
+          cases ho3 : Circuit.parseNat r2 with
+          | none => simp [ho1, ho2, ho3] at h
+          | some p3 =>
+              rcases p3 with ⟨c1, r3⟩
+              simp [ho1, ho2, ho3] at h
+              rcases h with ⟨rfl, rfl, rfl, rfl⟩
+              rw [Circuit.parseNat_spec ho1, Circuit.parseNat_spec ho2,
+                Circuit.parseNat_spec ho3]
+              simp [List.append_assoc]
+
+lemma parseNodeDescRest_spec {z : Word} {d : NodeDesc} {rest : Word}
+    (h : parseNodeDescRest z = some (d, rest)) :
+    z = d.encode ++ rest := by
+  cases z with
+  | nil => simp [parseNodeDescRest] at h
+  | cons b1 z1 =>
+      cases b1
+      · cases z1 with
+        | nil => simp [parseNodeDescRest] at h
+        | cons b2 z2 =>
+            cases b2
+            · cases z2 with
+              | nil => simp [parseNodeDescRest] at h
+              | cons b3 z3 =>
+                  cases b3
+                  · cases ho : Circuit.parseNat z3 with
+                    | none => simp [parseNodeDescRest, ho] at h
+                    | some p =>
+                        rcases p with ⟨a, r⟩
+                        simp [parseNodeDescRest, ho] at h
+                        rcases h with ⟨rfl, rfl⟩
+                        rw [Circuit.parseNat_spec ho]
+                        simp [NodeDesc.encode]
+                  · cases ho : Circuit.parseNat z3 with
+                    | none => simp [parseNodeDescRest, ho] at h
+                    | some p =>
+                        rcases p with ⟨a, r⟩
+                        simp [parseNodeDescRest, ho] at h
+                        rcases h with ⟨rfl, rfl⟩
+                        rw [Circuit.parseNat_spec ho]
+                        simp [NodeDesc.encode]
+            · cases ho : parseNat2 z2 with
+              | none => simp [parseNodeDescRest, ho] at h
+              | some p =>
+                  rcases p with ⟨a, b, r⟩
+                  simp [parseNodeDescRest, ho] at h
+                  rcases h with ⟨rfl, rfl⟩
+                  rw [parseNat2_spec ho]
+                  simp [NodeDesc.encode]
+      · cases z1 with
+        | nil => simp [parseNodeDescRest] at h
+        | cons b2 z2 =>
+            cases b2
+            · cases z2 with
+              | nil => simp [parseNodeDescRest] at h
+              | cons b3 z3 =>
+                  cases b3
+                  · cases ho : parseNat2 z3 with
+                    | none => simp [parseNodeDescRest, ho] at h
+                    | some p =>
+                        rcases p with ⟨a, b, r⟩
+                        simp [parseNodeDescRest, ho] at h
+                        rcases h with ⟨rfl, rfl⟩
+                        rw [parseNat2_spec ho]
+                        simp [NodeDesc.encode]
+                  · cases ho : parseNat3 z3 with
+                    | none => simp [parseNodeDescRest, ho] at h
+                    | some p =>
+                        rcases p with ⟨a, b, c, r⟩
+                        simp [parseNodeDescRest, ho] at h
+                        rcases h with ⟨rfl, rfl⟩
+                        rw [parseNat3_spec ho]
+                        simp [NodeDesc.encode]
+            · cases z2 with
+              | nil => simp [parseNodeDescRest] at h
+              | cons b3 z3 =>
+                  cases b3
+                  · simp [parseNodeDescRest] at h
+                  · cases ho : parseNat3 z3 with
+                    | none => simp [parseNodeDescRest, ho] at h
+                    | some p =>
+                        rcases p with ⟨a, b, c, r⟩
+                        simp [parseNodeDescRest, ho] at h
+                        rcases h with ⟨rfl, rfl⟩
+                        rw [parseNat3_spec ho]
+                        simp [NodeDesc.encode]
+
+lemma parseNodeDescSeqFuel_succ_not_term (n : Nat) {z : Word}
+    (hterm : ¬ ∃ r : Word, z = true :: true :: false :: r) :
+    parseNodeDescSeqFuel (n + 1) z =
+      match parseNodeDescRest z with
+      | some (d, r) =>
+          match parseNodeDescSeqFuel n r with
+          | some (ds, r') => some (d :: ds, r')
+          | none => none
+      | none => none := by
+  cases z with
+  | nil => rfl
+  | cons b1 z1 =>
+      cases b1
+      · rfl
+      · cases z1 with
+        | nil => rfl
+        | cons b2 z2 =>
+            cases b2
+            · rfl
+            · cases z2 with
+              | nil => rfl
+              | cons b3 z3 =>
+                  cases b3
+                  · exfalso
+                    exact hterm ⟨z3, rfl⟩
+                  · rfl
+
+lemma parseNodeDescSeqFuel_spec {n : Nat} {z : Word} {ds : List NodeDesc} {rest : Word}
+    (h : parseNodeDescSeqFuel n z = some (ds, rest)) :
+    z = NodeDescSeq.encode ds ++ rest := by
+  induction n generalizing z ds rest with
+  | zero =>
+      cases z with
+      | nil => simp [parseNodeDescSeqFuel] at h
+      | cons b1 z1 =>
+          cases b1
+          · simp [parseNodeDescSeqFuel] at h
+          · cases z1 with
+            | nil => simp [parseNodeDescSeqFuel] at h
+            | cons b2 z2 =>
+                cases b2
+                · simp [parseNodeDescSeqFuel] at h
+                · cases z2 with
+                  | nil => simp [parseNodeDescSeqFuel] at h
+                  | cons b3 rest' =>
+                      cases b3
+                      · simp [parseNodeDescSeqFuel] at h
+                        rcases h with ⟨rfl, rfl⟩
+                        simp [NodeDescSeq.encode]
+                      · simp [parseNodeDescSeqFuel] at h
+  | succ n ih =>
+      by_cases hterm : ∃ r : Word, z = true :: true :: false :: r
+      · rcases hterm with ⟨r, rfl⟩
+        simp [parseNodeDescSeqFuel] at h
+        rcases h with ⟨rfl, rfl⟩
+        simp [NodeDescSeq.encode]
+      · rw [parseNodeDescSeqFuel_succ_not_term n hterm] at h
+        cases ho : parseNodeDescRest z with
+        | none => simp [ho] at h
+        | some p =>
+            rcases p with ⟨d, r⟩
+            cases ho2 : parseNodeDescSeqFuel n r with
+            | none => simp [ho, ho2] at h
+            | some p2 =>
+                rcases p2 with ⟨ds', rest'⟩
+                simp [ho, ho2] at h
+                rcases h with ⟨rfl, rfl⟩
+                have hz : z = d.encode ++ r := parseNodeDescRest_spec ho
+                have hr : r = NodeDescSeq.encode ds' ++ rest' := ih ho2
+                rw [hz, hr]
+                simp [NodeDescSeq.encode, List.append_assoc]
+
+lemma parseNodeDescSeq_spec {z : Word} {ds : List NodeDesc} {rest : Word}
+    (h : parseNodeDescSeq z = some (ds, rest)) :
+    z = NodeDescSeq.encode ds ++ rest := by
+  unfold parseNodeDescSeq at h
+  exact parseNodeDescSeqFuel_spec h
+
+
+-- ---------------------------------------------------------------------------
+-- Length bounds for parsing and assembling descriptor sequences.
+-- ---------------------------------------------------------------------------
+
+lemma Circuit.parseNat_le_length {w : Word} {n : Nat} {rest : Word}
+    (h : parseNat w = some (n, rest)) : n ≤ w.length := by
+  rw [Circuit.parseNat_spec h]
+  simp [Formula.encodeNat_length]
+  omega
+
+lemma andMany_encode_length_le (fs : List Formula) (B : Nat)
+    (hB : ∀ f ∈ fs, f.encode.length ≤ B) :
+    (andMany fs).encode.length ≤ 10 + fs.length * (B + 2) := by
+  induction fs with
+  | nil =>
+      simp [andMany, Formula.trueFormula, Formula.encode_or_eq,
+        Formula.encode_not_eq, Formula.encode_var_eq, Formula.encodeNat_length]
+  | cons f fs ih =>
+      have hf : f.encode.length ≤ B := hB f (by simp)
+      have hfs : ∀ g ∈ fs, g.encode.length ≤ B := by
+        intro g hg
+        exact hB g (by simp [hg])
+      have hi := ih hfs
+      simp [andMany, Formula.encode_and_eq, Nat.succ_mul]
+      omega
+
+lemma NodeDescSeq.encode_mem_length_le {d : NodeDesc} {ds : List NodeDesc}
+    (hd : d ∈ ds) : d.encode.length ≤ (NodeDescSeq.encode ds).length := by
+  induction ds with
+  | nil => simp at hd
+  | cons e es ih =>
+      simp [NodeDescSeq.encode] at hd ⊢
+      rcases hd with rfl | hd
+      · simp
+      · have hle := ih hd
+        omega
+
+lemma nodeConstraintSeqEncode_length_le (z : Word) :
+    (nodeConstraintSeqEncode z).length ≤ 10 + z.length * (100 * z.length + 2) := by
+  unfold nodeConstraintSeqEncode
+  cases ho : parseNodeDescSeq z with
+  | none => simp
+  | some p =>
+      rcases p with ⟨ds, rest⟩
+      have hz : z = NodeDescSeq.encode ds ++ rest := parseNodeDescSeq_spec ho
+      have hds : ds.length ≤ z.length := by
+        rw [hz]
+        simp only [List.length_append]
+        have h := NodeDescSeq.encode_length ds
+        omega
+      have hB : ∀ d ∈ ds, (nodeConstraintFormula d).encode.length ≤ 100 * z.length := by
+        intro d hd
+        have hde : d.encode.length ≤ (NodeDescSeq.encode ds).length :=
+          NodeDescSeq.encode_mem_length_le hd
+        have hdez : d.encode.length ≤ z.length := by
+          rw [hz]
+          simp only [List.length_append]
+          omega
+        exact (nodeConstraintFormula_encode_length_le_encode_length d).trans
+          (Nat.mul_le_mul_left 100 hdez)
+      have hmap : ∀ f ∈ ds.map nodeConstraintFormula,
+          f.encode.length ≤ 100 * z.length := by
+        intro f hf
+        rcases List.mem_map.1 hf with ⟨d, hd, rfl⟩
+        exact hB d hd
+      have hand := andMany_encode_length_le (ds.map nodeConstraintFormula)
+        (100 * z.length) hmap
+      have hand' : (andMany (ds.map nodeConstraintFormula)).encode.length ≤
+          10 + ds.length * (100 * z.length + 2) := by
+        simpa [List.length_map] using hand
+      have hmul : ds.length * (100 * z.length + 2) ≤
+          z.length * (100 * z.length + 2) := Nat.mul_le_mul_right _ hds
+      exact hand'.trans (Nat.add_le_add_left hmul 10)
+
+noncomputable def nodeConstraintSeqEncodePoly : TimeBound := C 10 + X * (C 100 * X + C 2)
+
+lemma nodeConstraintSeqEncode_length_le_poly (z : Word) :
+    (nodeConstraintSeqEncode z).length ≤ nodeConstraintSeqEncodePoly.eval z.length := by
+  simpa [nodeConstraintSeqEncodePoly] using nodeConstraintSeqEncode_length_le z
+
+lemma tseitinAssemble_length_le (z : Word) :
+    (tseitinAssemble z).length ≤ 15 + z.length * (100 * z.length + 3) := by
+  unfold tseitinAssemble
+  cases ho : parseNodeDescSeq z with
+  | none => simp
+  | some p =>
+      rcases p with ⟨ds, rest⟩
+      simp only
+      cases hnat : Circuit.parseNat rest with
+      | none => simp [hnat]
+      | some q =>
+          rcases q with ⟨i, r⟩
+          simp only [hnat]
+          have hz : z = NodeDescSeq.encode ds ++ rest := parseNodeDescSeq_spec ho
+          have hds : ds.length ≤ z.length := by
+            rw [hz]
+            simp only [List.length_append]
+            have h := NodeDescSeq.encode_length ds
+            omega
+          have hi_rest : i ≤ rest.length := Circuit.parseNat_le_length hnat
+          have hi : i ≤ z.length := by
+            rw [hz]
+            simp only [List.length_append] at hi_rest ⊢
+            omega
+          have hB : ∀ d ∈ ds, (nodeConstraintFormula d).encode.length ≤ 100 * z.length := by
+            intro d hd
+            have hde : d.encode.length ≤ (NodeDescSeq.encode ds).length :=
+              NodeDescSeq.encode_mem_length_le hd
+            have hdez : d.encode.length ≤ z.length := by
+              rw [hz]
+              simp only [List.length_append]
+              omega
+            exact (nodeConstraintFormula_encode_length_le_encode_length d).trans
+              (Nat.mul_le_mul_left 100 hdez)
+          have hmap : ∀ f ∈ ds.map nodeConstraintFormula,
+              f.encode.length ≤ 100 * z.length := by
+            intro f hf
+            rcases List.mem_map.1 hf with ⟨d, hd, rfl⟩
+            exact hB d hd
+          have hand := andMany_encode_length_le (ds.map nodeConstraintFormula)
+            (100 * z.length) hmap
+          have hand' : (andMany (ds.map nodeConstraintFormula)).encode.length ≤
+              10 + ds.length * (100 * z.length + 2) := by
+            simpa [List.length_map] using hand
+          have hmul : ds.length * (100 * z.length + 2) ≤
+              z.length * (100 * z.length + 2) := Nat.mul_le_mul_right _ hds
+          have hpoly : z.length * (100 * z.length + 3) =
+              z.length * (100 * z.length + 2) + z.length := by
+            rw [Nat.mul_add, Nat.mul_add]
+            omega
+          rw [hpoly]
+          change ((Formula.and (andMany (ds.map nodeConstraintFormula))
+            (Formula.var i)).encode).length ≤
+              15 + (z.length * (100 * z.length + 2) + z.length)
+          simp [Formula.encode_and_eq, Formula.encode_var_eq, Formula.encodeNat_length]
+          omega
+
+noncomputable def tseitinAssemblePoly : TimeBound := C 15 + X * (C 100 * X + C 3)
+
+lemma tseitinAssemble_length_le_poly (z : Word) :
+    (tseitinAssemble z).length ≤ tseitinAssemblePoly.eval z.length := by
+  simpa [tseitinAssemblePoly] using tseitinAssemble_length_le z
+
+-- ---------------------------------------------------------------------------
+-- Explicit machine-construction obligations for the DAG route
+-- ---------------------------------------------------------------------------
+
+/-- Iterating the proved one-descriptor encoder over a parsed descriptor
+     sequence is still a machine-construction obligation. -/
+def NodeConstraintSeqEncodeComputable : Prop :=
+  DPolyTimeComputable nodeConstraintSeqEncode
+
+/-- Building a transducer for `tseitinAssemble` from the sequence encoder is
+     likewise left explicit rather than assumed. -/
+def TseitinAssembleComputable : Prop :=
+  DPolyTimeComputable tseitinAssemble
+
+/-- The two DAG subroutines required by the reduction.  These are not axioms:
+     they remain unproved `Prop`s until the corresponding transducers are built. -/
+def DAGReductionSubroutinesComputable : Prop :=
+  (∀ (V : TM) (p q : TimeBound),
+      DPolyTimeComputable (npReductionCoreDAG V p q)) ∧
+  (∀ (V : TM) (p q : TimeBound),
+      DPolyTimeComputable (npReductionAssemblerDAG V p q))
+
+/-- Packaging the DAG subroutines into the general DTM obligation. -/
+theorem NPReductionDTMSubroutineObligation_of_dag_computable
+    (h : DAGReductionSubroutinesComputable) :
+    NPReductionDTMSubroutineObligation :=
+  NPReductionDTMSubroutineObligation_of_dag h.1 h.2
+
+/-- The full route 3b conclusion, conditional only on explicit hypotheses:
+     the DAG transducers, the DTM/ TM bridge, SAT verifier realization, and the
+     lower bound `SATNotInPPoly`. -/
+theorem not_PEqualsNP_of_dag_obligations
+    (hv : SATVerifierTMExists) (hbridge : DTMPolyTimeBridge)
+    (hsub : DAGReductionSubroutinesComputable) (hlow : SATNotInPPoly) :
+    ¬ PEqualsNP :=
+  not_PEqualsNP_of_DTM_obligations hv hbridge
+    (NPReductionDTMSubroutineObligation_of_dag_computable hsub) hlow
+
+
+
+-- ---------------------------------------------------------------------------
+-- A total output-length bound for the DAG assembler.
+-- ---------------------------------------------------------------------------
+
+lemma Formula.and_var_sub_length_le (f : Formula) (L : Nat) :
+    (Formula.and f (Formula.var (L - f.encode.length - 5))).encode.length
+      ≤ L + f.encode.length + 5 := by
+  simp [Formula.encode_and_eq, Formula.encode_var_eq, Formula.encodeNat_length]
+  omega
+
+lemma andMany_nodeConstraint_encode_length_le_of_seq (ds : List NodeDesc) (n : Nat)
+    (hseq : (NodeDescSeq.encode ds).length ≤ n) :
+    (andMany (ds.map nodeConstraintFormula)).encode.length ≤
+      10 + n * (100 * n + 2) := by
+  have hds : ds.length ≤ n := by
+    have hlen := NodeDescSeq.encode_length ds
+    omega
+  have hB : ∀ d ∈ ds, (nodeConstraintFormula d).encode.length ≤ 100 * n := by
+    intro d hd
+    have hde : d.encode.length ≤ (NodeDescSeq.encode ds).length :=
+      NodeDescSeq.encode_mem_length_le hd
+    exact (nodeConstraintFormula_encode_length_le_encode_length d).trans
+      (Nat.mul_le_mul_left 100 (hde.trans hseq))
+  have hmap : ∀ f ∈ ds.map nodeConstraintFormula,
+      f.encode.length ≤ 100 * n := by
+    intro f hf
+    rcases List.mem_map.1 hf with ⟨d, hd, rfl⟩
+    exact hB d hd
+  have hand := andMany_encode_length_le (ds.map nodeConstraintFormula)
+    (100 * n) hmap
+  have hand' : (andMany (ds.map nodeConstraintFormula)).encode.length ≤
+      10 + ds.length * (100 * n + 2) := by
+    simpa [List.length_map] using hand
+  have hmul : ds.length * (100 * n + 2) ≤ n * (100 * n + 2) :=
+    Nat.mul_le_mul_right _ hds
+  exact hand'.trans (Nat.add_le_add_left hmul 10)
+
+noncomputable def npReductionAssemblerPoly : TimeBound :=
+  C 20 + X * (C 100 * X + C 4)
+
+lemma npReductionAssemblerDAG_length_le_poly (V : TM) (p q : TimeBound) (z : Word) :
+    (npReductionAssemblerDAG V p q z).length ≤
+      npReductionAssemblerPoly.eval z.length := by
+  unfold npReductionAssemblerDAG
+  cases hL : Circuit.parseNat z with
+  | none => simp
+  | some pL =>
+      rcases pL with ⟨L, rest⟩
+      simp only
+      have hzL : z = Formula.encodeNat L ++ rest := Circuit.parseNat_spec hL
+      have hrest_le : rest.length ≤ z.length := by
+        rw [hzL]
+        simp [Formula.encodeNat_length]
+      have hLle : L ≤ z.length := Circuit.parseNat_le_length hL
+      cases hds : parseNodeDescSeq rest with
+      | none => simp
+      | some pds =>
+          rcases pds with ⟨ds, r⟩
+          simp only
+          have hzds : rest = NodeDescSeq.encode ds ++ r := parseNodeDescSeq_spec hds
+          have hseq : (NodeDescSeq.encode ds).length ≤ z.length := by
+            rw [hzds] at hrest_le
+            simp only [List.length_append] at hrest_le ⊢
+            omega
+          have hdsle : ds.length ≤ z.length := by
+            have hlen := NodeDescSeq.encode_length ds
+            omega
+          cases hi : Circuit.parseNat r with
+          | none => simp
+          | some pi =>
+              rcases pi with ⟨i, _⟩
+              simp only
+              have hi_r : i ≤ r.length := Circuit.parseNat_le_length hi
+              have hr_le : r.length ≤ z.length := by
+                rw [hzds] at hrest_le
+                simp only [List.length_append] at hrest_le ⊢
+                omega
+              have hi_z : i ≤ z.length := hi_r.trans hr_le
+              have hf := andMany_nodeConstraint_encode_length_le_of_seq ds z.length hseq
+              change (assembleFixedFromTseitin L ds i).length ≤
+                npReductionAssemblerPoly.eval z.length
+              unfold assembleFixedFromTseitin
+              dsimp only
+              have hraw := Formula.and_var_sub_length_le
+                (Formula.and (andMany (ds.map nodeConstraintFormula)) (Formula.var i)) L
+              have hfencode :
+                  ((Formula.and (andMany (ds.map nodeConstraintFormula))
+                    (Formula.var i)).encode).length ≤
+                    (andMany (ds.map nodeConstraintFormula)).encode.length + i + 5 := by
+                simp [Formula.encode_and_eq, Formula.encode_var_eq, Formula.encodeNat_length]
+                omega
+              have hpoly : z.length * (100 * z.length + 4) =
+                  z.length * (100 * z.length + 2) + 2 * z.length := by
+                rw [Nat.mul_add, Nat.mul_add]
+                omega
+              simp [npReductionAssemblerPoly, Polynomial.eval_add, Polynomial.eval_mul,
+                Polynomial.eval_X]
+              rw [hpoly]
+              omega
+
+
+
+-- ---------------------------------------------------------------------------
+-- A clean unary predecessor transducer.
+-- ---------------------------------------------------------------------------
+
+abbrev DUnaryPredState := Fin 4
+
+namespace DUnaryPredState
+
+def init : DUnaryPredState := ⟨0, by decide⟩
+def start : DUnaryPredState := ⟨1, by decide⟩
+def copy : DUnaryPredState := ⟨2, by decide⟩
+def done : DUnaryPredState := ⟨3, by decide⟩
+
+attribute [simp] init start copy done
+
+end DUnaryPredState
+
+/-- Copy the tail after the first bit, stopping at the first `false`. -/
+def unaryPredTail : Word → Word
+  | [] => [false]
+  | false :: _ => [false]
+  | true :: zs => true :: unaryPredTail zs
+
+/-- Number of input bits consumed before the predecessor halts. -/
+def unaryPredHead : Word → Nat
+  | [] => 0
+  | false :: _ => 1
+  | true :: zs => 1 + unaryPredHead zs
+
+/-- Truncated predecessor of the unary code `replicate i true ++ [false]`. -/
+def unaryPred (x : Word) : Word :=
+  match x with
+  | [] => [false]
+  | false :: _ => [false]
+  | true :: zs => unaryPredTail zs
+
+lemma unaryPredTail_length_le (x : Word) : (unaryPredTail x).length ≤ x.length + 1 := by
+  induction x with
+  | nil => simp [unaryPredTail]
+  | cons b bs ih =>
+      cases b
+      · simp [unaryPredTail]
+      · simp [unaryPredTail]
+        omega
+
+lemma unaryPred_length_le (x : Word) : (unaryPred x).length ≤ x.length + 1 := by
+  cases x with
+  | nil => simp [unaryPred]
+  | cons b bs =>
+      cases b
+      · simp [unaryPred]
+      · simp [unaryPred]
+        have h := unaryPredTail_length_le bs
+        omega
+
+lemma unaryPredTail_replicate_true_false (i : Nat) (zs : Word) :
+    unaryPredTail (List.replicate i true ++ false :: zs) =
+      List.replicate i true ++ [false] := by
+  induction i with
+  | zero => simp [unaryPredTail]
+  | succ i ih =>
+      simp [List.replicate_succ, unaryPredTail, ih]
+
+lemma unaryPred_encodeNat_succ (i : Nat) :
+    unaryPred (Formula.encodeNat (i + 1)) = Formula.encodeNat i := by
+  simp [Formula.encodeNat, unaryPred, List.replicate_succ,
+    unaryPredTail_replicate_true_false]
+
+lemma unaryPred_encodeNat_zero :
+    unaryPred (Formula.encodeNat 0) = Formula.encodeNat 0 := by
+  simp [Formula.encodeNat, unaryPred]
+
+def DUnaryPredTM : DTM DUnaryPredState where
+  step := fun q sym _ =>
+    if q = DUnaryPredState.init then
+      { next := DUnaryPredState.start, output := none, inputMove := some true
+        workWrite := none, workMove := none }
+    else if q = DUnaryPredState.start then
+      match sym with
+      | some true =>
+          { next := DUnaryPredState.copy, output := none, inputMove := some true
+            workWrite := none, workMove := none }
+      | some false =>
+          { next := DUnaryPredState.done, output := some false, inputMove := some true
+            workWrite := none, workMove := none }
+      | none =>
+          { next := DUnaryPredState.done, output := some false, inputMove := none
+            workWrite := none, workMove := none }
+    else if q = DUnaryPredState.copy then
+      match sym with
+      | some true =>
+          { next := DUnaryPredState.copy, output := some true, inputMove := some true
+            workWrite := none, workMove := none }
+      | some false =>
+          { next := DUnaryPredState.done, output := some false, inputMove := some true
+            workWrite := none, workMove := none }
+      | none =>
+          { next := DUnaryPredState.done, output := some false, inputMove := none
+            workWrite := none, workMove := none }
+    else
+      { next := q, output := none, inputMove := none
+        workWrite := none, workMove := none }
+  start := DUnaryPredState.init
+  accept := DUnaryPredState.done
+  reject := DUnaryPredState.done
+
+lemma DUnaryPredTM_noWork : DNoWork DUnaryPredTM := by
+  intro q sym wsym
+  have hq : q.val = 0 ∨ q.val = 1 ∨ q.val = 2 ∨ q.val = 3 := by omega
+  rcases hq with h0 | h1 | h2 | h3
+  · have hq' : q = DUnaryPredState.init := by ext; assumption
+    subst q
+    cases sym <;> cases wsym <;> simp [DUnaryPredTM]
+  · have hq' : q = DUnaryPredState.start := by ext; assumption
+    subst q
+    cases sym with
+    | none => cases wsym <;> simp [DUnaryPredTM]
+    | some b => cases b <;> cases wsym <;> simp [DUnaryPredTM]
+  · have hq' : q = DUnaryPredState.copy := by ext; assumption
+    subst q
+    cases sym with
+    | none => cases wsym <;> simp [DUnaryPredTM]
+    | some b => cases b <;> cases wsym <;> simp [DUnaryPredTM]
+  · have hq' : q = DUnaryPredState.done := by ext; assumption
+    subst q
+    cases sym <;> cases wsym <;> simp [DUnaryPredTM]
+
+lemma Drun_DUnaryPredTM_start_true (zs : Word) :
+    Drun DUnaryPredTM 2 (Dinit DUnaryPredTM (true :: zs)) =
+      { state := DUnaryPredState.copy, input := true :: zs, head := 2,
+        output := [], work := fun _ : Nat => false, workHead := 0 } := by
+  simp [Drun, Dhalted, Dinit, Dstep, Dread, Dmove, DUnaryPredTM]
+
+lemma Drun_DUnaryPredTM_copy_pre (pre out : Word) (x : Word)
+    (wk : Nat → Bool) (wh : Nat) :
+    Drun DUnaryPredTM (x.length + 1)
+      { state := DUnaryPredState.copy, input := pre ++ true :: x,
+        head := pre.length + 2, output := out, work := wk, workHead := wh } =
+      { state := DUnaryPredState.done, input := pre ++ true :: x,
+        head := pre.length + 2 + unaryPredHead x, output := out ++ unaryPredTail x,
+        work := wk, workHead := wh } := by
+  induction x generalizing pre out wk wh with
+  | nil =>
+      simp [Drun, Dhalted, Dstep, Dread, Dmove, DUnaryPredTM, unaryPredTail,
+        unaryPredHead]
+  | cons b bs ih =>
+      cases b
+      · rw [show (false :: bs).length + 1 = 1 + (bs.length + 1) by simp; omega]
+        rw [Drun_add_eq]
+        let c : DConfig DUnaryPredState :=
+          { state := DUnaryPredState.copy, input := pre ++ true :: false :: bs,
+            head := pre.length + 2, output := out, work := wk, workHead := wh }
+        let c' : DConfig DUnaryPredState :=
+          { state := DUnaryPredState.done, input := pre ++ true :: false :: bs,
+            head := pre.length + 3, output := out ++ [false],
+            work := wk, workHead := wh }
+        have hstep : Drun DUnaryPredTM 1 c = c' := by
+          simp [c, c', Drun, Dhalted, Dstep, Dread, Dmove, DUnaryPredTM]
+        change Drun DUnaryPredTM (bs.length + 1) (Drun DUnaryPredTM 1 c) = _
+        rw [hstep]
+        have hh : Dhalted DUnaryPredTM c' = true := by
+          simp [c', Dhalted, DUnaryPredTM]
+        rw [Drun_halted DUnaryPredTM c' (bs.length + 1) hh]
+        simp [c', unaryPredTail, unaryPredHead, Nat.add_assoc, Nat.add_comm,
+          Nat.add_left_comm]
+      · rw [show (true :: bs).length + 1 = 1 + (bs.length + 1) by simp; omega]
+        rw [Drun_add_eq]
+        let c : DConfig DUnaryPredState :=
+          { state := DUnaryPredState.copy, input := pre ++ true :: true :: bs,
+            head := pre.length + 2, output := out, work := wk, workHead := wh }
+        let c' : DConfig DUnaryPredState :=
+          { state := DUnaryPredState.copy, input := pre ++ true :: true :: bs,
+            head := pre.length + 3, output := out ++ [true],
+            work := wk, workHead := wh }
+        have hstep : Drun DUnaryPredTM 1 c = c' := by
+          simp [c, c', Drun, Dhalted, Dstep, Dread, Dmove, DUnaryPredTM,
+            List.append_assoc]
+        change Drun DUnaryPredTM (bs.length + 1) (Drun DUnaryPredTM 1 c) = _
+        rw [hstep]
+        have hrec := ih (pre := pre ++ [true]) (out := out ++ [true])
+          (wk := wk) (wh := wh)
+        have hhead : pre.length + (1 + (2 + unaryPredHead bs)) =
+            pre.length + (3 + unaryPredHead bs) := by omega
+        simpa [c', unaryPredTail, unaryPredHead, hhead, List.append_assoc,
+          Nat.add_assoc, Nat.add_comm, Nat.add_left_comm] using hrec
+
+lemma Drun_DUnaryPredTM_halts (x : Word) :
+    Dhalted DUnaryPredTM
+      (Drun DUnaryPredTM ((X + C 3 : TimeBound).eval x.length)
+        (Dinit DUnaryPredTM x)) = true := by
+  cases x with
+  | nil =>
+      simp [Drun, Dhalted, Dinit, Dstep, Dread, Dmove, DUnaryPredTM]
+  | cons b zs =>
+      cases b
+      · simp [Drun, Dhalted, Dinit, Dstep, Dread, Dmove, DUnaryPredTM]
+      · have hstart := Drun_DUnaryPredTM_start_true zs
+        have hcopy := Drun_DUnaryPredTM_copy_pre [] [] zs
+          (fun _ : Nat => false) 0
+        have hcopy' :
+            Drun DUnaryPredTM (zs.length + 1)
+              { state := DUnaryPredState.copy, input := true :: zs, head := 2,
+                output := [], work := fun _ : Nat => false, workHead := 0 } =
+              { state := DUnaryPredState.done, input := true :: zs,
+                head := 2 + unaryPredHead zs, output := unaryPredTail zs,
+                work := fun _ : Nat => false, workHead := 0 } := by
+          simpa using hcopy
+        have hs : zs.length + 3 ≤ (X + C 3 : TimeBound).eval (true :: zs).length := by
+          simp
+        have hh : Dhalted DUnaryPredTM
+            (Drun DUnaryPredTM (zs.length + 3)
+              (Dinit DUnaryPredTM (true :: zs))) = true := by
+          rw [show zs.length + 3 = 2 + (zs.length + 1) by omega, Drun_add_eq, hstart]
+          rw [hcopy']
+          simp [Dhalted, DUnaryPredTM]
+        rw [Drun_eq_of_halted_within DUnaryPredTM
+          (Dinit DUnaryPredTM (true :: zs)) hs hh]
+        exact hh
+
+lemma Drun_DUnaryPredTM_output (x : Word) :
+    Dboutput DUnaryPredTM ((X + C 3 : TimeBound).eval x.length) x = unaryPred x := by
+  change (Drun DUnaryPredTM ((X + C 3 : TimeBound).eval x.length)
+    (Dinit DUnaryPredTM x)).output = unaryPred x
+  cases x with
+  | nil =>
+      simp [Polynomial.eval_add, Polynomial.eval_X, Polynomial.eval_C,
+        Drun, Dhalted, Dinit, Dstep, Dread, Dmove, DUnaryPredTM, unaryPred]
+  | cons b zs =>
+      cases b
+      · simp [Polynomial.eval_add, Polynomial.eval_X, Polynomial.eval_C,
+          Drun, Dhalted, Dinit, Dstep, Dread, Dmove, DUnaryPredTM, unaryPred]
+      · have hstart := Drun_DUnaryPredTM_start_true zs
+        have hcopy := Drun_DUnaryPredTM_copy_pre [] [] zs
+          (fun _ : Nat => false) 0
+        have hcopy' :
+            Drun DUnaryPredTM (zs.length + 1)
+              { state := DUnaryPredState.copy, input := true :: zs, head := 2,
+                output := [], work := fun _ : Nat => false, workHead := 0 } =
+              { state := DUnaryPredState.done, input := true :: zs,
+                head := 2 + unaryPredHead zs, output := unaryPredTail zs,
+                work := fun _ : Nat => false, workHead := 0 } := by
+          simpa using hcopy
+        have hs : zs.length + 3 ≤ (X + C 3 : TimeBound).eval (true :: zs).length := by
+          simp
+        have hh : Dhalted DUnaryPredTM
+            (Drun DUnaryPredTM (zs.length + 3)
+              (Dinit DUnaryPredTM (true :: zs))) = true := by
+          rw [show zs.length + 3 = 2 + (zs.length + 1) by omega, Drun_add_eq, hstart]
+          rw [hcopy']
+          simp [Dhalted, DUnaryPredTM]
+        rw [Drun_eq_of_halted_within DUnaryPredTM
+          (Dinit DUnaryPredTM (true :: zs)) hs hh]
+        rw [show zs.length + 3 = 2 + (zs.length + 1) by omega, Drun_add_eq, hstart]
+        rw [hcopy']
+        simp [unaryPred]
+
+theorem dPolyTimeComputableClean_unaryPred : DPolyTimeComputableClean unaryPred := by
+  refine DPolyTimeComputableClean.of_machine DUnaryPredTM (X + C 3) (X + C 1)
+    unaryPred (fun _ => rfl) DUnaryPredTM_noWork Drun_DUnaryPredTM_halts ?_
+  intro x
+  constructor
+  · exact Drun_DUnaryPredTM_output x
+  · simpa using unaryPred_length_le x
+
+theorem dPolyTimeComputable_unaryPred : DPolyTimeComputable unaryPred :=
+  dPolyTimeComputableClean_unaryPred.toPoly
+
+theorem DPolyTimeComputable.unaryPred {f : Word → Word}
+    (hf : DPolyTimeComputable f) : DPolyTimeComputable (fun x => PNP.unaryPred (f x)) := by
+  have hcomp := DPolyTimeComputableClosedUnderComposition
+    f PNP.unaryPred hf dPolyTimeComputable_unaryPred
+  simpa [Function.comp_def] using hcomp
+
+/-- Iterate a unary predecessor. -/
+def unaryPredIter : Nat → Word → Word
+  | 0, x => x
+  | k + 1, x => unaryPredIter k (unaryPred x)
+
+/-- Five applications compute `x - 5` on unary codes. -/
+def unaryPred5 (x : Word) : Word := unaryPredIter 5 x
+
+theorem dPolyTimeComputable_unaryPredIter (k : Nat) :
+    DPolyTimeComputable (unaryPredIter k) := by
+  induction k with
+  | zero =>
+      change DPolyTimeComputable id
+      exact dPolyTimeComputable_id
+  | succ k ih =>
+      have hcomp := DPolyTimeComputableClosedUnderComposition
+        PNP.unaryPred (unaryPredIter k) dPolyTimeComputable_unaryPred ih
+      simpa [unaryPredIter, Function.comp_def] using hcomp
+
+theorem dPolyTimeComputable_unaryPred5 : DPolyTimeComputable unaryPred5 := by
+  change DPolyTimeComputable (unaryPredIter 5)
+  exact dPolyTimeComputable_unaryPredIter 5
+
+lemma unaryPredIter_encodeNat (k i : Nat) :
+    unaryPredIter k (Formula.encodeNat i) = Formula.encodeNat (i - k) := by
+  induction k generalizing i with
+  | zero =>
+      simp [unaryPredIter]
+  | succ k ih =>
+      cases i with
+      | zero =>
+          rw [unaryPredIter, unaryPred_encodeNat_zero]
+          simpa using ih 0
+      | succ i =>
+          rw [unaryPredIter, unaryPred_encodeNat_succ]
+          simpa [Nat.succ_sub_succ] using ih i
+
+lemma unaryPred5_encodeNat (i : Nat) :
+    unaryPred5 (Formula.encodeNat i) = Formula.encodeNat (i - 5) := by
+  change unaryPredIter 5 (Formula.encodeNat i) = Formula.encodeNat (i - 5)
+  exact unaryPredIter_encodeNat 5 i
+
+
+-- ---------------------------------------------------------------------------
+-- A clean transducer preparing the two unary codes consumed by `unarySub`.
+-- ---------------------------------------------------------------------------
+
+/-- Scan a word after an optional separator.  Before the separator, copy the
+    leading unary code; after it, emit one `true` per remaining input bit and
+    terminate with `false`. -/
+def unarySubInputScan (sep : Bool) : Word → Word
+  | [] => [false]
+  | b :: ys =>
+      if sep = true then true :: unarySubInputScan true ys
+      else if b = true then true :: unarySubInputScan false ys
+      else false :: List.replicate ys.length true ++ [false]
+
+/-- Replace the suffix after the first unary code by its unary length. -/
+def unarySubInput (x : Word) : Word := unarySubInputScan false x
+
+lemma unarySubInputScan_length (sep : Bool) (x : Word) :
+    (unarySubInputScan sep x).length = x.length + 1 := by
+  induction x generalizing sep with
+  | nil => simp [unarySubInputScan]
+  | cons b bs ih =>
+      by_cases hs : sep = true
+      · simp [unarySubInputScan, hs, ih]
+      · by_cases hb : b = true
+        · simp [unarySubInputScan, hs, hb, ih]
+        · simp [unarySubInputScan, hs, hb]
+
+lemma unarySubInput_length (x : Word) : (unarySubInput x).length = x.length + 1 := by
+  simpa [unarySubInput] using unarySubInputScan_length false x
+
+lemma unarySubInputScan_encodeNat (L : Nat) (y : Word) :
+    unarySubInputScan false (Formula.encodeNat L ++ y) =
+      Formula.encodeNat L ++ Formula.encodeNat y.length := by
+  induction L generalizing y with
+  | zero =>
+      simp [Formula.encodeNat, unarySubInputScan]
+  | succ L ih =>
+      simpa [Formula.encodeNat, List.replicate_succ, unarySubInputScan,
+        List.append_assoc] using congrArg (fun w => true :: w) (ih y)
+
+lemma unarySubInput_encodeNat_append (L : Nat) (y : Word) :
+    unarySubInput (Formula.encodeNat L ++ y) =
+      Formula.encodeNat L ++ Formula.encodeNat y.length := by
+  simpa [unarySubInput] using unarySubInputScan_encodeNat L y
+
+abbrev DUnarySubInputState := Fin 4
+
+namespace DUnarySubInputState
+
+def start : DUnarySubInputState := ⟨0, by decide⟩
+def first : DUnarySubInputState := ⟨1, by decide⟩
+def second : DUnarySubInputState := ⟨2, by decide⟩
+def done : DUnarySubInputState := ⟨3, by decide⟩
+
+attribute [simp] start first second done
+
+end DUnarySubInputState
+
+/-- Copy the first unary code, then replace the rest by its unary length. -/
+def DUnarySubInputTM : DTM DUnarySubInputState where
+  step := fun q sym _ =>
+    if q = DUnarySubInputState.start then
+      { next := DUnarySubInputState.first, output := none, inputMove := some true
+        workWrite := none, workMove := none }
+    else if q = DUnarySubInputState.first then
+      match sym with
+      | some true =>
+          { next := DUnarySubInputState.first, output := some true, inputMove := some true
+            workWrite := none, workMove := none }
+      | some false =>
+          { next := DUnarySubInputState.second, output := some false, inputMove := some true
+            workWrite := none, workMove := none }
+      | none =>
+          { next := DUnarySubInputState.done, output := some false, inputMove := none
+            workWrite := none, workMove := none }
+    else if q = DUnarySubInputState.second then
+      match sym with
+      | some _ =>
+          { next := DUnarySubInputState.second, output := some true, inputMove := some true
+            workWrite := none, workMove := none }
+      | none =>
+          { next := DUnarySubInputState.done, output := some false, inputMove := none
+            workWrite := none, workMove := none }
+    else
+      { next := q, output := none, inputMove := none
+        workWrite := none, workMove := none }
+  start := DUnarySubInputState.start
+  accept := DUnarySubInputState.done
+  reject := DUnarySubInputState.done
+
+lemma DUnarySubInputTM_noWork : DNoWork DUnarySubInputTM := by
+  intro q sym wsym
+  have hq : q.val = 0 ∨ q.val = 1 ∨ q.val = 2 ∨ q.val = 3 := by omega
+  rcases hq with h0 | h1 | h2 | h3
+  · have hq' : q = DUnarySubInputState.start := by ext; assumption
+    subst q
+    cases sym <;> cases wsym <;> simp [DUnarySubInputTM]
+  · have hq' : q = DUnarySubInputState.first := by ext; assumption
+    subst q
+    cases sym with
+    | none => cases wsym <;> simp [DUnarySubInputTM]
+    | some b => cases b <;> cases wsym <;> simp [DUnarySubInputTM]
+  · have hq' : q = DUnarySubInputState.second := by ext; assumption
+    subst q
+    cases sym with
+    | none => cases wsym <;> simp [DUnarySubInputTM]
+    | some b => cases b <;> cases wsym <;> simp [DUnarySubInputTM]
+  · have hq' : q = DUnarySubInputState.done := by ext; assumption
+    subst q
+    cases sym <;> cases wsym <;> simp [DUnarySubInputTM]
+
+lemma Drun_DUnarySubInputTM_start (z : Word) :
+    Drun DUnarySubInputTM 1 (Dinit DUnarySubInputTM z) =
+      { state := DUnarySubInputState.first, input := z, head := 1,
+        output := [], work := fun _ : Nat => false, workHead := 0 } := by
+  simp [Drun, Dhalted, Dinit, Dstep, Dread, Dmove, DUnarySubInputTM]
+
+lemma Drun_DUnarySubInputTM_second (pre z out : Word)
+    (wk : Nat → Bool) (wh : Nat) :
+    Drun DUnarySubInputTM (z.length + 1)
+      { state := DUnarySubInputState.second, input := pre ++ z,
+        head := pre.length + 1, output := out, work := wk, workHead := wh } =
+      { state := DUnarySubInputState.done, input := pre ++ z,
+        head := pre.length + z.length + 1,
+        output := out ++ List.replicate z.length true ++ [false],
+        work := wk, workHead := wh } := by
+  induction z generalizing pre out wk wh with
+  | nil =>
+      simp [Drun, Dhalted, Dstep, Dread, Dmove, DUnarySubInputTM]
+  | cons b bs ih =>
+      rw [show (b :: bs).length + 1 = 1 + (bs.length + 1) by simp only [List.length_cons]; omega]
+      rw [Drun_add_eq]
+      let c : DConfig DUnarySubInputState :=
+        { state := DUnarySubInputState.second, input := pre ++ b :: bs,
+          head := pre.length + 1, output := out, work := wk, workHead := wh }
+      have hstep : Drun DUnarySubInputTM 1 c =
+          { state := DUnarySubInputState.second, input := pre ++ b :: bs,
+            head := pre.length + 2, output := out ++ [true],
+            work := wk, workHead := wh } := by
+        simp [c, Drun, Dhalted, Dstep, Dread, Dmove, DUnarySubInputTM]
+      change Drun DUnarySubInputTM (bs.length + 1) (Drun DUnarySubInputTM 1 c) = _
+      rw [hstep]
+      have hrec := ih (pre := pre ++ [b]) (out := out ++ [true]) (wk := wk) (wh := wh)
+      simpa [List.replicate_succ, List.append_assoc, Nat.add_assoc, Nat.add_comm,
+        Nat.add_left_comm] using hrec
+
+lemma Drun_DUnarySubInputTM_first_total (pre z out : Word)
+    (wk : Nat → Bool) (wh : Nat) :
+    Drun DUnarySubInputTM (2 * z.length + 1)
+      { state := DUnarySubInputState.first, input := pre ++ z,
+        head := pre.length + 1, output := out, work := wk, workHead := wh } =
+      { state := DUnarySubInputState.done, input := pre ++ z,
+        head := pre.length + z.length + 1,
+        output := out ++ unarySubInputScan false z, work := wk, workHead := wh } := by
+  induction z generalizing pre out wk wh with
+  | nil =>
+      simp [Drun, Dhalted, Dstep, Dread, Dmove, DUnarySubInputTM, unarySubInputScan]
+  | cons b bs ih =>
+      cases b with
+      | false =>
+          rw [show 2 * (false :: bs).length + 1 =
+              1 + ((bs.length + 1) + (bs.length + 1)) by simp only [List.length_cons]; omega]
+          rw [Drun_add_eq]
+          let c : DConfig DUnarySubInputState :=
+            { state := DUnarySubInputState.first, input := pre ++ false :: bs,
+              head := pre.length + 1, output := out, work := wk, workHead := wh }
+          have hstep : Drun DUnarySubInputTM 1 c =
+              { state := DUnarySubInputState.second, input := pre ++ false :: bs,
+                head := pre.length + 2, output := out ++ [false],
+                work := wk, workHead := wh } := by
+            simp [c, Drun, Dhalted, Dstep, Dread, Dmove, DUnarySubInputTM]
+          change Drun DUnarySubInputTM ((bs.length + 1) + (bs.length + 1))
+            (Drun DUnarySubInputTM 1 c) = _
+          rw [hstep]
+          have hsecond0 := Drun_DUnarySubInputTM_second
+            (pre := pre ++ [false]) (z := bs) (out := out ++ [false]) (wk := wk) (wh := wh)
+          have hsecond :
+              Drun DUnarySubInputTM (bs.length + 1)
+                { state := DUnarySubInputState.second, input := pre ++ false :: bs,
+                  head := pre.length + 2, output := out ++ [false],
+                  work := wk, workHead := wh } =
+                { state := DUnarySubInputState.done, input := pre ++ false :: bs,
+                  head := pre.length + (false :: bs).length + 1,
+                  output := out ++ [false] ++ List.replicate bs.length true ++ [false],
+                  work := wk, workHead := wh } := by
+            simpa [List.append_assoc, Nat.add_assoc, Nat.add_comm, Nat.add_left_comm] using hsecond0
+          rw [Drun_add_eq, hsecond]
+          simp [Dhalted, DUnarySubInputTM, Drun, unarySubInputScan, List.append_assoc,
+            Nat.add_assoc, Nat.add_comm, Nat.add_left_comm]
+      | true =>
+          rw [show 2 * (true :: bs).length + 1 = 1 + ((2 * bs.length + 1) + 1) by simp only [List.length_cons]; omega]
+          rw [Drun_add_eq]
+          let c : DConfig DUnarySubInputState :=
+            { state := DUnarySubInputState.first, input := pre ++ true :: bs,
+              head := pre.length + 1, output := out, work := wk, workHead := wh }
+          have hstep : Drun DUnarySubInputTM 1 c =
+              { state := DUnarySubInputState.first, input := pre ++ true :: bs,
+                head := pre.length + 2, output := out ++ [true],
+                work := wk, workHead := wh } := by
+            simp [c, Drun, Dhalted, Dstep, Dread, Dmove, DUnarySubInputTM]
+          change Drun DUnarySubInputTM ((2 * bs.length + 1) + 1)
+            (Drun DUnarySubInputTM 1 c) = _
+          rw [hstep]
+          have hrec0 := ih (pre := pre ++ [true]) (out := out ++ [true]) (wk := wk) (wh := wh)
+          have hrec :
+              Drun DUnarySubInputTM (2 * bs.length + 1)
+                { state := DUnarySubInputState.first, input := pre ++ true :: bs,
+                  head := pre.length + 2, output := out ++ [true],
+                  work := wk, workHead := wh } =
+                { state := DUnarySubInputState.done, input := pre ++ true :: bs,
+                  head := pre.length + (true :: bs).length + 1,
+                  output := out ++ [true] ++ unarySubInputScan false bs,
+                  work := wk, workHead := wh } := by
+            simpa [List.append_assoc, Nat.add_assoc, Nat.add_comm, Nat.add_left_comm] using hrec0
+          rw [Drun_add_eq]
+          rw [hrec]
+          simp [Dhalted, DUnarySubInputTM, Drun, unarySubInputScan, List.append_assoc,
+            Nat.add_assoc, Nat.add_comm, Nat.add_left_comm]
+
+lemma DUnarySubInputTM_time_eval (x : Word) :
+    (C 2 * X + C 3 : TimeBound).eval x.length = 2 * x.length + 3 := by
+  simp [Polynomial.eval_add, Polynomial.eval_mul]
+
+lemma Drun_DUnarySubInputTM_halts (x : Word) :
+    Dhalted DUnarySubInputTM
+      (Drun DUnarySubInputTM ((C 2 * X + C 3 : TimeBound).eval x.length)
+        (Dinit DUnarySubInputTM x)) = true := by
+  rw [DUnarySubInputTM_time_eval]
+  rw [show 2 * x.length + 3 = 1 + ((2 * x.length + 1) + 1) by omega, Drun_add_eq]
+  rw [Drun_DUnarySubInputTM_start x]
+  rw [Drun_add_eq]
+  have hfirst0 := Drun_DUnarySubInputTM_first_total (pre := []) (z := x) (out := [])
+    (fun _ : Nat => false) 0
+  have hfirst :
+      Drun DUnarySubInputTM (2 * x.length + 1)
+        { state := DUnarySubInputState.first, input := x, head := 1,
+          output := [], work := fun _ : Nat => false, workHead := 0 } =
+        { state := DUnarySubInputState.done, input := x, head := x.length + 1,
+          output := unarySubInputScan false x,
+          work := fun _ : Nat => false, workHead := 0 } := by
+    simpa using hfirst0
+  rw [hfirst]
+  simp [Dhalted, DUnarySubInputTM, Drun]
+
+lemma Drun_DUnarySubInputTM_output (x : Word) :
+    Dboutput DUnarySubInputTM ((C 2 * X + C 3 : TimeBound).eval x.length) x =
+      unarySubInput x := by
+  dsimp [Dboutput]
+  rw [DUnarySubInputTM_time_eval]
+  rw [show 2 * x.length + 3 = 1 + ((2 * x.length + 1) + 1) by omega, Drun_add_eq]
+  rw [Drun_DUnarySubInputTM_start x]
+  rw [Drun_add_eq]
+  have hfirst0 := Drun_DUnarySubInputTM_first_total (pre := []) (z := x) (out := [])
+    (fun _ : Nat => false) 0
+  have hfirst :
+      Drun DUnarySubInputTM (2 * x.length + 1)
+        { state := DUnarySubInputState.first, input := x, head := 1,
+          output := [], work := fun _ : Nat => false, workHead := 0 } =
+        { state := DUnarySubInputState.done, input := x, head := x.length + 1,
+          output := unarySubInputScan false x,
+          work := fun _ : Nat => false, workHead := 0 } := by
+    simpa using hfirst0
+  rw [hfirst]
+  simp [Dhalted, DUnarySubInputTM, Drun, unarySubInput]
+
+theorem dPolyTimeComputableClean_unarySubInput :
+    DPolyTimeComputableClean unarySubInput := by
+  refine DPolyTimeComputableClean.of_machine DUnarySubInputTM (C 2 * X + C 3) (X + C 2)
+    unarySubInput (fun _ => rfl) DUnarySubInputTM_noWork Drun_DUnarySubInputTM_halts ?_
+  intro x
+  constructor
+  · exact Drun_DUnarySubInputTM_output x
+  · have h := unarySubInput_length x
+    simp [Polynomial.eval_add]
+    omega
+
+theorem dPolyTimeComputable_unarySubInput : DPolyTimeComputable unarySubInput :=
+  dPolyTimeComputableClean_unarySubInput.toPoly
+
+theorem dPolyTimeComputable_paddingCode :
+    DPolyTimeComputable (fun z => PNP.unaryPred5 (unarySub (unarySubInput z))) := by
+  have h1 := DPolyTimeComputableClosedUnderComposition
+    unarySubInput unarySub dPolyTimeComputable_unarySubInput dPolyTimeComputable_unary_sub
+  have h2 := DPolyTimeComputableClosedUnderComposition
+    (fun z => unarySub (unarySubInput z)) PNP.unaryPred5 h1 dPolyTimeComputable_unaryPred5
+  simpa [Function.comp_def] using h2
+
+-- ---------------------------------------------------------------------------
+-- Exact padding code obtained from the parsed length and formula encoding.
+-- ---------------------------------------------------------------------------
+
+lemma unaryPred_replicate_true_append_false (k : Nat) (zs : Word) :
+    PNP.unaryPred (List.replicate k true ++ false :: zs) = Formula.encodeNat (k - 1) := by
+  cases k with
+  | zero =>
+      simp [PNP.unaryPred, Formula.encodeNat]
+  | succ k =>
+      simpa [PNP.unaryPred, List.replicate_succ, Formula.encodeNat] using
+        (PNP.unaryPredTail_replicate_true_false k zs)
+
+lemma unaryPred5_replicate_true_append_false (k : Nat) (zs : Word) :
+    PNP.unaryPred5 (List.replicate k true ++ false :: zs) = Formula.encodeNat (k - 5) := by
+  rw [PNP.unaryPred5]
+  change PNP.unaryPredIter 4
+    (PNP.unaryPred (List.replicate k true ++ false :: zs)) = Formula.encodeNat (k - 5)
+  rw [unaryPred_replicate_true_append_false]
+  have harith : (k - 1) - 4 = k - 5 := by omega
+  simpa [harith] using (PNP.unaryPredIter_encodeNat 4 (k - 1))
+
+lemma unaryPred5_unarySubCore (m n : Nat) (hm : m ≤ n) :
+    PNP.unaryPred5 (unarySubCore m n) = Formula.encodeNat (m - 5) := by
+  unfold unarySubCore
+  have hpos : 0 < n + 1 - m := by omega
+  rw [show n + 1 - m = (n - m) + 1 by omega]
+  rw [List.replicate_succ]
+  exact unaryPred5_replicate_true_append_false m (List.replicate (n - m) false)
+
+lemma unarySub_encodeNat_encodeNat (L M : Nat) :
+    unarySub (Formula.encodeNat L ++ Formula.encodeNat M) =
+      unarySubCore (L - M) (L + M + 2) := by
+  unfold unarySub
+  have hlen : (Formula.encodeNat L ++ Formula.encodeNat M).length = L + M + 2 := by
+    simp [Formula.encodeNat_length]
+    omega
+  rw [hlen]
+  congr 1
+  simpa [Formula.encodeNat, List.append_assoc] using
+    (unarySubScanA_replicate_false L M [false] (by simp))
+
+set_option maxHeartbeats 400000 in
+lemma paddingCode_of_length (L : Nat) (y : Word) :
+    PNP.unaryPred5 (unarySub (unarySubInput (Formula.encodeNat L ++ y))) =
+      Formula.encodeNat ((L - y.length) - 5) := by
+  rw [unarySubInput_encodeNat_append]
+  rw [unarySub_encodeNat_encodeNat]
+  exact unaryPred5_unarySubCore (L - y.length) (L + y.length + 2) (by omega)
+
+-- ---------------------------------------------------------------------------
+-- A clean version of the first-code deleter, for same-input append pipelines.
+-- ---------------------------------------------------------------------------
+
+lemma DDropFirstUnaryTM_noWork : DNoWork DDropFirstUnaryTM := by
+  intro q sym wsym
+  have hq : q.val = 0 ∨ q.val = 1 ∨ q.val = 2 ∨ q.val = 3 ∨ q.val = 4 := by omega
+  rcases hq with h0 | h1 | h2 | h3 | h4
+  · have hq' : q = DDropFirstUnaryState.start := by ext; assumption
+    subst q
+    cases sym <;> cases wsym <;> simp [DDropFirstUnaryTM, DDropFirstUnaryState.start,
+      DDropFirstUnaryState.scan, DDropFirstUnaryState.copy,
+      DDropFirstUnaryState.done, DDropFirstUnaryState.reject]
+  · have hq' : q = DDropFirstUnaryState.scan := by ext; assumption
+    subst q
+    cases sym with
+    | none => cases wsym <;> simp [DDropFirstUnaryTM, DDropFirstUnaryState.start,
+      DDropFirstUnaryState.scan, DDropFirstUnaryState.copy,
+      DDropFirstUnaryState.done, DDropFirstUnaryState.reject]
+    | some b => cases b <;> cases wsym <;> simp [DDropFirstUnaryTM, DDropFirstUnaryState.start,
+      DDropFirstUnaryState.scan, DDropFirstUnaryState.copy,
+      DDropFirstUnaryState.done, DDropFirstUnaryState.reject]
+  · have hq' : q = DDropFirstUnaryState.copy := by ext; assumption
+    subst q
+    cases sym with
+    | none => cases wsym <;> simp [DDropFirstUnaryTM, DDropFirstUnaryState.start,
+      DDropFirstUnaryState.scan, DDropFirstUnaryState.copy,
+      DDropFirstUnaryState.done, DDropFirstUnaryState.reject]
+    | some b => cases b <;> cases wsym <;> simp [DDropFirstUnaryTM, DDropFirstUnaryState.start,
+      DDropFirstUnaryState.scan, DDropFirstUnaryState.copy,
+      DDropFirstUnaryState.done, DDropFirstUnaryState.reject]
+  · have hq' : q = DDropFirstUnaryState.done := by ext; assumption
+    subst q
+    cases sym <;> cases wsym <;> simp [DDropFirstUnaryTM, DDropFirstUnaryState.start,
+      DDropFirstUnaryState.scan, DDropFirstUnaryState.copy,
+      DDropFirstUnaryState.done, DDropFirstUnaryState.reject]
+  · have hq' : q = DDropFirstUnaryState.reject := by ext; assumption
+    subst q
+    cases sym <;> cases wsym <;> simp [DDropFirstUnaryTM, DDropFirstUnaryState.start,
+      DDropFirstUnaryState.scan, DDropFirstUnaryState.copy,
+      DDropFirstUnaryState.done, DDropFirstUnaryState.reject]
+
+lemma DDropFirstUnaryTM_time_eval (x : Word) :
+    (X + C 2 : TimeBound).eval x.length = x.length + 2 := by
+  simp [Polynomial.eval_add]
+
+theorem dPolyTimeComputableClean_dropFirstUnary :
+    DPolyTimeComputableClean dropFirstUnary := by
+  refine DPolyTimeComputableClean.of_machine DDropFirstUnaryTM (X + C 2) X
+    dropFirstUnary (fun _ => rfl) DDropFirstUnaryTM_noWork ?_ ?_
+  · intro x
+    simpa [DDropFirstUnaryTM_time_eval] using DDropFirstUnaryTM_halts x
+  · intro x
+    constructor
+    · simpa [DDropFirstUnaryTM_time_eval] using DDropFirstUnaryTM_output x
+    · simpa using dropFirstUnary_length_le x
+
+theorem DPolyTimeComputable.comp_dropFirstUnary {f : Word → Word}
+    (hf : DPolyTimeComputable f) : DPolyTimeComputable (fun x => dropFirstUnary (f x)) := by
+  have hcomp := DPolyTimeComputableClosedUnderComposition
+    f PNP.dropFirstUnary hf dPolyTimeComputable_dropFirstUnary
+  simpa [Function.comp_def] using hcomp
+
+-- ---------------------------------------------------------------------------
+-- Padding from an explicit pair of unary codes.
+-- ---------------------------------------------------------------------------
+
+theorem dPolyTimeComputable_gap5FromPair :
+    DPolyTimeComputable (fun z => PNP.unaryPred5 (unarySub z)) := by
+  have hcomp := DPolyTimeComputableClosedUnderComposition
+    unarySub PNP.unaryPred5 dPolyTimeComputable_unary_sub dPolyTimeComputable_unaryPred5
+  simpa [Function.comp_def] using hcomp
+
+theorem dPolyTimeComputable_paddingFromHeader :
+    DPolyTimeComputable (fun z => PNP.unaryPred5 (unarySub (firstTwoCodes z))) := by
+  have hcomp := DPolyTimeComputableClosedUnderComposition
+    firstTwoCodes (fun z => PNP.unaryPred5 (unarySub z))
+    dPolyTimeComputableClean_firstTwoCodes.toPoly dPolyTimeComputable_gap5FromPair
+  simpa [Function.comp_def] using hcomp
+
+lemma gap5FromPair_encodeNat (L M : Nat) :
+    PNP.unaryPred5 (unarySub (Formula.encodeNat L ++ Formula.encodeNat M)) =
+      Formula.encodeNat ((L - M) - 5) := by
+  rw [unarySub_encodeNat_encodeNat]
+  exact unaryPred5_unarySubCore (L - M) (L + M + 2) (by omega)
+
+lemma firstTwoCodes_encodeNat_append (L M : Nat) (y : Word) :
+    firstTwoCodes (Formula.encodeNat L ++ Formula.encodeNat M ++ y) =
+      Formula.encodeNat L ++ Formula.encodeNat M := by
+  rw [show Formula.encodeNat L ++ Formula.encodeNat M ++ y =
+      Formula.encodeNat L ++ (Formula.encodeNat M ++ y) by simp [List.append_assoc]]
+  simp [firstTwoCodes, firstUnaryCode_encodeNat_append,
+    dropFirstUnary_encodeNat_append]
+
+lemma paddingFromHeader_encodeNat (L M : Nat) (y : Word) :
+    PNP.unaryPred5 (unarySub
+      (firstTwoCodes (Formula.encodeNat L ++ Formula.encodeNat M ++ y))) =
+      Formula.encodeNat ((L - M) - 5) := by
+  rw [firstTwoCodes_encodeNat_append]
+  exact gap5FromPair_encodeNat L M
+
+-- ---------------------------------------------------------------------------
+-- A header-format DAG decomposition whose assembler needs only unary arithmetic
+-- on an explicit pair of lengths.
+-- ---------------------------------------------------------------------------
+
+/-- A sharing-aware intermediate representation carrying the exact length of
+    the Tseitin encoding.  The core still only needs to enumerate the distinct
+    circuit nodes and produce the Tseitin formula once. -/
+noncomputable def npReductionCoreHeader (V : TM) (p q : TimeBound) (x : Word) : Word :=
+  Formula.encodeNat ((npReductionFixedPoly V p q).eval x.length + 1) ++
+    (Formula.encodeNat ((tseitinFormula (npVerifierCircuit V p q x)).encode.length) ++
+      (tseitinFormula (npVerifierCircuit V p q x)).encode)
+
+/-- Reassemble the fixed-length instance from the header format.  Malformed
+    inputs are sent to the empty word. -/
+noncomputable def npReductionAssemblerHeader (_V : TM) (_p _q : TimeBound) (z : Word) : Word :=
+  match Circuit.parseNat z with
+  | none => []
+  | some (L, r1) =>
+      match Circuit.parseNat r1 with
+      | none => []
+      | some (M, y) =>
+          [true, false] ++ y ++ [false, false] ++ Formula.encodeNat (L - M - 5)
+
+lemma npReductionAssemblerHeader_core (V : TM) (p q : TimeBound) (x : Word) :
+    npReductionAssemblerHeader V p q (npReductionCoreHeader V p q x) =
+      npReductionFixed V p q x := by
+  unfold npReductionAssemblerHeader npReductionCoreHeader
+  rw [Circuit.parseNat_encodeNat]
+  simp only
+  rw [Circuit.parseNat_encodeNat]
+  simp only
+  simp [npReductionFixed, Formula.encode_and_eq, Formula.encode_var_eq]
+
+noncomputable def npReductionHeaderPoly (V : TM) (p q : TimeBound) : TimeBound :=
+  npReductionFixedPoly V p q + C 4 + C 2 * npReductionOutputPoly V p q
+
+lemma npReductionCoreHeader_length_le_poly (V : TM) (p q : TimeBound) (x : Word) :
+    (npReductionCoreHeader V p q x).length ≤
+      (npReductionHeaderPoly V p q).eval x.length := by
+  have hf := npReduction_length_le_poly V p q x
+  simp [npReduction] at hf
+  unfold npReductionCoreHeader npReductionHeaderPoly
+  simp [npReduction, Polynomial.eval_add, Polynomial.eval_mul,
+    Formula.encodeNat_length, List.length_append]
+  omega
+
+/-- The header-format DTM subroutine obligation.  This is an explicit
+    proposition, implied by polynomial-time computability of the two header
+    functions. -/
+def HeaderReductionSubroutinesComputable : Prop :=
+  (∀ (V : TM) (p q : TimeBound),
+      DPolyTimeComputable (npReductionCoreHeader V p q)) ∧
+  (∀ (V : TM) (p q : TimeBound),
+      DPolyTimeComputable (npReductionAssemblerHeader V p q))
+
+theorem NPReductionDTMSubroutineObligation_of_header
+    (hcore : ∀ (V : TM) (p q : TimeBound),
+      DPolyTimeComputable (npReductionCoreHeader V p q))
+    (haux : ∀ (V : TM) (p q : TimeBound),
+      DPolyTimeComputable (npReductionAssemblerHeader V p q)) :
+    NPReductionDTMSubroutineObligation := by
+  intro V p q
+  refine ⟨npReductionCoreHeader V p q, npReductionAssemblerHeader V p q,
+    hcore V p q, haux V p q, ?_⟩
+  exact npReductionAssemblerHeader_core V p q
+
+theorem NPReductionDTMSubroutineObligation_of_header_computable
+    (h : HeaderReductionSubroutinesComputable) :
+    NPReductionDTMSubroutineObligation :=
+  NPReductionDTMSubroutineObligation_of_header h.1 h.2
+
+theorem not_PEqualsNP_of_header_obligations
+    (hv : SATVerifierTMExists) (hbridge : DTMPolyTimeBridge)
+    (hsub : HeaderReductionSubroutinesComputable) (hlow : SATNotInPPoly) :
+    ¬ PEqualsNP :=
+  not_PEqualsNP_of_DTM_obligations hv hbridge
+    (NPReductionDTMSubroutineObligation_of_header_computable hsub) hlow
+
+-- ---------------------------------------------------------------------------
+-- A header format that carries the padding code itself.  The assembler is a
+-- pure same-input concatenation of already-proved clean transducers.
+-- ---------------------------------------------------------------------------
+
+/-- A sharing-aware intermediate representation that stores the fresh-variable
+    padding code before the Tseitin encoding. -/
+noncomputable def npReductionCorePadded (V : TM) (p q : TimeBound) (x : Word) : Word :=
+  let f := tseitinFormula (npVerifierCircuit V p q x)
+  let L := (npReductionFixedPoly V p q).eval x.length + 1
+  Formula.encodeNat (L - f.encode.length - 5) ++ f.encode
+
+/-- Reassemble the fixed-length SAT word from a unary padding code followed by
+    the Tseitin encoding. -/
+noncomputable def npReductionAssemblerPadded (_V : TM) (_p _q : TimeBound) (z : Word) : Word :=
+  [true, false] ++ dropFirstUnary z ++ [false, false] ++ firstUnaryCode z
+
+lemma npReductionAssemblerPadded_core (V : TM) (p q : TimeBound) (x : Word) :
+    npReductionAssemblerPadded V p q (npReductionCorePadded V p q x) =
+      npReductionFixed V p q x := by
+  unfold npReductionAssemblerPadded npReductionCorePadded npReductionFixed
+  simp only [List.length_append, firstUnaryCode_encodeNat_append,
+    dropFirstUnary_encodeNat_append]
+  simp [Formula.encode_and_eq, Formula.encode_var_eq, List.append_assoc]
+
+lemma npReductionCorePadded_length_le_poly (V : TM) (p q : TimeBound) (x : Word) :
+    (npReductionCorePadded V p q x).length ≤
+      (npReductionHeaderPoly V p q).eval x.length := by
+  have hf := npReduction_length_le_poly V p q x
+  simp [npReduction] at hf
+  unfold npReductionCorePadded npReductionHeaderPoly
+  simp [Formula.encodeNat_length, Polynomial.eval_add, Polynomial.eval_mul]
+  omega
+
+theorem dPolyTimeComputableClean_npReductionAssemblerPadded
+    (V : TM) (p q : TimeBound) :
+    DPolyTimeComputableClean (npReductionAssemblerPadded V p q) := by
+  unfold npReductionAssemblerPadded
+  have h1 := DPolyTimeComputableClean_prepend ([true, false] : Word)
+    dPolyTimeComputableClean_dropFirstUnary
+  have h2 := DPolyTimeComputableClean_appendFixed h1 ([false, false] : Word)
+  have h3 := DPolyTimeComputableCleanAppend
+    (fun z => ([true, false] ++ dropFirstUnary z) ++ [false, false])
+    firstUnaryCode h2 dPolyTimeComputableClean_firstUnaryCode
+  simpa [List.append_assoc] using h3
+
+theorem dPolyTimeComputable_npReductionAssemblerPadded
+    (V : TM) (p q : TimeBound) :
+    DPolyTimeComputable (npReductionAssemblerPadded V p q) :=
+  (dPolyTimeComputableClean_npReductionAssemblerPadded V p q).toPoly
+
+def PaddedHeaderReductionSubroutinesComputable : Prop :=
+  (∀ (V : TM) (p q : TimeBound),
+      DPolyTimeComputable (npReductionCorePadded V p q)) ∧
+  (∀ (V : TM) (p q : TimeBound),
+      DPolyTimeComputable (npReductionAssemblerPadded V p q))
+
+theorem NPReductionDTMSubroutineObligation_of_paddedHeader
+    (hcore : ∀ (V : TM) (p q : TimeBound),
+      DPolyTimeComputable (npReductionCorePadded V p q))
+    (haux : ∀ (V : TM) (p q : TimeBound),
+      DPolyTimeComputable (npReductionAssemblerPadded V p q)) :
+    NPReductionDTMSubroutineObligation := by
+  intro V p q
+  refine ⟨npReductionCorePadded V p q, npReductionAssemblerPadded V p q,
+    hcore V p q, haux V p q, ?_⟩
+  exact npReductionAssemblerPadded_core V p q
+
+theorem NPReductionDTMSubroutineObligation_of_paddedHeader_computable
+    (h : PaddedHeaderReductionSubroutinesComputable) :
+    NPReductionDTMSubroutineObligation :=
+  NPReductionDTMSubroutineObligation_of_paddedHeader h.1 h.2
+
+theorem not_PEqualsNP_of_paddedHeader_obligations
+    (hv : SATVerifierTMExists) (hbridge : DTMPolyTimeBridge)
+    (hsub : PaddedHeaderReductionSubroutinesComputable) (hlow : SATNotInPPoly) :
+    ¬ PEqualsNP :=
+  not_PEqualsNP_of_DTM_obligations hv hbridge
+    (NPReductionDTMSubroutineObligation_of_paddedHeader_computable hsub) hlow
+
+-- ---------------------------------------------------------------------------
+-- Consequences of the padded-header decomposition.
+-- ---------------------------------------------------------------------------
+
+theorem SATNPComplete_of_paddedHeader_obligations
+    (hv : SATVerifierTMExists) (hbridge : DTMPolyTimeBridge)
+    (hsub : PaddedHeaderReductionSubroutinesComputable) : SATNPComplete := by
+  exact SATNPComplete_of_obligations hv
+    (NPSemanticReductionIsPolyTime_of_DTM hbridge
+      (NPReductionDTMSubroutineObligation_of_paddedHeader_computable hsub))
+
+theorem NP_subset_PPoly_of_paddedHeader_obligations
+    (hbridge : DTMPolyTimeBridge)
+    (hsub : PaddedHeaderReductionSubroutinesComputable)
+    (hSAT : InPPoly SAT) :
+    ∀ L : Language, InNP L → InPPoly L := by
+  exact NP_subset_PPoly_of_reduction_and_SAT_in_PPoly
+    (NPSemanticReductionIsPolyTime_of_DTM hbridge
+      (NPReductionDTMSubroutineObligation_of_paddedHeader_computable hsub)) hSAT
+
+theorem NPNotInPPoly_implies_SATNotInPPoly_of_paddedHeader_obligations
+    (hbridge : DTMPolyTimeBridge)
+    (hsub : PaddedHeaderReductionSubroutinesComputable) :
+    NPNotInPPoly → SATNotInPPoly := by
+  exact NPNotInPPoly_implies_SATNotInPPoly_of_reduction
+    (NPSemanticReductionIsPolyTime_of_DTM hbridge
+      (NPReductionDTMSubroutineObligation_of_paddedHeader_computable hsub))
+
+-- ---------------------------------------------------------------------------
+-- Semantic correctness of the padded-header assembly step.
+-- ---------------------------------------------------------------------------
+
+theorem npReductionPadded_mem_SAT_iff_accepts
+    (V : TM) (p q : TimeBound) (x : Word)
+    (hhalt : ∀ x y : Word,
+      halted V (run V (p.eval (x ++ y).length) (init V (x ++ y))) = true) :
+    npReductionAssemblerPadded V p q (npReductionCorePadded V p q x) ∈ SAT ↔
+      ∃ y : Word, y.length ≤ q.eval x.length ∧
+        acceptsIn V (x ++ y) (p.eval (x ++ y).length) = true := by
+  rw [npReductionAssemblerPadded_core V p q x]
+  exact npReductionFixed_mem_SAT_iff_accepts V p q x hhalt
 end PNP
